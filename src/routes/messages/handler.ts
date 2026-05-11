@@ -27,6 +27,10 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
+import {
+  makeResponsesStreamState,
+  translateResponsesEventToAnthropic,
+} from "./responses-stream-translation"
 import { translateResponsesToAnthropic } from "./responses-to-anthropic"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
 
@@ -115,18 +119,66 @@ async function handleAnthropicViaResponses(
   consola.debug("Routing /v1/messages via Responses API for", payload.model)
 
   if (payload.stream) {
-    // TODO(#10): implement streaming translation
-    return c.json(
-      {
-        error: {
-          message:
-            "Streaming not yet supported for Responses-API models via /v1/messages. Use /v1/responses directly.",
-          type: "not_implemented",
-          code: "streaming_not_implemented",
-        },
-      },
-      501,
-    )
+    const responsesPayload = translateAnthropicToResponses(payload)
+    const rawResponse = await createResponses({
+      ...responsesPayload,
+      stream: true,
+    })
+
+    return streamSSE(c, async (stream) => {
+      const streamState = makeResponsesStreamState()
+
+      try {
+        for await (const rawEvent of rawResponse as AsyncIterable<{
+          data?: string
+          event?: string
+        }>) {
+          const eventType = rawEvent.event ?? ""
+
+          // Never block on parse failures — parse only for translation/logging
+          let parsedData: unknown = undefined
+          if (rawEvent.data) {
+            try {
+              parsedData = JSON.parse(rawEvent.data)
+            } catch {
+              consola.warn(
+                "Could not parse Responses SSE chunk:",
+                rawEvent.data.slice(0, 200),
+              )
+            }
+          }
+
+          consola.debug("Responses SSE event:", eventType)
+
+          const anthropicEvents = translateResponsesEventToAnthropic(
+            eventType,
+            parsedData,
+            streamState,
+          )
+
+          for (const event of anthropicEvents) {
+            consola.debug("Translated Responses→Anthropic event:", event.type)
+            await stream.writeSSE({
+              event: event.type,
+              data: JSON.stringify(event),
+            })
+          }
+        }
+      } catch (err) {
+        consola.error("Error during Responses API streaming:", err)
+        const errorEvent: AnthropicStreamEventData = {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "An unexpected error occurred during streaming.",
+          },
+        }
+        await stream.writeSSE({
+          event: errorEvent.type,
+          data: JSON.stringify(errorEvent),
+        })
+      }
+    })
   }
 
   const responsesPayload = translateAnthropicToResponses(payload)
