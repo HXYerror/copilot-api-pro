@@ -1,5 +1,16 @@
 import consola from "consola"
 
+// Allowlisted image media types for data URI construction (injection guard)
+const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+])
+
+// Keys that trigger prototype pollution — stripped from upstream tool arguments
+const DANGEROUS_TOOL_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -216,12 +227,19 @@ function mapContent(
       }
       case "image": {
         if (block.source.type === "base64") {
-          contentParts.push({
-            type: "image_url",
-            image_url: {
-              url: `data:${block.source.media_type};base64,${block.source.data}`,
-            },
-          })
+          if (ALLOWED_IMAGE_MEDIA_TYPES.has(block.source.media_type)) {
+            contentParts.push({
+              type: "image_url",
+              image_url: {
+                url: `data:${block.source.media_type};base64,${block.source.data}`,
+              },
+            })
+          } else {
+            consola.warn(
+              "Skipping image with unsupported media_type in translation path:",
+              block.source.media_type,
+            )
+          }
         } else {
           // URL images are rejected by Copilot upstream — skip silently
           // (type kept for fidelity when round-tripping through native path)
@@ -370,10 +388,28 @@ function getAnthropicToolUseBlocks(
   if (!toolCalls) {
     return []
   }
-  return toolCalls.map((toolCall) => ({
-    type: "tool_use",
-    id: toolCall.id,
-    name: toolCall.function.name,
-    input: JSON.parse(toolCall.function.arguments) as Record<string, unknown>,
-  }))
+  return toolCalls.map((toolCall) => {
+    let parsedInput: Record<string, unknown>
+    try {
+      const raw: unknown = JSON.parse(toolCall.function.arguments)
+      // Non-object JSON (array, number, null, etc.) → wrap in _raw
+      parsedInput =
+        typeof raw !== "object" || raw === null || Array.isArray(raw) ?
+          { _raw: toolCall.function.arguments }
+          // Strip prototype-pollution keys before forwarding
+        : Object.fromEntries(
+            Object.entries(raw as Record<string, unknown>).filter(
+              ([k]) => !DANGEROUS_TOOL_KEYS.has(k),
+            ),
+          )
+    } catch {
+      parsedInput = { _raw: toolCall.function.arguments }
+    }
+    return {
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.function.name,
+      input: parsedInput,
+    }
+  })
 }

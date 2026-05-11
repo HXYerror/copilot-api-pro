@@ -4,6 +4,9 @@
  * Anthropic clients understand.
  */
 
+// Keys that trigger prototype pollution — stripped from upstream tool arguments
+const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
 import type {
   ResponsesOutputFunctionCall,
   ResponsesOutputMessage,
@@ -89,18 +92,17 @@ function translateFunctionCallItem(
   let parsedInput: Record<string, unknown>
   try {
     const raw: unknown = JSON.parse(item.arguments)
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-      parsedInput = { _raw: item.arguments }
-    } else {
-      // Strip prototype-pollution keys before forwarding.
-      // Use Object.entries to avoid inherited properties and __proto__ setter tricks.
-      const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"])
-      parsedInput = Object.fromEntries(
-        Object.entries(raw as Record<string, unknown>).filter(
-          ([k]) => !DANGEROUS_KEYS.has(k),
-        ),
-      )
-    }
+    // Non-object JSON (array, number, null, etc.) → wrap in _raw
+    parsedInput =
+      typeof raw !== "object" || raw === null || Array.isArray(raw) ?
+        { _raw: item.arguments }
+        // Strip prototype-pollution keys before forwarding.
+        // Use Object.entries to avoid inherited properties and __proto__ setter tricks.
+      : Object.fromEntries(
+          Object.entries(raw as Record<string, unknown>).filter(
+            ([k]) => !DANGEROUS_KEYS.has(k),
+          ),
+        )
   } catch {
     // If arguments are not valid JSON, wrap as a string
     parsedInput = { _raw: item.arguments }

@@ -3,8 +3,6 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
-import type { ResponsesResponse } from "~/routes/responses/types"
-
 import { awaitApproval } from "~/lib/approval"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
@@ -136,7 +134,41 @@ async function handleAnthropicViaResponses(
     ...responsesPayload,
     stream: false,
   })
-  const sanitised = sanitiseResponsesOutput(rawResponse as ResponsesResponse)
+
+  // Runtime guard: createResponses returns ResponsesResponse for stream:false,
+  // but TypeScript types the return as a union — narrow explicitly.
+  if (!("output" in rawResponse)) {
+    consola.error(
+      "Unexpected non-response shape from createResponses:",
+      rawResponse,
+    )
+    return c.json(
+      {
+        error: {
+          message: "Upstream returned unexpected response shape",
+          type: "api_error",
+          code: "invalid_upstream_response",
+        },
+      },
+      502,
+    )
+  }
+
+  const typedResponse = rawResponse
+
+  // Surface upstream terminal failures as errors instead of 200 OK
+  if (typedResponse.status === "failed") {
+    const errMsg =
+      (typedResponse as unknown as { error?: { message?: string } }).error
+        ?.message ?? "Upstream model call failed"
+    consola.error("Responses API returned failed status:", errMsg)
+    return c.json(
+      { error: { message: errMsg, type: "api_error", code: "model_error" } },
+      500,
+    )
+  }
+
+  const sanitised = sanitiseResponsesOutput(typedResponse)
   const anthropicResponse = translateResponsesToAnthropic(sanitised)
 
   consola.debug(

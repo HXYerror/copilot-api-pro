@@ -94,6 +94,39 @@ describe("translateAnthropicToResponses — basic messages", () => {
     expect(parts[0].image_url).toBe("data:image/png;base64,abc123")
   })
 
+  test("image block with disallowed media_type → dropped (injection guard)", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Look at this",
+              },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  // svg+xml is not in the allowlist
+                  media_type: "image/svg+xml" as "image/png",
+                  data: "evil-data",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    const items = result.input as Array<unknown>
+    // Only the text block should survive; the disallowed image is dropped
+    const msg = items[0] as ResponsesInputMessage
+    const parts = msg.content as Array<{ type: string }>
+    expect(parts.every((p) => p.type !== "input_image")).toBe(true)
+    expect(parts.some((p) => p.type === "input_text")).toBe(true)
+  })
+
   test("user message with tool_result → function_call_output item", () => {
     const result = translateAnthropicToResponses(
       makeBasePayload({

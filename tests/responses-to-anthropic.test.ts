@@ -219,9 +219,31 @@ describe("translateResponsesToAnthropic — function_call items", () => {
       ],
     })
     const result = translateResponsesToAnthropic(response)
+    expect(result.content[0].type).toBe("tool_use")
     const block = result.content[0]
     if (block.type === "tool_use") {
       expect(block.input).toEqual({ _raw: "not-json" })
+    }
+  })
+
+  test("function_call with array JSON arguments → wrapped in _raw (non-object guard)", () => {
+    const response = makeResponse({
+      output: [
+        {
+          type: "function_call",
+          id: "fc_arr",
+          call_id: "call_arr",
+          name: "array_tool",
+          arguments: JSON.stringify([1, 2, 3]),
+          status: "completed",
+        },
+      ],
+    })
+    const result = translateResponsesToAnthropic(response)
+    expect(result.content[0].type).toBe("tool_use")
+    const block = result.content[0]
+    if (block.type === "tool_use") {
+      expect(block.input).toEqual({ _raw: "[1,2,3]" })
     }
   })
 
@@ -242,10 +264,36 @@ describe("translateResponsesToAnthropic — function_call items", () => {
       ],
     })
     const result = translateResponsesToAnthropic(response)
+    expect(result.content[0].type).toBe("tool_use")
     const block = result.content[0]
     if (block.type === "tool_use") {
       expect(Object.hasOwn(block.input, "__proto__")).toBe(false)
       expect(block.input.city).toBe("London")
+    }
+  })
+
+  test("function_call with constructor/prototype keys → stripped", () => {
+    const args =
+      '{"constructor":{"name":"hacked"},"prototype":{"x":1},"value":42}'
+    const response = makeResponse({
+      output: [
+        {
+          type: "function_call",
+          id: "fc_4",
+          call_id: "call_ctor",
+          name: "ctor_tool",
+          arguments: args,
+          status: "completed",
+        },
+      ],
+    })
+    const result = translateResponsesToAnthropic(response)
+    expect(result.content[0].type).toBe("tool_use")
+    const block = result.content[0]
+    if (block.type === "tool_use") {
+      expect(Object.hasOwn(block.input, "constructor")).toBe(false)
+      expect(Object.hasOwn(block.input, "prototype")).toBe(false)
+      expect(block.input.value).toBe(42)
     }
   })
 })

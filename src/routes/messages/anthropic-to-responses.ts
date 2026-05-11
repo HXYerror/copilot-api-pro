@@ -39,6 +39,12 @@ const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
 ])
 
 // ---------------------------------------------------------------------------
+// Allowlisted reasoning effort values
+// ---------------------------------------------------------------------------
+
+const VALID_EFFORT_VALUES = new Set<string>(["low", "medium", "high"])
+
+// ---------------------------------------------------------------------------
 // Budget → effort tier mapping
 // ---------------------------------------------------------------------------
 
@@ -152,9 +158,6 @@ function translateUserMessage(
         // image block
         const imagePart = translateImageBlock(block)
         if (imagePart) contentParts.push(imagePart)
-        // Note: stop_sequences are also not forwarded — Responses API has no
-        // equivalent field; callers relying on stop sequences will not get that
-        // behaviour when using Responses-only models.
       }
     }
 
@@ -296,8 +299,13 @@ function translateReasoning(
   if (!thinking) return undefined
 
   if (thinking.type === "adaptive") {
-    // Use explicit effort from output_config when provided; default to medium
-    return { effort: outputConfig?.effort ?? "medium" }
+    const rawEffort = outputConfig?.effort
+    // Validate effort value against allowlist to prevent forwarding arbitrary strings
+    const effort =
+      rawEffort !== undefined && VALID_EFFORT_VALUES.has(rawEffort) ?
+        rawEffort
+      : "medium"
+    return { effort: effort }
   }
 
   // type === "enabled"
@@ -337,5 +345,8 @@ export function translateAnthropicToResponses(
     reasoning: translateReasoning(payload.thinking, payload.output_config),
     stream: payload.stream,
     user: payload.metadata?.user_id,
+    // NOTE: stop_sequences is not forwarded — the Responses API has no
+    // equivalent field.  Callers relying on stop sequences will not get that
+    // behaviour when using Responses-only models.
   }
 }
