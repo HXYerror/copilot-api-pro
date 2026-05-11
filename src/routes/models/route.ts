@@ -15,6 +15,9 @@ modelRoutes.get("/", async (c) => {
       await cacheModels()
     }
 
+    // One snapshot per request — cheap for small configs, and guards against
+    // a hot-reload changing configModels between the hasAliases check and
+    // the Object.entries() call.
     const { models: configModels } = getConfig()
     const hasAliases = Object.keys(configModels).length > 0
 
@@ -31,11 +34,20 @@ modelRoutes.get("/", async (c) => {
           id: alias,
           object: "model",
           type: "model",
-          created: 0,
-          created_at: new Date(0).toISOString(),
-          // owned_by reflects the upstream model name so clients can infer the provider
+          created: 0, // synthetic; Copilot upstream does not expose creation timestamps
+          created_at: new Date(0).toISOString(), // ditto
+          // owned_by intentionally reflects the upstream model name so clients
+          // can infer the provider family (e.g. "gpt-4o" → OpenAI).
+          // This is a deliberate design choice: upstream identity is visible to
+          // permitted callers.  It does NOT expose the full alias→upstream
+          // mapping beyond what a caller can observe from their own requests.
           owned_by: entry.upstream,
           display_name: alias,
+          // Pass entry.upstream, not alias: getModelMode checks state.models by
+          // upstream ID and applies heuristics designed for upstream names
+          // (e.g. "codex", "o\d+-pro").  Using the alias could misclassify an
+          // alias named "codex-wrapper" as responses-only when the upstream is
+          // a chat model.
           mode: getModelMode(entry.upstream),
         }))
 

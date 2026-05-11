@@ -18,7 +18,15 @@ import { configPath } from "./paths"
 // ---------------------------------------------------------------------------
 
 const ModelEntrySchema = z.object({
-  upstream: z.string(),
+  // upstream must be a model identifier, not a URL.
+  // Reject URL-shaped values to prevent SSRF if this field is ever used as an
+  // endpoint. Valid: "gpt-4o", "claude-opus-4". Invalid: "https://…", "//…".
+  upstream: z
+    .string()
+    .regex(
+      /^\w[\w.:-]*$/,
+      "upstream must be a model ID (e.g. 'gpt-4o'), not a URL",
+    ),
   enabled: z.boolean().default(true),
   allowed_keys: z.array(z.string()).default(["*"]),
 })

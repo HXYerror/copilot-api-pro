@@ -513,3 +513,30 @@ describe("GET /v1/models — alias filtering", () => {
     expect(ids).not.toContain("hidden")
   })
 })
+
+// ---------------------------------------------------------------------------
+// GET /v1/models — upstream schema rejects URLs
+// ---------------------------------------------------------------------------
+
+describe("GET /v1/models — all aliases disabled produces empty list", () => {
+  afterEach(async () => {
+    await loadModelsConfig({})
+  })
+
+  test("all aliases disabled → empty data list, no upstream leak", async () => {
+    await loadModelsConfig({
+      a: { upstream: "gpt-4o", enabled: false },
+      b: { upstream: "gpt-4o-mini", enabled: false },
+    })
+    const res = await server.request("/v1/models", { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      object: string
+      data: Array<unknown>
+      has_more: boolean
+    }
+    expect(body.object).toBe("list")
+    expect(body.data).toHaveLength(0)
+    expect(body.has_more).toBe(false)
+  })
+})

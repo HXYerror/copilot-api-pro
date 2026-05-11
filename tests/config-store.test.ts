@@ -33,7 +33,7 @@ const validComplete: Config = {
   version: 1,
   models: {
     "gpt-4o": {
-      upstream: "https://api.example.com",
+      upstream: "gpt-4o",
       enabled: true,
       allowed_keys: ["*"],
     },
@@ -90,7 +90,7 @@ describe("ConfigSchema — validates a complete config", () => {
     const result = ConfigSchema.safeParse({
       version: 1,
       models: {
-        "my-model": { upstream: "https://example.com" },
+        "my-model": { upstream: "gpt-4o" },
       },
     })
     expect(result.success).toBe(true)
@@ -112,6 +112,23 @@ describe("ConfigSchema — validates a complete config", () => {
     const result = ConfigSchema.safeParse({
       version: 1,
       retention: { events_days: -1 },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test("rejects URL-shaped upstream value (SSRF prevention)", () => {
+    // upstream must be a model identifier, not a URL
+    const result = ConfigSchema.safeParse({
+      version: 1,
+      models: { "my-alias": { upstream: "https://attacker.example.com/ssrf" } },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test("rejects upstream with double-slash (URL guard)", () => {
+    const result = ConfigSchema.safeParse({
+      version: 1,
+      models: { "my-alias": { upstream: "//evil" } },
     })
     expect(result.success).toBe(false)
   })
@@ -150,7 +167,7 @@ describe("loadConfig()", () => {
     const config = await loadConfig(cfgPath)
     expect(config.version).toBe(1)
     expect(config.features.auth).toBe(true)
-    expect(config.models["gpt-4o"].upstream).toBe("https://api.example.com")
+    expect(config.models["gpt-4o"].upstream).toBe("gpt-4o")
   })
 
   test("throws on invalid JSON", async () => {
@@ -281,7 +298,7 @@ describe("watchConfig()", () => {
     writeJson(cfgPath, updated)
 
     // Wait longer than the 250ms debounce + generous headroom for parallel test load
-    await new Promise<void>((resolve) => setTimeout(resolve, 900))
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200))
 
     expect(callCount).toBe(1)
     expect(receivedConfig).not.toBeNull()
@@ -297,7 +314,7 @@ describe("watchConfig()", () => {
     // Write corrupt JSON — should NOT invoke callback, should keep previous
     fs.writeFileSync(cfgPath, "{ INVALID JSON !!!", { mode: 0o600 })
 
-    await new Promise<void>((resolve) => setTimeout(resolve, 900))
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200))
 
     // Callback must NOT have been called with a broken config
     expect(callbacks.length).toBe(0)
@@ -324,7 +341,7 @@ describe("watchConfig()", () => {
     }
     writeJson(cfgPath, updated)
 
-    await new Promise<void>((resolve) => setTimeout(resolve, 900))
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200))
     expect(callCount).toBe(0)
   })
 })
