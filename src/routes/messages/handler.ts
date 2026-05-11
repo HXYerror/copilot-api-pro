@@ -5,6 +5,7 @@ import { streamSSE } from "hono/streaming"
 
 import { resolveAlias } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
+import { getConfig } from "~/lib/config-store"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -38,13 +39,16 @@ import { translateChunkToAnthropicEvents } from "./stream-translation"
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
+  // Single config snapshot for this request (consistent ingress + future egress).
+  const { models } = getConfig()
+
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
   // Ingress: rewrite client-facing alias → upstream model name
   const payload: AnthropicMessagesPayload = {
     ...anthropicPayload,
-    model: resolveAlias(anthropicPayload.model),
+    model: resolveAlias(anthropicPayload.model, models),
   }
 
   if (state.manualApprove) {

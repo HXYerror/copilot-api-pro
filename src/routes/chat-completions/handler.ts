@@ -5,6 +5,7 @@ import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { resolveAlias, resolveUpstream } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
+import { getConfig } from "~/lib/config-store"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -20,8 +21,16 @@ export async function handleCompletion(c: Context) {
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
-  // Ingress: rewrite client-facing alias → upstream model name
-  payload = { ...payload, model: resolveAlias(payload.model) }
+  // Take a single config snapshot for the lifetime of this request.
+  // Using one snapshot ensures ingress + egress rewrites are consistent even
+  // if the config hot-reloads between the two calls.
+  const { models } = getConfig()
+
+  // Ingress: rewrite client-facing alias → upstream model name.
+  // Preserve the original alias so egress can return it verbatim (avoids the
+  // O(n) reverse-scan and multi-alias ambiguity problems).
+  const clientAlias = payload.model
+  payload = { ...payload, model: resolveAlias(payload.model, models) }
 
   if (getModelMode(payload.model) === "responses") {
     return c.json(
@@ -69,17 +78,76 @@ export async function handleCompletion(c: Context) {
 
   if (isNonStreaming(response)) {
     consola.debug("Non-streaming response:", JSON.stringify(response))
-    // Egress: rewrite upstream model name back to client-facing alias
-    return c.json({ ...response, model: resolveUpstream(response.model) })
+    // Egress: return the original client alias rather than the upstream name.
+    // Use clientAlias directly (exact round-trip) if an alias was configured;
+    // fall back to resolveUpstream for un-aliased models.
+    const egressModel =
+      clientAlias !== payload.model ?
+        clientAlias
+      : resolveUpstream(response.model, models)
+    return c.json({ ...response, model: egressModel })
   }
 
   consola.debug("Streaming response")
   return streamSSE(c, async (stream) => {
     for await (const chunk of response) {
       consola.debug("Streaming chunk:", JSON.stringify(chunk))
-      await stream.writeSSE(chunk as SSEMessage)
+
+      // Egress SSE rewrite: parse event data and rewrite the model field.
+      // Only rewrite on structured JSON chunks — skip [DONE] sentinel and
+      // any non-JSON data verbatim to avoid corrupting tool-call arguments.
+      const rewritten = rewriteChunkModel(chunk as SSEMessage, {
+        clientAlias,
+        upstreamModel: payload.model,
+        models,
+      })
+      await stream.writeSSE(rewritten)
     }
   })
+}
+
+type ModelMap = ReturnType<typeof getConfig>["models"]
+
+interface RewriteCtx {
+  clientAlias: string
+  upstreamModel: string
+  models: ModelMap
+}
+
+/**
+ * Rewrite the `model` field in a single SSE chunk's `data` payload.
+ * Returns the chunk unchanged if `data` is not parseable JSON or has no
+ * top-level `model` field.  Never touches nested JSON (tool-call arguments).
+ */
+function rewriteChunkModel(chunk: SSEMessage, ctx: RewriteCtx): SSEMessage {
+  const data = chunk.data
+  if (!data || data === "[DONE]") return chunk
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    return chunk
+  }
+
+  if (
+    typeof parsed !== "object"
+    || parsed === null
+    || !Object.hasOwn(parsed, "model")
+  ) {
+    return chunk
+  }
+
+  const { clientAlias, upstreamModel, models } = ctx
+  const egressModel =
+    clientAlias !== upstreamModel ? clientAlias : (
+      resolveUpstream((parsed as { model: string }).model, models)
+    )
+
+  return {
+    ...chunk,
+    data: JSON.stringify({ ...parsed, model: egressModel }),
+  }
 }
 
 const isNonStreaming = (
