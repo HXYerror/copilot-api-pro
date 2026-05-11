@@ -6,6 +6,8 @@
  * `createChatCompletions`.
  */
 
+import consola from "consola"
+
 import type {
   ResponsesContentPart,
   ResponsesFunctionCallOutput,
@@ -24,6 +26,17 @@ import type {
   AnthropicToolResultBlock,
   AnthropicUserMessage,
 } from "./anthropic-types"
+
+// ---------------------------------------------------------------------------
+// Allowlisted image media types for data URI construction
+// ---------------------------------------------------------------------------
+
+const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+])
 
 // ---------------------------------------------------------------------------
 // Budget → effort tier mapping
@@ -52,6 +65,39 @@ function buildInstructions(
   if (typeof system === "string") return system
   // Array of text blocks — join with double newlines
   return system.map((b) => b.text).join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Image block → input_image content part
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a base64 Anthropic image block to a Responses API `input_image`
+ * content part.  Returns `undefined` if the source type is not base64 (URL
+ * images are not supported on the Copilot upstream) or if the media type is
+ * not in the allowed set (guard against data-URI injection).
+ */
+function translateImageBlock(block: {
+  type: "image"
+  source: { type: string; media_type?: string; data?: string }
+}): ResponsesContentPart | undefined {
+  if (block.source.type !== "base64") {
+    // URL images: skip (not supported on Copilot upstream)
+    return undefined
+  }
+  const { media_type, data } = block.source as {
+    media_type: string
+    data: string
+  }
+  // Allowlist media_type to prevent data-URI injection
+  if (!ALLOWED_IMAGE_MEDIA_TYPES.has(media_type)) {
+    consola.warn("Skipping image with unsupported media_type:", media_type)
+    return undefined
+  }
+  return {
+    type: "input_image",
+    image_url: `data:${media_type};base64,${data}`,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,14 +150,11 @@ function translateUserMessage(
         contentParts.push({ type: "input_text", text: block.text })
       } else {
         // image block
-        const imgBlock = block
-        if (imgBlock.source.type === "base64") {
-          contentParts.push({
-            type: "input_image",
-            image_url: `data:${imgBlock.source.media_type};base64,${imgBlock.source.data}`,
-          })
-        }
-        // URL images: skip (not supported on Copilot upstream)
+        const imagePart = translateImageBlock(block)
+        if (imagePart) contentParts.push(imagePart)
+        // Note: stop_sequences are also not forwarded — Responses API has no
+        // equivalent field; callers relying on stop sequences will not get that
+        // behaviour when using Responses-only models.
       }
     }
 
@@ -155,10 +198,15 @@ function translateAssistantMessage(
       }
       case "thinking": {
         const thinkingBlock = block
-        // Preserve signature as encrypted_content for multi-turn continuity
+        // Preserve signature as encrypted_content for multi-turn continuity.
+        // NOTE: the original reasoning item `id` is not preserved here — the
+        // Anthropic ThinkingBlock format has no id field.  If the upstream
+        // validates stable IDs across turns this could break multi-turn
+        // reasoning; at present Copilot upstream does not enforce this.
+        // TODO: investigate id round-trip once multi-turn Responses is stable.
         const reasoningItem: ResponsesReasoningItem = {
           type: "reasoning",
-          id: `reasoning_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          id: `reasoning_${crypto.randomUUID()}`,
           summary: [{ type: "summary_text", text: thinkingBlock.thinking }],
           ...(thinkingBlock.signature && {
             encrypted_content: thinkingBlock.signature,
@@ -223,6 +271,9 @@ function translateToolChoice(
       if (toolChoice.name) {
         return { type: "function", name: toolChoice.name }
       }
+      consola.warn(
+        "tool_choice.type is 'tool' but no name was provided — falling back to 'auto'",
+      )
       return "auto"
     }
     case "none": {
@@ -240,11 +291,13 @@ function translateToolChoice(
 
 function translateReasoning(
   thinking: AnthropicMessagesPayload["thinking"],
+  outputConfig?: AnthropicMessagesPayload["output_config"],
 ): ResponsesPayload["reasoning"] {
   if (!thinking) return undefined
 
   if (thinking.type === "adaptive") {
-    return { effort: "medium" }
+    // Use explicit effort from output_config when provided; default to medium
+    return { effort: outputConfig?.effort ?? "medium" }
   }
 
   // type === "enabled"
@@ -281,7 +334,7 @@ export function translateAnthropicToResponses(
     temperature: payload.temperature,
     top_p: payload.top_p,
     max_output_tokens: payload.max_tokens,
-    reasoning: translateReasoning(payload.thinking),
+    reasoning: translateReasoning(payload.thinking, payload.output_config),
     stream: payload.stream,
     user: payload.metadata?.user_id,
   }

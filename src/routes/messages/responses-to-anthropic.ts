@@ -88,7 +88,19 @@ function translateFunctionCallItem(
 ): AnthropicToolUseBlock {
   let parsedInput: Record<string, unknown>
   try {
-    parsedInput = JSON.parse(item.arguments) as Record<string, unknown>
+    const raw: unknown = JSON.parse(item.arguments)
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      parsedInput = { _raw: item.arguments }
+    } else {
+      // Strip prototype-pollution keys before forwarding.
+      // Use Object.entries to avoid inherited properties and __proto__ setter tricks.
+      const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"])
+      parsedInput = Object.fromEntries(
+        Object.entries(raw as Record<string, unknown>).filter(
+          ([k]) => !DANGEROUS_KEYS.has(k),
+        ),
+      )
+    }
   } catch {
     // If arguments are not valid JSON, wrap as a string
     parsedInput = { _raw: item.arguments }

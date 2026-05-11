@@ -119,6 +119,47 @@ describe("translateAnthropicToResponses — basic messages", () => {
     expect(item.output).toBe("sunny, 72°F")
   })
 
+  test("tool_result with array content → text parts joined with newline", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "call_multi",
+                content: [
+                  { type: "text", text: "Part A" },
+                  { type: "text", text: "Part B" },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    const items = result.input as Array<unknown>
+    const item = items[0] as ResponsesFunctionCallOutput
+    expect(item.type).toBe("function_call_output")
+    expect(item.call_id).toBe("call_multi")
+    expect(item.output).toBe("Part A\nPart B")
+  })
+
+  test("empty messages array → input: []", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({ messages: [] }),
+    )
+    expect(Array.isArray(result.input)).toBe(true)
+    expect(result.input as Array<unknown>).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Assistant message translation
+// ---------------------------------------------------------------------------
+
+describe("translateAnthropicToResponses — assistant messages", () => {
   test("assistant string message → message item with output_text", () => {
     const result = translateAnthropicToResponses(
       makeBasePayload({
@@ -296,6 +337,24 @@ describe("translateAnthropicToResponses — thinking budget_tokens tiers", () =>
     expect(result.reasoning?.effort).toBe("medium")
   })
 
+  test("budget_tokens exactly 9999 → effort: medium (not high)", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        thinking: { type: "enabled", budget_tokens: 9_999 },
+      }),
+    )
+    expect(result.reasoning?.effort).toBe("medium")
+  })
+
+  test("thinking { type: 'enabled' } without budget_tokens → effort: medium", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        thinking: { type: "enabled" },
+      }),
+    )
+    expect(result.reasoning).toEqual({ effort: "medium" })
+  })
+
   test("thinking { type: 'adaptive' } → reasoning { effort: 'medium' }", () => {
     const result = translateAnthropicToResponses(
       makeBasePayload({
@@ -303,6 +362,26 @@ describe("translateAnthropicToResponses — thinking budget_tokens tiers", () =>
       }),
     )
     expect(result.reasoning).toEqual({ effort: "medium" })
+  })
+
+  test("thinking { type: 'adaptive' } + output_config.effort: 'high' → effort: high", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        thinking: { type: "adaptive" },
+        output_config: { effort: "high" },
+      }),
+    )
+    expect(result.reasoning).toEqual({ effort: "high" })
+  })
+
+  test("thinking { type: 'adaptive' } + output_config.effort: 'low' → effort: low", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({
+        thinking: { type: "adaptive" },
+        output_config: { effort: "low" },
+      }),
+    )
+    expect(result.reasoning).toEqual({ effort: "low" })
   })
 
   test("no thinking → reasoning is undefined", () => {
@@ -374,6 +453,13 @@ describe("translateAnthropicToResponses — tool_choice", () => {
       type: "function",
       name: "get_weather",
     })
+  })
+
+  test("tool without name → falls back to 'auto'", () => {
+    const result = translateAnthropicToResponses(
+      makeBasePayload({ tool_choice: { type: "tool" } }),
+    )
+    expect(result.tool_choice).toBe("auto")
   })
 
   test("none → 'none'", () => {

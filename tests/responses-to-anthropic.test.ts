@@ -224,6 +224,30 @@ describe("translateResponsesToAnthropic — function_call items", () => {
       expect(block.input).toEqual({ _raw: "not-json" })
     }
   })
+
+  test("function_call with __proto__ in arguments → stripped (prototype pollution guard)", () => {
+    const response = makeResponse({
+      output: [
+        {
+          type: "function_call",
+          id: "fc_3",
+          call_id: "call_proto",
+          name: "evil_tool",
+          arguments: JSON.stringify({
+            __proto__: { isAdmin: true },
+            city: "London",
+          }),
+          status: "completed",
+        },
+      ],
+    })
+    const result = translateResponsesToAnthropic(response)
+    const block = result.content[0]
+    if (block.type === "tool_use") {
+      expect(Object.hasOwn(block.input, "__proto__")).toBe(false)
+      expect(block.input.city).toBe("London")
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -269,6 +293,25 @@ describe("translateResponsesToAnthropic — status / stop_reason", () => {
             id: "fc_1",
             call_id: "call_xyz",
             name: "do_thing",
+            arguments: "{}",
+            status: "completed",
+          },
+        ],
+      }),
+    )
+    expect(result.stop_reason).toBe("tool_use")
+  })
+
+  test("function_call present with status 'incomplete' → stop_reason 'tool_use' (tool_use takes precedence)", () => {
+    const result = translateResponsesToAnthropic(
+      makeResponse({
+        status: "incomplete",
+        output: [
+          {
+            type: "function_call",
+            id: "fc_2",
+            call_id: "call_preempt",
+            name: "some_tool",
             arguments: "{}",
             status: "completed",
           },
