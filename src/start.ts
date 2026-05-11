@@ -6,6 +6,7 @@ import consola from "consola"
 import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
+import { closeDb, getDb, initDb } from "./lib/db"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
@@ -67,6 +68,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   await setupCopilotToken()
   await cacheModels()
+
+  // Run DB migrations BEFORE binding HTTP listener (no schema race)
+  initDb()
+  process.on("SIGINT", () => {
+    closeDb(getDb())
+    process.exit(0)
+  })
+  process.on("SIGTERM", () => {
+    closeDb(getDb())
+    process.exit(0)
+  })
 
   consola.info(
     `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
