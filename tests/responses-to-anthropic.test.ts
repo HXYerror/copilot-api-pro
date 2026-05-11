@@ -255,10 +255,9 @@ describe("translateResponsesToAnthropic — function_call items", () => {
           id: "fc_3",
           call_id: "call_proto",
           name: "evil_tool",
-          arguments: JSON.stringify({
-            __proto__: { isAdmin: true },
-            city: "London",
-          }),
+          // Use a raw string literal — JSON.stringify({__proto__:...}) silently
+          // drops the key because the JS engine treats it as a prototype setter.
+          arguments: '{"__proto__":{"isAdmin":true},"city":"London"}',
           status: "completed",
         },
       ],
