@@ -130,7 +130,7 @@ interface ResponseFailedData {
 
 function mapResponsesStatusToStopReason(
   status: string,
-): "end_turn" | "max_tokens" | null {
+): "end_turn" | "max_tokens" {
   switch (status) {
     case "completed": {
       return "end_turn"
@@ -139,7 +139,9 @@ function mapResponsesStatusToStopReason(
       return "max_tokens"
     }
     default: {
-      return null
+      // Unknown status (e.g. "cancelled") — default to end_turn to avoid
+      // emitting null stop_reason in message_delta which some clients reject.
+      return "end_turn"
     }
   }
 }
@@ -175,10 +177,12 @@ export function translateResponsesEventToAnthropic(
     case "response.in_progress": {
       const d = data as ResponseCreatedData | null | undefined
       const responseData = d?.response
-      const responseId = responseData?.id
-      if (!state.messageStartSent && responseId) {
+      if (!state.messageStartSent) {
+        // Use response.id if present; fall back to a generated id so message_start
+        // is always emitted (missing id must not silently suppress the event).
+        const responseId = responseData?.id ?? `msg_fallback_${Date.now()}`
         state.messageId = responseId
-        state.messageModel = responseData.model ?? ""
+        state.messageModel = responseData?.model ?? ""
         events.push({
           type: "message_start",
           message: {
@@ -190,7 +194,9 @@ export function translateResponsesEventToAnthropic(
             stop_reason: null,
             stop_sequence: null,
             usage: {
-              // input_tokens not known yet — updated at response.completed
+              // KNOWN LIMITATION: input_tokens not available until response.completed
+              // in the Responses API.  Clients reading billing from message_start
+              // will always see 0 here; the real count is in message_delta.usage.
               input_tokens: 0,
               output_tokens: 0,
             },
@@ -208,12 +214,10 @@ export function translateResponsesEventToAnthropic(
 
       if (item === undefined || outputIndex === undefined) break
 
-      const blockIndex = state.blockIndex
-      state.outputIndexToBlockIndex.set(outputIndex, blockIndex)
-      state.blockIndex++
-
       switch (item.type) {
         case "reasoning": {
+          const blockIndex = state.blockIndex++
+          state.outputIndexToBlockIndex.set(outputIndex, blockIndex)
           state.reasoningOutputIndexes.add(outputIndex)
           events.push({
             type: "content_block_start",
@@ -223,8 +227,10 @@ export function translateResponsesEventToAnthropic(
           break
         }
         case "message": {
-          // The message item starts — open a text block immediately so the
-          // block index is registered and deltas can be mapped correctly.
+          // Open a text block so the block index is registered and deltas can
+          // be mapped correctly when output_text.delta events arrive.
+          const blockIndex = state.blockIndex++
+          state.outputIndexToBlockIndex.set(outputIndex, blockIndex)
           events.push({
             type: "content_block_start",
             index: blockIndex,
@@ -233,6 +239,8 @@ export function translateResponsesEventToAnthropic(
           break
         }
         case "function_call": {
+          const blockIndex = state.blockIndex++
+          state.outputIndexToBlockIndex.set(outputIndex, blockIndex)
           state.functionCallOutputIndexes.add(outputIndex)
           events.push({
             type: "content_block_start",
@@ -247,7 +255,9 @@ export function translateResponsesEventToAnthropic(
           break
         }
         default: {
-          // Unknown item type — block index already allocated, no event emitted
+          // Unknown item type — do NOT allocate a block index or register a
+          // mapping. Allocating without emitting a content_block_start would
+          // cause content_part.done to emit an orphaned content_block_stop.
           break
         }
       }
@@ -328,8 +338,13 @@ export function translateResponsesEventToAnthropic(
       if (outputIndex === undefined) break
       const blockIndex = state.outputIndexToBlockIndex.get(outputIndex)
       if (blockIndex === undefined) break
-      // Only emit stop for message output items (text parts), not reasoning
-      if (!state.reasoningOutputIndexes.has(outputIndex)) {
+      // Only emit stop for message output items (text parts).
+      // Reasoning items are stopped by response.output_item.done.
+      // Function_call items are also stopped by response.output_item.done.
+      if (
+        !state.reasoningOutputIndexes.has(outputIndex)
+        && !state.functionCallOutputIndexes.has(outputIndex)
+      ) {
         events.push({ type: "content_block_stop", index: blockIndex })
       }
       break
