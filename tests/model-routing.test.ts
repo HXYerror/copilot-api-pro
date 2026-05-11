@@ -360,9 +360,10 @@ describe("GET /v1/models — mode field", () => {
     expect(responsesEntry?.mode).toBe("responses")
   })
 
-  test("responses-only model (codex) gets mode='responses' from heuristic when capabilities missing type", async () => {
-    // Simulate a model list that doesn't set capabilities.type explicitly —
-    // the heuristic must still classify codex models as "responses".
+  test("responses-only model (codex) gets mode='responses' from heuristic when capabilities.type absent", async () => {
+    // Simulate a model list where capabilities.type is not set.
+    // getModelMode should fall through to isResponsesOnlyModel heuristic,
+    // which classifies "codex" in the model id as "responses".
     state.models = {
       object: "list",
       data: [
@@ -380,24 +381,20 @@ describe("GET /v1/models — mode field", () => {
             object: "model_capabilities",
             supports: {},
             tokenizer: "cl100k_base",
-            // No type field — falls through to heuristic
-            type: "chat", // actual upstream sends "chat" for these, but isResponsesOnlyModel overrides
+            // No `type` field — heuristic must fire
           },
         },
       ],
     }
 
-    // getModelMode respects capabilities.type when explicitly "chat" (upstream authoritative),
-    // so this test validates the API shape (mode field present) rather than the heuristic path.
     const res = await server.request("/v1/models", { method: "GET" })
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
       data: Array<{ id: string; mode: string }>
     }
     const entry = body.data.find((m) => m.id === "gpt-5.1-codex-max")
-    // The mode field must be present regardless of which routing branch fires
-    expect(entry?.mode).toBeDefined()
-    expect(["chat", "responses"]).toContain(entry?.mode)
+    // Heuristic: "codex" in the id → "responses"
+    expect(entry?.mode).toBe("responses")
   })
 
   test("o1-pro gets mode='responses' in models list", async () => {

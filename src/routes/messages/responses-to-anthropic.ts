@@ -57,8 +57,10 @@ function translateReasoningItem(
     thinking: thinkingText,
   }
 
-  // Preserve encrypted_content as signature for multi-turn continuity
-  if (item.encrypted_content) {
+  // Preserve encrypted_content as signature for multi-turn continuity.
+  // Use !== undefined rather than truthy check: an empty string "" is a valid
+  // (if unusual) blob and must not be silently dropped.
+  if (item.encrypted_content !== undefined) {
     block.signature = item.encrypted_content
   }
 

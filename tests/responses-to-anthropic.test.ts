@@ -374,7 +374,7 @@ describe("translateResponsesToAnthropic — status / stop_reason", () => {
     // stop_reason so callers know to execute the tool.
     const result = translateResponsesToAnthropic(
       makeResponse({
-        status: "in_progress" as "completed",
+        status: "in_progress",
         output: [
           {
             type: "function_call",

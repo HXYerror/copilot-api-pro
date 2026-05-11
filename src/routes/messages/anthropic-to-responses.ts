@@ -211,7 +211,7 @@ function translateAssistantMessage(
           type: "reasoning",
           id: `reasoning_${crypto.randomUUID()}`,
           summary: [{ type: "summary_text", text: thinkingBlock.thinking }],
-          ...(thinkingBlock.signature && {
+          ...(thinkingBlock.signature !== undefined && {
             encrypted_content: thinkingBlock.signature,
           }),
         }

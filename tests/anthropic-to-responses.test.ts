@@ -1,14 +1,20 @@
 import { describe, test, expect } from "bun:test"
 
-import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+import type {
+  AnthropicTextBlock,
+  AnthropicThinkingBlock,
+  AnthropicMessagesPayload,
+} from "~/routes/messages/anthropic-types"
 import type {
   ResponsesFunctionCallOutput,
   ResponsesInputFunctionCall,
   ResponsesInputMessage,
   ResponsesReasoningItem,
+  ResponsesResponse,
 } from "~/routes/responses/types"
 
 import { translateAnthropicToResponses } from "../src/routes/messages/anthropic-to-responses"
+import { translateResponsesToAnthropic } from "../src/routes/messages/responses-to-anthropic"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -562,13 +568,6 @@ describe("translateAnthropicToResponses — top-level fields", () => {
 // → Responses translation round-trip so multi-turn reasoning continuity works.
 // ---------------------------------------------------------------------------
 
-import type {
-  ResponsesResponse,
-  ResponsesReasoningItem,
-} from "~/routes/responses/types"
-
-import { translateResponsesToAnthropic } from "../src/routes/messages/responses-to-anthropic"
-
 describe("encrypted_content round-trip: Responses → Anthropic → Responses", () => {
   const ENCRYPTED_BLOB = "opaque-encrypted-content-blob-abc123"
 
@@ -608,60 +607,49 @@ describe("encrypted_content round-trip: Responses → Anthropic → Responses", 
     expect(anthropicResponse.content).toHaveLength(2)
 
     const thinkingBlock = anthropicResponse.content[0]
+    // Assert type unconditionally — if this fails we get a clear error
     expect(thinkingBlock.type).toBe("thinking")
-    if (thinkingBlock.type === "thinking") {
-      expect(thinkingBlock.thinking).toBe("I carefully considered the problem.")
-      // The encrypted_content blob must become the signature field verbatim
-      expect(thinkingBlock.signature).toBe(ENCRYPTED_BLOB)
-    }
+    // Cast after assertion so the critical signature check always runs
+    const tb = thinkingBlock as AnthropicThinkingBlock
+    expect(tb.thinking).toBe("I carefully considered the problem.")
+    // The encrypted_content blob MUST become the signature field verbatim
+    expect(tb.signature).toBe(ENCRYPTED_BLOB)
 
     const textBlock = anthropicResponse.content[1]
     expect(textBlock.type).toBe("text")
-    if (textBlock.type === "text") {
-      expect(textBlock.text).toBe("The answer is 42.")
-    }
+    const tt = textBlock as AnthropicTextBlock
+    expect(tt.text).toBe("The answer is 42.")
   })
 
   test("Step 2 → 3: Anthropic thinking block (with signature) maps back to reasoning item with encrypted_content", () => {
-    // Translate Responses → Anthropic first to get the assistant message with
-    // a thinking block (this mirrors what translateResponsesToAnthropic returns).
     const anthropicResponse =
       translateResponsesToAnthropic(responsesApiResponse)
 
-    // Now simulate the next turn: the caller takes the Anthropic response
-    // and feeds it back as a conversation turn.
     const nextTurnPayload = makeBasePayload({
       messages: [
-        // Original user turn
         { role: "user", content: "Solve a hard problem." },
-        // Previous assistant turn (reconstructed from Anthropic response)
         {
           role: "assistant",
           content: anthropicResponse.content,
         },
-        // New user message
         { role: "user", content: "Now explain your reasoning in detail." },
       ],
     })
 
     const responsesPayload = translateAnthropicToResponses(nextTurnPayload)
-
     const inputItems = responsesPayload.input as Array<unknown>
 
-    // Find the reasoning item in the translated input
     const reasoningItem = inputItems.find(
       (item): item is ResponsesReasoningItem =>
         (item as { type: string }).type === "reasoning",
     )
 
-    // The reasoning item MUST be present
-    expect(reasoningItem).toBeDefined()
-    if (!reasoningItem) return // narrow for TS
+    // Hard-fail if reasoning item is absent — no silent skip
+    if (!reasoningItem)
+      throw new Error("reasoning item not found in translated input")
 
     // The encrypted_content must survive the full round-trip verbatim
     expect(reasoningItem.encrypted_content).toBe(ENCRYPTED_BLOB)
-
-    // The summary text should also be preserved
     expect(reasoningItem.summary?.[0]?.text).toBe(
       "I carefully considered the problem.",
     )
@@ -712,8 +700,10 @@ describe("encrypted_content round-trip: Responses → Anthropic → Responses", 
         (i as { type: string }).type === "reasoning",
     )
 
+    if (!rsItem)
+      throw new Error("reasoning item not found in full round-trip output")
     // encrypted_content must be exactly the original blob — no modification whatsoever
-    expect(rsItem?.encrypted_content).toBe(blob)
+    expect(rsItem.encrypted_content).toBe(blob)
   })
 
   test("Round-trip: reasoning item without encrypted_content produces no encrypted_content on next turn", () => {
@@ -741,10 +731,9 @@ describe("encrypted_content round-trip: Responses → Anthropic → Responses", 
     const anthropicMsg = translateResponsesToAnthropic(simulatedApiResponse)
     const thinkingBlock = anthropicMsg.content[0]
     expect(thinkingBlock.type).toBe("thinking")
-    if (thinkingBlock.type === "thinking") {
-      // No signature should be set on the Anthropic block
-      expect("signature" in thinkingBlock).toBe(false)
-    }
+    const tb = thinkingBlock as AnthropicThinkingBlock
+    // No signature should be set on the Anthropic block
+    expect(tb.signature).toBeUndefined()
 
     // Feed back as assistant turn
     const nextPayload = makeBasePayload({
@@ -760,8 +749,107 @@ describe("encrypted_content round-trip: Responses → Anthropic → Responses", 
       (i): i is ResponsesReasoningItem =>
         (i as { type: string }).type === "reasoning",
     )
-    expect(rsItem).toBeDefined()
+    if (!rsItem) throw new Error("reasoning item not found")
     // No encrypted_content should be present
-    expect(rsItem && "encrypted_content" in rsItem).toBe(false)
+    expect(rsItem.encrypted_content).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// encrypted_content edge cases
+// ---------------------------------------------------------------------------
+
+describe("encrypted_content edge cases", () => {
+  test("Multiple reasoning items each preserve their own encrypted_content blob", () => {
+    const blob1 = "blob-FIRST-aaa111"
+    const blob2 = "blob-SECOND-bbb222"
+
+    const apiResponse: ResponsesResponse = {
+      id: "resp_multi",
+      object: "response",
+      created_at: 1_700_000_000,
+      model: "gpt-5-codex",
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          id: "rs_A",
+          encrypted_content: blob1,
+          summary: [{ type: "summary_text", text: "First thought." }],
+          status: "completed",
+        },
+        {
+          type: "reasoning",
+          id: "rs_B",
+          encrypted_content: blob2,
+          summary: [{ type: "summary_text", text: "Second thought." }],
+          status: "completed",
+        },
+      ],
+    }
+
+    // Translate to Anthropic then back to Responses
+    const anthropicMsg = translateResponsesToAnthropic(apiResponse)
+    const nextPayload = makeBasePayload({
+      messages: [
+        { role: "user", content: "Multi-turn" },
+        { role: "assistant", content: anthropicMsg.content },
+      ],
+    })
+    const nextResponses = translateAnthropicToResponses(nextPayload)
+    const items = nextResponses.input as Array<unknown>
+
+    const reasoningItems = items.filter(
+      (i): i is ResponsesReasoningItem =>
+        (i as { type: string }).type === "reasoning",
+    )
+    expect(reasoningItems).toHaveLength(2)
+    // Each blob must match its original — no swapping or merging
+    expect(reasoningItems[0].encrypted_content).toBe(blob1)
+    expect(reasoningItems[1].encrypted_content).toBe(blob2)
+  })
+
+  test("Empty-string encrypted_content is not dropped (falsy guard bug)", () => {
+    // An empty-string blob is unusual but must not be silently dropped by
+    // a truthy check (if item.encrypted_content) since "" is falsy.
+    const apiResponse: ResponsesResponse = {
+      id: "resp_empty_blob",
+      object: "response",
+      created_at: 1_700_000_000,
+      model: "gpt-5-codex",
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          id: "rs_empty",
+          encrypted_content: "",
+          summary: [{ type: "summary_text", text: "Empty blob." }],
+          status: "completed",
+        },
+      ],
+    }
+
+    // Responses → Anthropic: should set signature to "" not omit it
+    const anthropicMsg = translateResponsesToAnthropic(apiResponse)
+    const tb = anthropicMsg.content[0] as AnthropicThinkingBlock
+    expect(tb.type).toBe("thinking")
+    // signature must be "" not absent
+    expect(tb.signature).toBe("")
+
+    // Anthropic → Responses: should set encrypted_content to "" not omit it
+    const nextPayload = makeBasePayload({
+      messages: [
+        { role: "user", content: "Q" },
+        { role: "assistant", content: anthropicMsg.content },
+      ],
+    })
+    const nextResponses = translateAnthropicToResponses(nextPayload)
+    const items = nextResponses.input as Array<unknown>
+    const rsItem = items.find(
+      (i): i is ResponsesReasoningItem =>
+        (i as { type: string }).type === "reasoning",
+    )
+    if (!rsItem) throw new Error("reasoning item not found")
+    expect(rsItem.encrypted_content).toBe("")
   })
 })
