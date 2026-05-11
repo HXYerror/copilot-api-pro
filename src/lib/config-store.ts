@@ -1,6 +1,8 @@
 import { consola } from "consola"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import fsPromises from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { z } from "zod"
 
@@ -59,6 +61,9 @@ let _currentConfig: Config = DEFAULT_CONFIG
 // ---------------------------------------------------------------------------
 
 function fsyncPath(targetPath: string): void {
+  // Opening a directory fd for fsync is POSIX-only; skip silently on Windows
+  // (rename is still atomic there via the NTFS journal).
+  if (os.platform() === "win32") return
   const fd = fs.openSync(targetPath, "r")
   try {
     fs.fsyncSync(fd)
@@ -71,11 +76,15 @@ export function saveConfig(config: Config, filePath = configPath()): void {
   // Validate before writing (throws on invalid input)
   const parsed = ConfigSchema.parse(config)
   const json = JSON.stringify(parsed, null, 2)
-  const tmpPath = `${filePath}.tmp`
+  // Use a PID + random-hex suffix to avoid collisions when saveConfig is
+  // called concurrently and to prevent symlink-clobber TOCTOU attacks
+  // (O_EXCL would also work but the random suffix is cross-platform).
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`
   const dir = path.dirname(filePath)
 
-  // Ensure parent directory exists
-  fs.mkdirSync(dir, { recursive: true })
+  // Ensure parent directory exists with restrictive permissions (0700 so
+  // other local users cannot traverse into it and enumerate file paths).
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
 
   // Write to .tmp atomically: open → write → fsync → close
   const fd = fs.openSync(tmpPath, "w", 0o600)
@@ -94,6 +103,9 @@ export function saveConfig(config: Config, filePath = configPath()): void {
 
   // Sync parent directory to persist the directory entry
   fsyncPath(dir)
+
+  // Keep in-memory view consistent with what was just written to disk
+  _currentConfig = parsed
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +114,7 @@ export function saveConfig(config: Config, filePath = configPath()): void {
 
 export async function loadConfig(filePath = configPath()): Promise<Config> {
   const dir = path.dirname(filePath)
-  await fsPromises.mkdir(dir, { recursive: true })
+  await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 })
 
   let raw: string
   try {
@@ -179,7 +191,8 @@ export function watchConfig(
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
   const watcher = fs.watch(dir, (_eventType, changedFile) => {
-    if (changedFile !== filename) return
+    // Guard against null filename (Linux can fire null for directory-level events)
+    if (!changedFile || changedFile !== filename) return
 
     if (debounceTimer) clearTimeout(debounceTimer)
     debounceTimer = setTimeout(() => {
@@ -214,8 +227,14 @@ export function watchConfig(
         }
 
         _currentConfig = result.data
-        onChange(result.data)
-      })()
+        // Pass a frozen snapshot to the callback so callers cannot accidentally
+        // mutate the shared in-memory config through the callback argument.
+        onChange(deepFreeze(structuredClone(result.data)))
+      })().catch((err: unknown) => {
+        consola.error(
+          `config.json reload: unexpected error in onChange callback: ${String(err)}`,
+        )
+      })
     }, 250)
   })
 

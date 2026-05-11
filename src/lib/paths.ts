@@ -2,8 +2,16 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
-const XDG_DATA_HOME =
-  process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share")
+// XDG Base Directory spec requires XDG_DATA_HOME to be an absolute path.
+// Reject relative values to prevent directory traversal when the env var is
+// set by an unprivileged caller (e.g. `XDG_DATA_HOME=../../etc`).
+function resolveXdgDataHome(): string {
+  const xdg = process.env.XDG_DATA_HOME
+  if (xdg !== undefined && path.isAbsolute(xdg)) return xdg
+  return path.join(os.homedir(), ".local", "share")
+}
+
+const XDG_DATA_HOME = resolveXdgDataHome()
 
 const APP_DIR = path.join(XDG_DATA_HOME, "copilot-api")
 

@@ -209,7 +209,11 @@ describe("saveConfig()", () => {
 
   test("is atomic — no .tmp file left behind after write", () => {
     saveConfig(validComplete, cfgPath)
-    expect(fs.existsSync(`${cfgPath}.tmp`)).toBe(false)
+    // With random-suffix tmp files (e.g. config.json.<pid>.<hex>.tmp) there
+    // must be no leftover file in the directory matching *.tmp after a
+    // successful write.
+    const tmpFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith(".tmp"))
+    expect(tmpFiles).toHaveLength(0)
   })
 
   test("overwriting preserves mode 0600", () => {
