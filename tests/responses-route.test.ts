@@ -297,3 +297,169 @@ describe("createResponses behavior", () => {
     expect(text).toContain("response.completed")
   })
 })
+
+// ---------------------------------------------------------------------------
+// Feature #11 — Copilot-Vision-Request header
+// ---------------------------------------------------------------------------
+
+describe("createResponses — vision header (#11)", () => {
+  beforeEach(() => {
+    state.copilotToken = "test-token"
+    state.vsCodeVersion = "1.99.0"
+    state.accountType = "individual"
+    state.manualApprove = false
+  })
+
+  afterEach(() => {
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = fetchMock
+  })
+
+  test("copilot-vision-request header is set when input contains input_image", async () => {
+    const captureMock = mock(
+      (_url: string, opts: { headers: Record<string, string> }) =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(mockResponseBody),
+          headers: opts.headers,
+        }),
+    )
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = captureMock
+
+    await server.request("/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        stream: false,
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: "What is in this image?" },
+              {
+                type: "input_image",
+                image_url: "https://example.com/img.png",
+                detail: "auto",
+              },
+            ],
+          },
+        ],
+      }),
+    })
+
+    expect(captureMock).toHaveBeenCalled()
+    const sentHeaders = (
+      captureMock.mock.calls[0][1] as { headers: Record<string, string> }
+    ).headers
+    expect(sentHeaders["copilot-vision-request"]).toBe("true")
+  })
+
+  test("copilot-vision-request header is absent for text-only input", async () => {
+    const captureMock = mock(
+      (_url: string, opts: { headers: Record<string, string> }) =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(mockResponseBody),
+          headers: opts.headers,
+        }),
+    )
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = captureMock
+
+    await server.request("/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        stream: false,
+        input: [{ type: "message", role: "user", content: "just text" }],
+      }),
+    })
+
+    expect(captureMock).toHaveBeenCalled()
+    const sentHeaders = (
+      captureMock.mock.calls[0][1] as { headers: Record<string, string> }
+    ).headers
+    expect(sentHeaders["copilot-vision-request"]).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Feature #12 — previous_response_id passthrough
+// ---------------------------------------------------------------------------
+
+describe("createResponses — previous_response_id passthrough (#12)", () => {
+  beforeEach(() => {
+    state.copilotToken = "test-token"
+    state.vsCodeVersion = "1.99.0"
+    state.accountType = "individual"
+    state.manualApprove = false
+  })
+
+  afterEach(() => {
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = fetchMock
+  })
+
+  test("previous_response_id is forwarded verbatim in the upstream request body", async () => {
+    const captureMock = mock(
+      (_url: string, opts: { headers: Record<string, string>; body: string }) =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(mockResponseBody),
+          headers: opts.headers,
+        }),
+    )
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = captureMock
+
+    await server.request("/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        stream: false,
+        input: [{ type: "message", role: "user", content: "continue" }],
+        previous_response_id: "resp_prev_123",
+      }),
+    })
+
+    expect(captureMock).toHaveBeenCalled()
+    const sentBody = JSON.parse(
+      (captureMock.mock.calls[0][1] as { body: string }).body,
+    ) as { previous_response_id?: string }
+    expect(sentBody.previous_response_id).toBe("resp_prev_123")
+  })
+
+  test("previous_response_id is absent in body when not provided", async () => {
+    const captureMock = mock(
+      (_url: string, opts: { headers: Record<string, string>; body: string }) =>
+        Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(mockResponseBody),
+          headers: opts.headers,
+        }),
+    )
+    // @ts-expect-error – mock doesn't implement full fetch signature
+    globalThis.fetch = captureMock
+
+    await server.request("/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        stream: false,
+        input: [{ type: "message", role: "user", content: "fresh start" }],
+      }),
+    })
+
+    expect(captureMock).toHaveBeenCalled()
+    const sentBody = JSON.parse(
+      (captureMock.mock.calls[0][1] as { body: string }).body,
+    ) as { previous_response_id?: string }
+    expect(sentBody.previous_response_id).toBeUndefined()
+  })
+})

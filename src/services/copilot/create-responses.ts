@@ -65,7 +65,6 @@ export const createResponses = async (
 
   const initiator = isAgentCall(payload) ? "agent" : "user"
 
-  // TODO(#11): add Copilot-Vision-Request header when vision detected
   const headers: Record<string, string> = {
     ...copilotHeaders(state, enableVision),
     "X-Initiator": initiator,
