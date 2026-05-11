@@ -6,7 +6,11 @@ import {
   beforeEach,
   beforeAll,
 } from "bun:test"
+import { writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
+import { loadConfig } from "../src/lib/config-store"
 import { getModelMode, isResponsesOnlyModel } from "../src/lib/model-routing"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
@@ -428,5 +432,84 @@ describe("GET /v1/models — mode field", () => {
     }
     const entry = body.data.find((m) => m.id === "o1-pro")
     expect(entry?.mode).toBe("responses")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// GET /v1/models — alias filtering from config
+// ---------------------------------------------------------------------------
+
+async function loadModelsConfig(
+  models: Record<string, { upstream: string; enabled?: boolean }>,
+): Promise<void> {
+  const filePath = join(tmpdir(), `models-route-test-${Date.now()}.json`)
+  await writeFile(filePath, JSON.stringify({ version: 1, models }), "utf8")
+  await loadConfig(filePath)
+}
+
+describe("GET /v1/models — alias filtering", () => {
+  afterEach(async () => {
+    // Reset to empty config (passthrough mode)
+    await loadModelsConfig({})
+  })
+
+  test("with no aliases configured, returns upstream models list", async () => {
+    state.models = {
+      object: "list",
+      data: [
+        {
+          id: "gpt-4o",
+          vendor: "OpenAI",
+          name: "GPT-4o",
+          object: "model",
+          version: "1",
+          preview: false,
+          model_picker_enabled: true,
+          capabilities: {
+            family: "gpt",
+            limits: {},
+            object: "model_capabilities",
+            supports: {},
+            tokenizer: "cl100k_base",
+            type: "chat",
+          },
+        },
+      ],
+    }
+    const res = await server.request("/v1/models", { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: Array<{ id: string }> }
+    expect(body.data.some((m) => m.id === "gpt-4o")).toBe(true)
+  })
+
+  test("with aliases configured, returns only alias entries", async () => {
+    await loadModelsConfig({
+      fast: { upstream: "gpt-4o-mini", enabled: true },
+      smart: { upstream: "gpt-4o", enabled: true },
+    })
+
+    const res = await server.request("/v1/models", { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: Array<{ id: string }> }
+    const ids = body.data.map((m) => m.id)
+    expect(ids).toContain("fast")
+    expect(ids).toContain("smart")
+    // Upstream names must not appear
+    expect(ids).not.toContain("gpt-4o-mini")
+    expect(ids).not.toContain("gpt-4o")
+  })
+
+  test("disabled aliases are hidden from the list", async () => {
+    await loadModelsConfig({
+      fast: { upstream: "gpt-4o-mini", enabled: true },
+      hidden: { upstream: "gpt-4o", enabled: false },
+    })
+
+    const res = await server.request("/v1/models", { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: Array<{ id: string }> }
+    const ids = body.data.map((m) => m.id)
+    expect(ids).toContain("fast")
+    expect(ids).not.toContain("hidden")
   })
 })
