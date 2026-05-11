@@ -103,6 +103,28 @@ describe("runMigrations", () => {
     expect(row?.user_version).toBe(1)
   })
 
+  it("applies all statements in a multi-statement migration file", () => {
+    if (!database) throw new Error("database not initialized")
+    const migrationsDir = makeTmpMigrations({
+      "001_multi.sql":
+        "CREATE TABLE IF NOT EXISTS t1 (id INTEGER PRIMARY KEY);\n"
+        + "CREATE TABLE IF NOT EXISTS t2 (id INTEGER PRIMARY KEY);",
+    })
+
+    runMigrations(database, migrationsDir)
+
+    // Both tables must exist — verifies that run() processes all statements
+    // in a multi-statement SQL file (not just the first).
+    const tables = database
+      .query<
+        { name: string },
+        []
+      >("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all()
+    expect(tables.map((r) => r.name)).toContain("t1")
+    expect(tables.map((r) => r.name)).toContain("t2")
+  })
+
   it("throws with filename in error on corrupt SQL", () => {
     if (!database) throw new Error("database not initialized")
     const migrationsDir = makeTmpMigrations({

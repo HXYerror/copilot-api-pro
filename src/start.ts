@@ -71,13 +71,22 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   // Run DB migrations BEFORE binding HTTP listener (no schema race)
   initDb()
+
+  // Graceful shutdown: close DB before exit to flush WAL and release locks.
+  // Guard getDb() — if initDb threw, db is undefined and getDb() would throw.
+  const shutdown = (code: number): void => {
+    try {
+      closeDb(getDb())
+    } catch {
+      // db was never initialized or already closed — safe to ignore
+    }
+    process.exit(code)
+  }
   process.on("SIGINT", () => {
-    closeDb(getDb())
-    process.exit(0)
+    shutdown(0)
   })
   process.on("SIGTERM", () => {
-    closeDb(getDb())
-    process.exit(0)
+    shutdown(0)
   })
 
   consola.info(
