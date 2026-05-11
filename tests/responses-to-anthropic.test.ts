@@ -367,6 +367,28 @@ describe("translateResponsesToAnthropic — status / stop_reason", () => {
     )
     expect(result.stop_reason).toBe("tool_use")
   })
+
+  test("function_call present with status 'in_progress' → stop_reason 'tool_use'", () => {
+    // The response-level status may still be "in_progress" while a function_call
+    // item is already present. tool_use must take precedence over any status-derived
+    // stop_reason so callers know to execute the tool.
+    const result = translateResponsesToAnthropic(
+      makeResponse({
+        status: "in_progress" as "completed",
+        output: [
+          {
+            type: "function_call",
+            id: "fc_inprog",
+            call_id: "call_inprog",
+            name: "stream_tool",
+            arguments: '{"x":1}',
+            status: "in_progress",
+          },
+        ],
+      }),
+    )
+    expect(result.stop_reason).toBe("tool_use")
+  })
 })
 
 // ---------------------------------------------------------------------------
