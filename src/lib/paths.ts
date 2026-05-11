@@ -2,13 +2,23 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
-const APP_DIR = path.join(os.homedir(), ".local", "share", "copilot-api")
+const XDG_DATA_HOME =
+  process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share")
+
+const APP_DIR = path.join(XDG_DATA_HOME, "copilot-api")
 
 const GITHUB_TOKEN_PATH = path.join(APP_DIR, "github_token")
+
+const CONFIG_PATH = path.join(APP_DIR, "config.json")
 
 export const PATHS = {
   APP_DIR,
   GITHUB_TOKEN_PATH,
+  CONFIG_PATH,
+}
+
+export function configPath(): string {
+  return CONFIG_PATH
 }
 
 export async function ensurePaths(): Promise<void> {
