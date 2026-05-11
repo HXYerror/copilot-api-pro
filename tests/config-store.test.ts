@@ -280,8 +280,8 @@ describe("watchConfig()", () => {
     writeJson(cfgPath, updated)
     writeJson(cfgPath, updated)
 
-    // Wait longer than the 250ms debounce + some headroom
-    await new Promise<void>((resolve) => setTimeout(resolve, 600))
+    // Wait longer than the 250ms debounce + generous headroom for parallel test load
+    await new Promise<void>((resolve) => setTimeout(resolve, 900))
 
     expect(callCount).toBe(1)
     expect(receivedConfig).not.toBeNull()
@@ -297,7 +297,7 @@ describe("watchConfig()", () => {
     // Write corrupt JSON — should NOT invoke callback, should keep previous
     fs.writeFileSync(cfgPath, "{ INVALID JSON !!!", { mode: 0o600 })
 
-    await new Promise<void>((resolve) => setTimeout(resolve, 600))
+    await new Promise<void>((resolve) => setTimeout(resolve, 900))
 
     // Callback must NOT have been called with a broken config
     expect(callbacks.length).toBe(0)
@@ -324,7 +324,7 @@ describe("watchConfig()", () => {
     }
     writeJson(cfgPath, updated)
 
-    await new Promise<void>((resolve) => setTimeout(resolve, 600))
+    await new Promise<void>((resolve) => setTimeout(resolve, 900))
     expect(callCount).toBe(0)
   })
 })

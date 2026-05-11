@@ -3,6 +3,7 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
+import { resolveAlias, resolveUpstream } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
@@ -18,6 +19,9 @@ import {
 export async function handleCompletion(c: Context) {
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
+
+  // Ingress: rewrite client-facing alias → upstream model name
+  payload = { ...payload, model: resolveAlias(payload.model) }
 
   if (getModelMode(payload.model) === "responses") {
     return c.json(
@@ -65,7 +69,8 @@ export async function handleCompletion(c: Context) {
 
   if (isNonStreaming(response)) {
     consola.debug("Non-streaming response:", JSON.stringify(response))
-    return c.json(response)
+    // Egress: rewrite upstream model name back to client-facing alias
+    return c.json({ ...response, model: resolveUpstream(response.model) })
   }
 
   consola.debug("Streaming response")

@@ -3,6 +3,7 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
+import { resolveAlias } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
@@ -40,22 +41,28 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
+  // Ingress: rewrite client-facing alias → upstream model name
+  const payload: AnthropicMessagesPayload = {
+    ...anthropicPayload,
+    model: resolveAlias(anthropicPayload.model),
+  }
+
   if (state.manualApprove) {
     await awaitApproval()
   }
 
   // Route to native Anthropic pass-through for Claude models to preserve
   // thinking blocks (with signature), top_k, cache_control, and richer usage.
-  if (isNativeAnthropicModel(anthropicPayload.model)) {
-    return handleNative(c, anthropicPayload)
+  if (isNativeAnthropicModel(payload.model)) {
+    return handleNative(c, payload)
   }
 
   // Route Responses-only models (codex, o-pro variants) via the Responses API.
-  if (getModelMode(anthropicPayload.model) === "responses") {
-    return handleAnthropicViaResponses(c, anthropicPayload)
+  if (getModelMode(payload.model) === "responses") {
+    return handleAnthropicViaResponses(c, payload)
   }
 
-  return handleTranslated(c, anthropicPayload)
+  return handleTranslated(c, payload)
 }
 
 // ---------------------------------------------------------------------------
