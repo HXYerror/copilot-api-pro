@@ -6,6 +6,7 @@ import consola from "consola"
 import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
+import { runBootstrap } from "./lib/bootstrap"
 import { closeDb, getDb, initDb } from "./lib/db"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
@@ -71,6 +72,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   // Run DB migrations BEFORE binding HTTP listener (no schema race)
   initDb()
+
+  // First-run admin bootstrap (no-op if auth disabled or keys exist)
+  runBootstrap()
 
   // Graceful shutdown: close DB before exit to flush WAL and release locks.
   // Guard getDb() — if initDb threw, db is undefined and getDb() would throw.

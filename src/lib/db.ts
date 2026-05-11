@@ -134,7 +134,11 @@ export function runMigrations(
       database.run("BEGIN EXCLUSIVE")
       // run() in bun:sqlite handles multiple semicolon-separated statements.
       // exec() is deprecated — use run() for the full SQL string.
-      if (sql.trim()) database.run(sql)
+      // Strip line comments before testing for emptiness: a comment-only file
+      // (e.g. placeholder migrations) should be treated as a no-op so that
+      // bun:sqlite does not throw "Query contained no valid SQL statement".
+      const sqlNoComments = sql.replaceAll(/--[^\n]*/g, "")
+      if (sqlNoComments.trim()) database.run(sql)
       // PRAGMA user_version cannot use a bound parameter — interpolate the
       // validated integer directly.
       database.run(`PRAGMA user_version = ${num}`)
