@@ -3,17 +3,23 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
+import type { ResponsesResponse } from "~/routes/responses/types"
+
 import { awaitApproval } from "~/lib/approval"
+import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
+import { sanitiseResponsesOutput } from "~/routes/responses/translation"
 import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
 import { createMessagesNative } from "~/services/copilot/create-messages-native"
+import { createResponses } from "~/services/copilot/create-responses"
 import { isNativeAnthropicModel } from "~/services/copilot/native-models"
 
+import { translateAnthropicToResponses } from "./anthropic-to-responses"
 import {
   type AnthropicMessagesPayload,
   type AnthropicStreamEventData,
@@ -23,6 +29,7 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
+import { translateResponsesToAnthropic } from "./responses-to-anthropic"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
 
 export async function handleCompletion(c: Context) {
@@ -39,6 +46,11 @@ export async function handleCompletion(c: Context) {
   // thinking blocks (with signature), top_k, cache_control, and richer usage.
   if (isNativeAnthropicModel(anthropicPayload.model)) {
     return handleNative(c, anthropicPayload)
+  }
+
+  // Route Responses-only models (codex, o-pro variants) via the Responses API.
+  if (getModelMode(anthropicPayload.model) === "responses") {
+    return handleAnthropicViaResponses(c, anthropicPayload)
   }
 
   return handleTranslated(c, anthropicPayload)
@@ -92,6 +104,46 @@ async function handleNative(
       }
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// Responses API path (Responses-only models via /responses)
+// ---------------------------------------------------------------------------
+
+async function handleAnthropicViaResponses(
+  c: Context,
+  payload: AnthropicMessagesPayload,
+): Promise<Response> {
+  consola.debug("Routing /v1/messages via Responses API for", payload.model)
+
+  if (payload.stream) {
+    // TODO(#10): implement streaming translation
+    return c.json(
+      {
+        error: {
+          message:
+            "Streaming not yet supported for Responses-API models via /v1/messages. Use /v1/responses directly.",
+          type: "not_implemented",
+          code: "streaming_not_implemented",
+        },
+      },
+      501,
+    )
+  }
+
+  const responsesPayload = translateAnthropicToResponses(payload)
+  const rawResponse = await createResponses({
+    ...responsesPayload,
+    stream: false,
+  })
+  const sanitised = sanitiseResponsesOutput(rawResponse as ResponsesResponse)
+  const anthropicResponse = translateResponsesToAnthropic(sanitised)
+
+  consola.debug(
+    "Responses→Anthropic translated response:",
+    JSON.stringify(anthropicResponse).slice(0, 400),
+  )
+  return c.json(anthropicResponse)
 }
 
 // ---------------------------------------------------------------------------

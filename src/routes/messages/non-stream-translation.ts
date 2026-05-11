@@ -292,19 +292,22 @@ export function translateToAnthropic(
   response: ChatCompletionResponse,
 ): AnthropicResponse {
   // Merge content from all choices
+  const allThinkingBlocks: Array<AnthropicThinkingBlock> = []
   const allTextBlocks: Array<AnthropicTextBlock> = []
   const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
   let stopReason: "stop" | "length" | "tool_calls" | "content_filter" | null =
     null // default
   stopReason = response.choices[0]?.finish_reason ?? stopReason
 
-  // Process all choices to extract text and tool use blocks
+  // Process all choices to extract thinking, text and tool use blocks
   for (const choice of response.choices) {
-    const textBlocks = getAnthropicTextBlocks(choice.message.content)
-    const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
-
-    allTextBlocks.push(...textBlocks)
-    allToolUseBlocks.push(...toolUseBlocks)
+    allThinkingBlocks.push(
+      ...getAnthropicThinkingBlocks(choice.message.reasoning_content),
+    )
+    allTextBlocks.push(...getAnthropicTextBlocks(choice.message.content))
+    allToolUseBlocks.push(
+      ...getAnthropicToolUseBlocks(choice.message.tool_calls),
+    )
 
     // Use the finish_reason from the first choice, or prioritize tool_calls
     if (choice.finish_reason === "tool_calls" || stopReason === "stop") {
@@ -321,7 +324,7 @@ export function translateToAnthropic(
     type: "message",
     role: "assistant",
     model: response.model,
-    content: [...allTextBlocks, ...allToolUseBlocks],
+    content: [...allThinkingBlocks, ...allTextBlocks, ...allToolUseBlocks],
     stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
     stop_sequence: null,
     usage: {
@@ -336,6 +339,13 @@ export function translateToAnthropic(
       }),
     },
   }
+}
+
+function getAnthropicThinkingBlocks(
+  reasoningContent: string | null | undefined,
+): Array<AnthropicThinkingBlock> {
+  if (!reasoningContent) return []
+  return [{ type: "thinking", thinking: reasoningContent }]
 }
 
 function getAnthropicTextBlocks(
