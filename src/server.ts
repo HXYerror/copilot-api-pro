@@ -2,6 +2,7 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 
+import { auditAdminRoute } from "./admin/audit/route"
 import { authMiddleware } from "./middleware/auth"
 import { completionRoutes } from "./routes/chat-completions/route"
 import { embeddingRoutes } from "./routes/embeddings/route"
@@ -41,3 +42,6 @@ server.route("/v1/messages", messageRoutes)
 // OpenAI Responses API
 server.route("/responses", responses)
 server.route("/v1/responses", responses)
+
+// Admin routes (requireAdminMiddleware is applied inside the route)
+server.route("/admin/audit", auditAdminRoute)

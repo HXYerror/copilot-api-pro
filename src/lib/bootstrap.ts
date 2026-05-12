@@ -2,6 +2,7 @@ import consola from "consola"
 import fs from "node:fs"
 import path from "node:path"
 
+import { audit } from "~/services/audit"
 import { countActiveAdminKeys, createKey } from "~/services/keys"
 
 import { getConfig } from "./config-store"
@@ -69,6 +70,14 @@ export function runBootstrap(): void {
     )
     throw err
   }
+
+  // Audit the bootstrap event after the key file is successfully written
+  audit({
+    actor_key_id: "__system__",
+    actor_tier: "system",
+    action: "auth.bootstrap",
+    after: { label: "bootstrap-admin" },
+  })
 
   // Output: full key on TTY; path-only on non-TTY (Docker/journald — avoid log capture)
   if (process.stdout.isTTY) {

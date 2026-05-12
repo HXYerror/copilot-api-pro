@@ -35,6 +35,7 @@ const RetentionSchema = z.object({
   events_days: z.number().int().min(0).default(90),
   traces_days: z.number().int().min(0).default(7),
   traces_max_bytes: z.number().int().min(0).default(104857600), // 100MB
+  audit_days: z.number().int().min(0).default(365),
 })
 
 const FeaturesSchema = z.object({

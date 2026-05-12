@@ -79,7 +79,12 @@ function makeTmpConfig(override: Partial<Config["features"]> = {}): {
   const cfg: Config = {
     version: 1,
     models: {},
-    retention: { events_days: 90, traces_days: 7, traces_max_bytes: 104857600 },
+    retention: {
+      events_days: 90,
+      traces_days: 7,
+      traces_max_bytes: 104857600,
+      audit_days: 365,
+    },
     features: { auth: true, telemetry: false, debug: false, ...override },
   }
   saveConfig(cfg, cfgPath)

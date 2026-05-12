@@ -42,6 +42,7 @@ const validComplete: Config = {
     events_days: 30,
     traces_days: 7,
     traces_max_bytes: 104857600,
+    audit_days: 365,
   },
   features: {
     auth: true,
@@ -81,6 +82,7 @@ describe("ConfigSchema — validates a complete config", () => {
     expect(data.retention.events_days).toBe(90)
     expect(data.retention.traces_days).toBe(7)
     expect(data.retention.traces_max_bytes).toBe(104857600)
+    expect(data.retention.audit_days).toBe(365)
     expect(data.features.auth).toBe(false)
     expect(data.features.telemetry).toBe(false)
     expect(data.features.debug).toBe(false)

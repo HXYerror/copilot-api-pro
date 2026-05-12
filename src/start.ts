@@ -7,6 +7,7 @@ import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
 import { runBootstrap } from "./lib/bootstrap"
+import { getConfig } from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
@@ -16,6 +17,7 @@ import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels } from "./lib/utils"
 import { warnNoAuth } from "./middleware/auth"
 import { server } from "./server"
+import { audit, initAudit } from "./services/audit"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
 
@@ -32,10 +34,9 @@ interface RunServerOptions {
   proxyEnv: boolean
 }
 
-export async function runServer(options: RunServerOptions): Promise<void> {
-  if (options.proxyEnv) {
-    initProxyFromEnv()
-  }
+/** Apply CLI options to mutable state and kick off version fetches. */
+async function applyOptions(options: RunServerOptions): Promise<void> {
+  if (options.proxyEnv) initProxyFromEnv()
 
   if (options.verbose) {
     consola.level = 5
@@ -46,7 +47,6 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.accountType !== "individual") {
     consola.info(`Using ${options.accountType} plan GitHub account`)
   }
-
   state.manualApprove = options.manual
   state.rateLimitSeconds = options.rateLimit
   state.rateLimitWait = options.rateLimitWait
@@ -70,15 +70,31 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   await setupCopilotToken()
   await cacheModels()
+}
+
+export async function runServer(options: RunServerOptions): Promise<void> {
+  await applyOptions(options)
 
   // Run DB migrations BEFORE binding HTTP listener (no schema race)
   initDb()
+
+  // Initialize audit log — prunes old files beyond retention
+  initAudit()
 
   // Warn if --no-auth mode is active (safe to call unconditionally)
   warnNoAuth()
 
   // First-run admin bootstrap (no-op if auth disabled or keys exist)
   runBootstrap()
+
+  // Emit audit event when starting without authentication
+  if (!getConfig().features.auth) {
+    audit({
+      actor_key_id: "__system__",
+      actor_tier: "system",
+      action: "server.start_no_auth",
+    })
+  }
 
   // Graceful shutdown: close DB before exit to flush WAL and release locks.
   // Guard getDb() — if initDb threw, db is undefined and getDb() would throw.

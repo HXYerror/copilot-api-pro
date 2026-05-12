@@ -8,6 +8,7 @@ import type { KeyRow } from "~/services/keys"
 import { getConfig } from "~/lib/config-store"
 import { HTTPError } from "~/lib/error"
 import { checkKeyRateLimit } from "~/lib/rate-limit"
+import { audit } from "~/services/audit"
 import { findKeyByHash } from "~/services/keys"
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,33 @@ export function isModelAllowed(
 }
 
 // ---------------------------------------------------------------------------
+// Auth middleware helpers
+// ---------------------------------------------------------------------------
+
+const AUTH_401_HEADERS = { "WWW-Authenticate": 'Bearer realm="copilot-api"' }
+
+type HonoCtx = Parameters<MiddlewareHandler<{ Variables: KeyVar }>>[0]
+
+function auditReject(c: HonoCtx, hashPrefix?: string): void {
+  audit({
+    actor_key_id: "__noauth__",
+    actor_tier: "system",
+    action: "auth.reject",
+    ...(hashPrefix !== undefined && { target: hashPrefix }),
+    ip: c.req.header("x-forwarded-for"),
+    user_agent: c.req.header("user-agent"),
+  })
+}
+
+function rejectJson(c: HonoCtx, message: string): ReturnType<HonoCtx["json"]> {
+  return c.json(
+    { error: { message, type: "invalid_api_key", code: "invalid_api_key" } },
+    401,
+    AUTH_401_HEADERS,
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
 
@@ -147,98 +175,63 @@ export const authMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   c,
   next,
 ) => {
-  // Strip sensitive client headers BEFORE any branching so they are never
-  // forwarded upstream in no-auth mode or after auth passes.
-  //
-  // Note: Bun's Fetch API uses a "request" guard that allows .delete() on
-  // server-side Request.headers. This is a Bun extension (not guaranteed by
-  // the Fetch spec) — tracked at https://github.com/oven-sh/bun/issues/XXXX.
-  // Downstream copilotHeaders() builds its own outbound Headers from
-  // state.copilotToken, so even if delete() were a no-op, the client's
-  // Authorization would not be used for the upstream call.
+  // Strip sensitive client headers BEFORE any branching.
+  // Note: Bun allows .delete() on server Request.headers (non-spec extension).
+  // copilotHeaders() always builds its own Headers from state.copilotToken so
+  // the client's Authorization is never forwarded upstream regardless.
   c.req.raw.headers.delete("x-api-key")
   c.req.raw.headers.delete("cookie")
 
-  const config = getConfig()
-
-  // --no-auth short-circuit
-  if (!config.features.auth) {
+  if (!getConfig().features.auth) {
     c.set("key", NO_AUTH_SENTINEL)
     await next()
     return
   }
 
   const authHeader = c.req.header("Authorization")
-
   if (!authHeader) {
-    return c.json(
-      {
-        error: {
-          message: "Missing Authorization header",
-          type: "invalid_api_key",
-          code: "invalid_api_key",
-        },
-      },
-      401,
-      { "WWW-Authenticate": 'Bearer realm="copilot-api"' },
-    )
+    auditReject(c)
+    return rejectJson(c, "Missing Authorization header")
   }
 
-  // Extract bearer token — case-insensitive scheme per RFC 7235 §2
-  const lower = authHeader.toLowerCase()
-  const bearer = lower.startsWith("bearer ") ? authHeader.slice(7) : authHeader
-
-  // Strip the Authorization header from the raw request after extraction
+  // Case-insensitive scheme extraction per RFC 7235 §2
+  const bearer =
+    authHeader.toLowerCase().startsWith("bearer ") ?
+      authHeader.slice(7)
+    : authHeader
   c.req.raw.headers.delete("authorization")
 
-  // Validate full sk-cap- token format before hashing
   if (!SK_CAP_RE.test(bearer)) {
     const hint =
       bearer.startsWith("sk-cap-") ?
         "Malformed sk-cap-* key (expected sk-cap- + 52 uppercase base32 chars)"
       : "this proxy does not forward your GitHub token; use a sk-cap-* key issued by this server"
     consola.warn("[auth] Rejected request: invalid bearer token format")
-    return c.json(
-      {
-        error: {
-          message: hint,
-          type: "invalid_api_key",
-          code: "invalid_api_key",
-        },
-      },
-      401,
-      { "WWW-Authenticate": 'Bearer realm="copilot-api"' },
-    )
+    const prefix = crypto
+      .createHash("sha256")
+      .update(bearer)
+      .digest("hex")
+      .slice(0, 8)
+    auditReject(c, prefix)
+    return rejectJson(c, hint)
   }
 
-  // Hash and look up
   const hash = crypto.createHash("sha256").update(bearer).digest("hex")
   const keyRecord = findKeyByHash(hash)
 
   if (!keyRecord || keyRecord.revoked_at !== null) {
     consola.warn("[auth] Rejected request: key not found or revoked")
-    return c.json(
-      {
-        error: {
-          message: "Invalid API key",
-          type: "invalid_api_key",
-          code: "invalid_api_key",
-        },
-      },
-      401,
-      { "WWW-Authenticate": 'Bearer realm="copilot-api"' },
-    )
+    auditReject(c, hash.slice(0, 8))
+    return rejectJson(c, "Invalid API key")
   }
 
-  // X-Capi-Debug header: strip from raw request unconditionally so it is
-  // never forwarded to GitHub. Honour it only for admin-tier keys via context.
+  // Strip X-Capi-Debug unconditionally; only honor for admin-tier keys via context
   const debugHeader = c.req.header("x-capi-debug")
   c.req.raw.headers.delete("x-capi-debug")
   if (debugHeader !== undefined && keyRecord.tier !== "admin") {
     consola.warn("[auth] Stripped X-Capi-Debug from client-tier request")
   }
 
-  // Per-key rate limit check — checkKeyRateLimit throws HTTPError on breach
   try {
     checkKeyRateLimit(keyRecord.id, keyRecord.rate_limit_override)
   } catch (err) {
