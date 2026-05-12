@@ -56,7 +56,7 @@ indexApp.get("/", (c) => {
   const keyIdSuffix = session.key_id.slice(-4)
 
   return c.html(
-    <Layout title="Overview" active="index">
+    <Layout title="Overview" active="index" csrfToken={session.csrf_token}>
       <h1>Overview</h1>
       <div class="status-grid">
         <div class="status-card">

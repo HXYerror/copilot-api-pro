@@ -45,8 +45,9 @@ export const CSRF_HEADER = "x-csrf-token"
 /** Build Set-Cookie value for the CSRF token cookie */
 export function csrfCookieValue(token: string): string {
   // SameSite=Strict prevents cross-origin form submissions.
-  // NOT HttpOnly — JS/form must be able to read it for the double-submit pattern.
-  return `${CSRF_COOKIE}=${token}; SameSite=Strict; Path=/admin`
+  // NOT HttpOnly — JS/forms must be able to read it for the double-submit pattern.
+  // Secure — must only be transmitted over HTTPS (consistent with the session cookie).
+  return `${CSRF_COOKIE}=${token}; SameSite=Strict; Secure; Path=/admin`
 }
 
 /** Extract CSRF token from cookie string */

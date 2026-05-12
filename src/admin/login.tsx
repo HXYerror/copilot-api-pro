@@ -2,6 +2,7 @@ import { Hono } from "hono"
 /** @jsxImportSource hono/jsx */
 import crypto from "node:crypto"
 
+import { getDb } from "~/lib/db"
 import { findKeyByHash } from "~/services/keys"
 
 import { csrfCookieValue, generateCsrfToken } from "./csrf"
@@ -82,6 +83,11 @@ loginApp.post("/", async (c) => {
   ) {
     return c.redirect("/admin/login?error=invalid", 303)
   }
+
+  // Invalidate any existing sessions for this key before creating a new one.
+  // This ensures stolen sessions cannot outlive a legitimate re-login and
+  // enforces "one active session per key" semantics.
+  getDb().run("DELETE FROM sessions WHERE key_id = ?", [keyRecord.id])
 
   // Create session
   const session = createSession(keyRecord.id)

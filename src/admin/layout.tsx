@@ -20,12 +20,15 @@ export const ADMIN_SECURITY_HEADERS = {
 interface LayoutProps {
   title?: string
   active?: "index" | "keys" | "usage" | "audit" | "settings"
+  /** CSRF token for the logout form (required for session-protected pages). */
+  csrfToken?: string
   children?: unknown
 }
 
 export const Layout: FC<LayoutProps> = ({
   title = "Admin",
   active,
+  csrfToken,
   children,
 }) => {
   const navItems: Array<{
@@ -69,6 +72,11 @@ export const Layout: FC<LayoutProps> = ({
             action="/admin/session/logout"
             class="admin-header__logout"
           >
+            {/* CSRF hidden field: required because HTML forms cannot send custom headers.
+                The session middleware also accepts the token from the form body. */}
+            {csrfToken && (
+              <input type="hidden" name="csrf_token" value={csrfToken} />
+            )}
             <button type="submit">Logout</button>
           </form>
         </header>

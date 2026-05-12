@@ -53,11 +53,12 @@ server.get("/readyz", (c) => {
 
 // Static assets — served before session check
 server.get("/admin/assets/*", (c) => {
-  const assetsDir = path.join(import.meta.dirname, "admin/assets")
+  const assetsDir = path.join(import.meta.dirname, "admin/assets") + path.sep
   const reqPath = c.req.path.replace("/admin/assets/", "")
   const filePath = path.join(assetsDir, reqPath)
 
-  // Path traversal guard
+  // Path traversal guard: use path.sep suffix so a sibling directory
+  // named "admin/assets_evil" cannot bypass the startsWith check.
   if (!filePath.startsWith(assetsDir)) {
     return c.text("Not Found", 404)
   }
@@ -65,6 +66,7 @@ server.get("/admin/assets/*", (c) => {
   let content: string
   let contentType: string
   try {
+    // Low-traffic admin-only path: synchronous read is acceptable here.
     content = fs.readFileSync(filePath, "utf8")
   } catch {
     return c.text("Not Found", 404)

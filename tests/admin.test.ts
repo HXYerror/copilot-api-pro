@@ -29,7 +29,7 @@ import { loadConfig, saveConfig } from "../src/lib/config-store"
 import { closeDb, getDb, initDb, resetDb } from "../src/lib/db"
 import { _resetNoAuthWarned_TEST_ONLY } from "../src/middleware/auth"
 import { server } from "../src/server"
-import { createKey, findKeyByHash } from "../src/services/keys"
+import { createKey, findKeyByHash, revokeKey } from "../src/services/keys"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -228,14 +228,23 @@ describe("Session management", () => {
     )
   })
 
-  test("getSession returns the session after creation", () => {
+  test("getSession extends expires_at in the DB (sliding window)", () => {
     const { plain } = createKey({ tier: "admin" })
     const keyRow = findKeyByHash(hashPlain(plain))
     if (!keyRow) throw new Error("key not found")
     const session = createSession(keyRow.id)
+
+    // Manually wind back the expiry
+    const earlyExpiry = Date.now() + 60_000 // 1 minute from now
+    getDb().run("UPDATE sessions SET expires_at = ? WHERE id = ?", [
+      earlyExpiry,
+      session.id,
+    ])
+
     const fetched = getSession(session.id)
     expect(fetched).not.toBeNull()
-    expect(fetched?.key_id).toBe(keyRow.id)
+    // The returned expiry should be much greater than earlyExpiry
+    expect(fetched?.expires_at).toBeGreaterThan(earlyExpiry + 100_000)
   })
 
   test("getSession returns null for non-existent session", () => {
@@ -298,6 +307,17 @@ describe("isRequestAllowed", () => {
     expect(isRequestAllowed(makeIsAllowedCtx({ host: "127.0.0.1:4141" }))).toBe(
       true,
     )
+  })
+
+  test("allows IPv6 [::1] HTTP", () => {
+    expect(
+      isRequestAllowed(
+        makeIsAllowedCtx({
+          host: "[::1]:4141",
+          url: "http://[::1]:4141/admin",
+        }),
+      ),
+    ).toBe(true)
   })
 
   test("allows HTTPS from any host", () => {
@@ -431,6 +451,45 @@ describe("GET /admin/login", () => {
     expect(res.headers.get("location")).toContain("error=invalid")
   })
 
+  test("POST login invalidates previous sessions for the same key", async () => {
+    const { plain } = createKey({ tier: "admin" })
+
+    // First login
+    const loginRes1 = await server.request("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `key=${plain}`,
+    })
+    const cookies1 = getSetCookies(loginRes1)
+    const sid1 = cookies1.find((c) => c.startsWith("sid="))?.split(";")[0] ?? ""
+    const sidValue1 = sid1.split("=")[1] ?? ""
+
+    // Verify first session exists
+    expect(getSession(sidValue1)).not.toBeNull()
+
+    // Second login (re-login invalidates first session)
+    await server.request("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `key=${plain}`,
+    })
+
+    // First session must now be gone
+    expect(getSession(sidValue1)).toBeNull()
+  })
+
+  test("POST with revoked key redirects to /admin/login?error=invalid", async () => {
+    const { plain, row } = createKey({ tier: "admin" })
+    revokeKey(row.id)
+    const res = await server.request("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `key=${plain}`,
+    })
+    expect(res.status).toBe(303)
+    expect(res.headers.get("location")).toContain("error=invalid")
+  })
+
   test("POST with client-tier key redirects to /admin/login?error=invalid", async () => {
     const { plain } = createKey({ tier: "client" })
     const res = await server.request("/admin/login", {
@@ -525,7 +584,7 @@ describe("Session-protected /admin routes", () => {
     expect(body).toContain("Overview")
   })
 
-  test("POST /admin/session/logout clears session cookie", async () => {
+  test("POST /admin/session/logout clears session cookie (CSRF via form body)", async () => {
     const { plain } = createKey({ tier: "admin" })
     const loginRes = await server.request("/admin/login", {
       method: "POST",
@@ -543,18 +602,71 @@ describe("Session-protected /admin routes", () => {
       .filter(Boolean)
       .join("; ")
 
+    // Send CSRF token in form body (as an HTML form would)
     const logoutRes = await server.request("/admin/session/logout", {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
         "Sec-Fetch-Site": "same-origin",
-        [CSRF_HEADER]: csrfValue,
+        "Content-Type": "application/x-www-form-urlencoded",
       },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}`,
     })
     expect(logoutRes.status).toBe(303)
     const afterCookies = getSetCookies(logoutRes)
     const clearCookie = afterCookies.find((c) => c.startsWith("sid="))
     expect(clearCookie).toContain("Max-Age=0")
+  })
+
+  test("POST /admin/session/logout without CSRF returns 403", async () => {
+    const { plain } = createKey({ tier: "admin" })
+    const loginRes = await server.request("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `key=${plain}`,
+    })
+    const cookies = getSetCookies(loginRes)
+    const sidValue =
+      cookies.find((c) => c.startsWith("sid="))?.split(";")[0] ?? ""
+
+    // No CSRF token at all
+    const logoutRes = await server.request("/admin/session/logout", {
+      method: "POST",
+      headers: {
+        Cookie: sidValue,
+        "Sec-Fetch-Site": "same-origin",
+      },
+    })
+    expect(logoutRes.status).toBe(403)
+  })
+
+  test("POST /admin/session/logout without Sec-Fetch-Site returns 403", async () => {
+    const { plain } = createKey({ tier: "admin" })
+    const loginRes = await server.request("/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `key=${plain}`,
+    })
+    const cookies = getSetCookies(loginRes)
+    const sidCookie = cookies.find((c) => c.startsWith("sid="))
+    const sidValue = sidCookie?.split(";")[0] ?? ""
+    const csrfCookieStr = cookies.find((c) => c.startsWith(`${CSRF_COOKIE}=`))
+    const csrfParts = csrfCookieStr?.split(";")[0]?.split("=") ?? []
+    const csrfValue = csrfParts.slice(1).join("=")
+
+    const cookieHeader = [sidValue, csrfCookieStr?.split(";")[0]]
+      .filter(Boolean)
+      .join("; ")
+
+    // Missing Sec-Fetch-Site header
+    const logoutRes = await server.request("/admin/session/logout", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        [CSRF_HEADER]: csrfValue,
+      },
+    })
+    expect(logoutRes.status).toBe(403)
   })
 })
 

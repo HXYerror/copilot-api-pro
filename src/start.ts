@@ -6,6 +6,7 @@ import consola from "consola"
 import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
+import { purgeExpiredSessions } from "./admin/session"
 import { runBootstrap } from "./lib/bootstrap"
 import { getConfig } from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
@@ -86,6 +87,15 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   // First-run admin bootstrap (no-op if auth disabled or keys exist)
   runBootstrap()
+
+  // Purge expired sessions on startup, then sweep hourly.
+  purgeExpiredSessions()
+  setInterval(
+    () => {
+      purgeExpiredSessions()
+    },
+    60 * 60 * 1000,
+  )
 
   // Emit audit event when starting without authentication
   if (!getConfig().features.auth) {
