@@ -2,12 +2,12 @@ import consola from "consola"
 import fs from "node:fs"
 import path from "node:path"
 
-import { countActiveAdminKeys, createKey, hashKey } from "~/services/keys"
+import { countActiveAdminKeys, createKey } from "~/services/keys"
 
 import { getConfig } from "./config-store"
 import { PATHS } from "./paths"
 
-const ADMIN_KEY_FILE = path.join(PATHS.APP_DIR, "admin.key.txt")
+export const ADMIN_KEY_FILE = path.join(PATHS.APP_DIR, "admin.key.txt")
 
 /**
  * Returns true if the admin bootstrap file exists (operator hasn't read it yet).
@@ -19,40 +19,64 @@ export function bootstrapFilePending(): boolean {
 /**
  * Run bootstrap: if auth is enabled and no admin keys exist, generate one.
  * Called during startup AFTER initDb() and BEFORE HTTP listener binds.
+ *
+ * Logic:
+ * 1. If auth is disabled → no-op.
+ * 2. If admin keys already exist in DB → warn if file still present, return.
+ * 3. Otherwise → create first admin key and write to ADMIN_KEY_FILE.
  */
 export function runBootstrap(): void {
   const { features } = getConfig()
   if (!features.auth) return // auth off — no bootstrap needed
 
-  if (bootstrapFilePending()) {
-    // Bootstrap file still exists — operator must read and delete it first
-    consola.error(
-      `Startup blocked: admin bootstrap file exists at ${ADMIN_KEY_FILE}.\n`
-        + `Please read your admin key and delete this file before restarting:\n`
-        + `  cat ${ADMIN_KEY_FILE} && rm ${ADMIN_KEY_FILE}`,
-    )
-    process.exit(1)
+  const adminCount = countActiveAdminKeys()
+
+  if (adminCount > 0) {
+    // Already bootstrapped. Remind operator to delete the key file if it lingers.
+    if (bootstrapFilePending()) {
+      consola.warn(
+        `Admin key file still present at ${ADMIN_KEY_FILE}. Delete it after reading:\n`
+          + `  rm ${ADMIN_KEY_FILE}`,
+      )
+    }
+    return
   }
 
-  const adminCount = countActiveAdminKeys()
-  if (adminCount > 0) return // admin keys exist — no bootstrap needed
-
-  // Generate first admin key
-  const { plain } = createKey({ tier: "admin", label: "bootstrap-admin" })
-  const sha256prefix = hashKey(plain).slice(0, 8)
-
-  // Write plaintext to file with mode 0600
+  // No active admin keys — generate the first one.
+  // Ensure APP_DIR exists before writing key file.
   fs.mkdirSync(PATHS.APP_DIR, { recursive: true, mode: 0o700 })
-  fs.writeFileSync(ADMIN_KEY_FILE, plain + "\n", { mode: 0o600 })
 
-  // Output to stdout: full key only on TTY, path+hash on non-TTY (Docker/journald)
-  const isTty = process.stdout.isTTY
-  if (isTty) {
+  const { plain } = createKey({ tier: "admin", label: "bootstrap-admin" })
+
+  // Write plaintext key with O_EXCL to prevent symlink/TOCTOU attacks.
+  // If the file somehow already exists (race between two server starts),
+  // the write fails — the first writer wins and the second exits cleanly.
+  try {
+    fs.writeFileSync(ADMIN_KEY_FILE, plain + "\n", { mode: 0o600, flag: "wx" })
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === "EEXIST") {
+      // Another instance won the race — its key is valid.
+      consola.warn(
+        `Bootstrap key file already exists at ${ADMIN_KEY_FILE} (parallel start?). Using existing file.`,
+      )
+      return
+    }
+    // Unexpected write failure: key is in DB but not on disk.
+    // Surface the error so the operator can run `admin recover`.
+    consola.error(
+      `Admin key created in DB but file write failed. Run 'copilot-api admin recover' to retrieve it. Error: ${String(err)}`,
+    )
+    throw err
+  }
+
+  // Output: full key on TTY; path-only on non-TTY (Docker/journald — avoid log capture)
+  if (process.stdout.isTTY) {
     consola.success(`Admin key generated: ${plain}`)
     consola.info(`Also written to ${ADMIN_KEY_FILE} (delete after reading)`)
   } else {
     consola.info(
-      `Admin key written to ${ADMIN_KEY_FILE} (sha256:${sha256prefix}…). Read & delete this file.`,
+      `Admin key written to ${ADMIN_KEY_FILE}. Read it and delete the file before restarting.`,
     )
   }
 }

@@ -2,7 +2,7 @@ import crypto from "node:crypto"
 
 import { getDb } from "~/lib/db"
 
-// Row type from DB
+// Row type from DB (full — includes hash for internal auth use)
 export interface KeyRow {
   id: string
   hash: string
@@ -18,13 +18,17 @@ export interface KeyRow {
 // Base32 alphabet (RFC 4648, no padding)
 const BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
+// Regex that mirrors the upstream model-name validation in config-store (SSRF prevention)
+const MODEL_RE = /^\w[\w.:-]*$/
+
 /**
  * Generate a new API key: "sk-cap-" + 52 base32 chars = 59 chars total.
- * Uses 32 random bytes = 256 bits entropy.
+ * Uses 33 random bytes = 264 bits of entropy; 264 / 5 = 52 full 5-bit groups
+ * (260 bits encoded) with 4 bits remaining — no zero-padding required.
  */
 export function generateKey(): string {
-  const bytes = crypto.randomBytes(32)
-  // Encode to base32: each 5 bits → one char; 32 bytes = 256 bits = 51.2 → pad to 52 chars
+  const bytes = crypto.randomBytes(33)
+  // Encode to base32: each 5 bits → one char; 33 bytes = 264 bits → exactly 52 chars
   let result = ""
   let buffer = 0
   let bitsLeft = 0
@@ -36,19 +40,59 @@ export function generateKey(): string {
       result += BASE32_CHARS[(buffer >> bitsLeft) & 0x1f]
     }
   }
-  // Pad to exactly 52 chars if needed
-  while (result.length < 52) {
-    result += BASE32_CHARS[0]
-  }
+  // 33 bytes yields exactly 52 chars; the slice+guard is belt-and-suspenders
   return `sk-cap-${result.slice(0, 52)}`
 }
 
 /**
- * Hash a plain key to sha256 hex for storage.
+ * Hash a plain key to SHA-256 hex for storage.
+ *
+ * Unsalted SHA-256 is intentional: API keys have ≥260 bits of random entropy
+ * so dictionary attacks and rainbow tables are meaningless.
+ * Do NOT use this function for user-chosen secrets (passwords, PINs, etc.).
+ *
  * The plain key value must NEVER be written to the DB.
  */
 export function hashKey(plain: string): string {
   return crypto.createHash("sha256").update(plain).digest("hex")
+}
+
+/** Validate allowedModels: non-empty array of valid model identifiers or "*" */
+function validateAllowedModels(models: Array<string> | undefined): void {
+  if (models === undefined) return
+  if (models.length === 0) {
+    throw new Error(
+      'allowedModels must not be empty; use ["*"] for unrestricted access',
+    )
+  }
+  for (const m of models) {
+    if (m !== "*" && !MODEL_RE.test(m)) {
+      throw new Error(
+        `Invalid model name in allowedModels: "${m}". Must match /^\\w[\\w.:-]*$/ or be "*"`,
+      )
+    }
+  }
+}
+
+/**
+ * Compute the rate-limit integer to store: null means "inherit global".
+ * Positive values are capped at 10× globalDefault.
+ */
+function resolveRateLimit(
+  override: number | undefined,
+  globalDefault: number,
+): number | null {
+  if (override === undefined || override === 0) return null
+  if (!Number.isInteger(override) || override < 0) {
+    throw new Error("rateLimitOverride must be a non-negative integer")
+  }
+  const cap = globalDefault * 10
+  if (override > cap) {
+    throw new Error(
+      `rate_limit_override ${override} exceeds cap ${cap} (10× global default ${globalDefault})`,
+    )
+  }
+  return override
 }
 
 export function createKey(options: {
@@ -57,30 +101,20 @@ export function createKey(options: {
   allowedModels?: Array<string>
   rateLimitOverride?: number
   debugEnabled?: boolean
-  globalRateLimit?: number // for cap enforcement
+  globalRateLimit?: number // for cap enforcement; defaults to 60 if not provided
 }): { plain: string; row: KeyRow } {
+  validateAllowedModels(options.allowedModels)
+
   const db = getDb()
   const plain = generateKey()
   const hash = hashKey(plain)
   const id = crypto.randomUUID()
   const now = Date.now()
 
-  // Rate limit override safety: 0/negative = use default (null).
-  // Hard cap at 10× global default; reject above cap.
-  let rateLimit: number | null = null
-  if (
-    options.rateLimitOverride !== undefined
-    && options.rateLimitOverride > 0
-  ) {
-    const globalDefault = options.globalRateLimit ?? 60
-    const cap = globalDefault * 10
-    if (options.rateLimitOverride > cap) {
-      throw new Error(
-        `rate_limit_override ${options.rateLimitOverride} exceeds cap ${cap} (10× global default ${globalDefault})`,
-      )
-    }
-    rateLimit = options.rateLimitOverride
-  }
+  const rateLimit = resolveRateLimit(
+    options.rateLimitOverride,
+    options.globalRateLimit ?? 60,
+  )
 
   const allowedModels = JSON.stringify(options.allowedModels ?? ["*"])
 
@@ -114,13 +148,23 @@ export function createKey(options: {
   return { plain, row }
 }
 
-export function revokeKey(id: string): void {
-  getDb().run(`UPDATE keys SET revoked_at = ? WHERE id = ?`, [Date.now(), id])
+/**
+ * Revoke a key by ID.
+ * Idempotent: only sets revoked_at if the key is currently active.
+ * Returns true if the key was revoked, false if not found or already revoked.
+ * Callers are responsible for verifying the tier before calling (no tier guard here).
+ */
+export function revokeKey(id: string): boolean {
+  const result = getDb().run(
+    `UPDATE keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
+    [Date.now(), id],
+  )
+  return result.changes === 1
 }
 
 export function listKeys(): Array<KeyRow> {
   return getDb()
-    .query<KeyRow, []>("SELECT * FROM keys ORDER BY created_at")
+    .query<KeyRow, []>("SELECT * FROM keys ORDER BY created_at, id")
     .all()
 }
 
@@ -142,9 +186,14 @@ export function countActiveAdminKeys(): number {
   return row?.n ?? 0
 }
 
-export function setDebugEnabled(id: string, enabled: boolean): void {
-  getDb().run(`UPDATE keys SET debug_enabled = ? WHERE id = ?`, [
+/**
+ * Toggle the debug flag on a key.
+ * Returns true if the key was found and updated, false otherwise.
+ */
+export function setDebugEnabled(id: string, enabled: boolean): boolean {
+  const result = getDb().run(`UPDATE keys SET debug_enabled = ? WHERE id = ?`, [
     enabled ? 1 : 0,
     id,
   ])
+  return result.changes === 1
 }
