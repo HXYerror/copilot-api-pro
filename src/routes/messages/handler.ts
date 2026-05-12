@@ -3,12 +3,15 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
+import type { KeyVar } from "~/middleware/auth"
+
 import { resolveAlias } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
 import { getConfig } from "~/lib/config-store"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
+import { isModelAllowed } from "~/middleware/auth"
 import { sanitiseResponsesOutput } from "~/routes/responses/translation"
 import {
   createChatCompletions,
@@ -36,7 +39,7 @@ import {
 import { translateResponsesToAnthropic } from "./responses-to-anthropic"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
 
-export async function handleCompletion(c: Context) {
+export async function handleCompletion(c: Context<{ Variables: KeyVar }>) {
   await checkRateLimit(state)
 
   // Single config snapshot for this request (consistent ingress + future egress).
@@ -46,9 +49,26 @@ export async function handleCompletion(c: Context) {
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
   // Ingress: rewrite client-facing alias → upstream model name
+  const clientAlias = anthropicPayload.model
   const payload: AnthropicMessagesPayload = {
     ...anthropicPayload,
     model: resolveAlias(anthropicPayload.model, models),
+  }
+
+  // Scope check: verify the user-facing alias is in the key's allowed_models.
+  // Uses clientAlias (before upstream resolution) per the comment in models/route.ts:28.
+  const key = c.get("key")
+  if (!isModelAllowed(key.allowed_models, clientAlias)) {
+    return c.json(
+      {
+        error: {
+          message: `Model "${clientAlias}" is not in your key's allowed models`,
+          type: "permission_denied",
+          code: "model_not_allowed",
+        },
+      },
+      403,
+    )
   }
 
   if (state.manualApprove) {

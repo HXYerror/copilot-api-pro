@@ -2,6 +2,7 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 
+import { authMiddleware } from "./middleware/auth"
 import { completionRoutes } from "./routes/chat-completions/route"
 import { embeddingRoutes } from "./routes/embeddings/route"
 import { messageRoutes } from "./routes/messages/route"
@@ -15,7 +16,13 @@ export const server = new Hono()
 server.use(logger())
 server.use(cors())
 
+// Public: health probe — no auth required
 server.get("/", (c) => c.text("Server running"))
+
+// Auth middleware on every other route.
+// New routes are protected by default; add explicit exceptions above this line
+// for intentionally public paths (health checks, metrics, etc.).
+server.use("*", authMiddleware)
 
 server.route("/chat/completions", completionRoutes)
 server.route("/models", modelRoutes)

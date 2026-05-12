@@ -14,6 +14,7 @@ import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels } from "./lib/utils"
+import { warnNoAuth } from "./middleware/auth"
 import { server } from "./server"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
@@ -72,6 +73,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   // Run DB migrations BEFORE binding HTTP listener (no schema race)
   initDb()
+
+  // Warn if --no-auth mode is active (safe to call unconditionally)
+  warnNoAuth()
 
   // First-run admin bootstrap (no-op if auth disabled or keys exist)
   runBootstrap()

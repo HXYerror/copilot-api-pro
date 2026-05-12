@@ -3,6 +3,8 @@ import type { Context } from "hono"
 import consola from "consola"
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
+import type { KeyVar } from "~/middleware/auth"
+
 import { resolveAlias, resolveUpstream } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
 import { getConfig } from "~/lib/config-store"
@@ -11,13 +13,14 @@ import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
+import { isModelAllowed } from "~/middleware/auth"
 import {
   createChatCompletions,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
 } from "~/services/copilot/create-chat-completions"
 
-export async function handleCompletion(c: Context) {
+export async function handleCompletion(c: Context<{ Variables: KeyVar }>) {
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
@@ -31,6 +34,22 @@ export async function handleCompletion(c: Context) {
   // O(n) reverse-scan and multi-alias ambiguity problems).
   const clientAlias = payload.model
   payload = { ...payload, model: resolveAlias(payload.model, models) }
+
+  // Scope check: verify the user-facing alias is in the key's allowed_models.
+  // Uses clientAlias (before upstream resolution) per the comment in models/route.ts:28.
+  const key = c.get("key")
+  if (!isModelAllowed(key.allowed_models, clientAlias)) {
+    return c.json(
+      {
+        error: {
+          message: `Model "${clientAlias}" is not in your key's allowed models`,
+          type: "permission_denied",
+          code: "model_not_allowed",
+        },
+      },
+      403,
+    )
+  }
 
   if (getModelMode(payload.model) === "responses") {
     return c.json(
