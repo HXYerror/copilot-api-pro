@@ -37,6 +37,23 @@ let monotonicId = 0
 
 const encoder = new TextEncoder()
 
+// Placeholder controller used while a Subscriber is reserved in the
+// `subscribers` set but the real ReadableStream `start()` callback hasn't
+// fired yet.  Swallows any frame silently — broadcastTrace shouldn't reach
+// it in practice, but we'd rather drop a frame than crash if it does.
+const PLACEHOLDER_CONTROLLER: ReadableStreamDefaultController<Uint8Array> = {
+  desiredSize: 0,
+  close() {
+    /* noop */
+  },
+  enqueue() {
+    /* noop */
+  },
+  error() {
+    /* noop */
+  },
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -165,20 +182,29 @@ export function subscribe(
     return { ok: false, reason: "too_many_subscribers" }
   }
 
-  let subRef: Subscriber | null = null
+  // Reserve the slot SYNCHRONOUSLY here, not inside start().  ReadableStream's
+  // `start` callback is invoked lazily (when the consumer first pulls), so two
+  // near-simultaneous subscribe() calls would otherwise both pass the size
+  // check on the same value and end up exceeding MAX_SUBSCRIBERS.  Adding a
+  // placeholder Subscriber to the set right now closes that window — the
+  // ReadableStream's start() callback below fills in `controller` and the
+  // heartbeat timer before the first frame is enqueued.
+  const sub: Subscriber = {
+    // controller is replaced in start(); the placeholder enqueue silently
+    // drops frames that arrive before start() (none, in practice, because
+    // we only call broadcast after start() has run for at least one event).
+    controller: PLACEHOLDER_CONTROLLER,
+    queue: [],
+    queueBytes: 0,
+    pending: false,
+    heartbeat: null,
+    closed: false,
+  }
+  subscribers.add(sub)
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      const sub: Subscriber = {
-        controller,
-        queue: [],
-        queueBytes: 0,
-        pending: false,
-        heartbeat: null,
-        closed: false,
-      }
-      subRef = sub
-      subscribers.add(sub)
+      sub.controller = controller
 
       // Replay anything in the ring newer than lastEventId
       if (opts.lastEventId !== undefined) {
@@ -209,7 +235,7 @@ export function subscribe(
       }, HEARTBEAT_MS)
     },
     cancel() {
-      if (subRef) closeSubscriber(subRef)
+      closeSubscriber(sub)
     },
   })
 

@@ -75,6 +75,50 @@ describe("redactBody", () => {
     expect(out).toBe("client=[REDACTED]")
   })
 
+  test("scrubs Iv23.<hex16+> client id (new GitHub App family)", () => {
+    // crew review R6: the original Iv1 regex was too narrow.
+    const out = redactBody("client=Iv23.AbCdEf0123456789Ab")
+    expect(out).toBe("client=[REDACTED]")
+  })
+
+  test("scrubs this proxy's own sk-cap-* bearer tokens (crew R1)", () => {
+    // The proxy mints these as admin/client API keys; a developer pasting
+    // their own key into a chat prompt would leak it without this pattern.
+    const sample =
+      "Here is my key: sk-cap-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA. Help?"
+    const out = redactBody(sample)
+    expect(out).toContain("[REDACTED]")
+    expect(out).not.toContain("sk-cap-A")
+  })
+
+  test("scrubs sk-ant-* Anthropic keys", () => {
+    const out = redactBody(
+      "key=sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    expect(out).toContain("[REDACTED]")
+    expect(out).not.toContain("sk-ant-")
+  })
+
+  test("scrubs OpenAI-style sk-proj-* keys", () => {
+    const out = redactBody(
+      "key=sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    expect(out).toContain("[REDACTED]")
+    expect(out).not.toContain("sk-proj-")
+  })
+
+  test("scrubs AWS access key id (AKIA...)", () => {
+    const out = redactBody("aws_access_key=AKIAIOSFODNN7EXAMPLE more text")
+    expect(out).toContain("[REDACTED]")
+    expect(out).not.toContain("AKIA")
+  })
+
+  test("scrubs basic-auth credentials embedded in a URL", () => {
+    const out = redactBody("https://alice:hunter2supersecret@example.com/path")
+    expect(out).toContain("[REDACTED]@example.com")
+    expect(out).not.toContain("hunter2supersecret")
+  })
+
   test("returns empty string for null / undefined", () => {
     expect(redactBody(null)).toBe("")
     expect(redactBody(undefined)).toBe("")
@@ -202,6 +246,23 @@ describe("redactBody — fuzz", () => {
     expect(() => {
       assertRedacted(`payload: Iv1.b507a08c87ecfe98`)
     }).toThrow()
+  })
+
+  test("assertRedacted catches unknown secret shapes via heuristics (R2)", () => {
+    // The bearer-token heuristic catches an opaque token that ISN'T in
+    // BODY_PATTERNS — this is the real defence-in-depth value of the
+    // post-redact pass.
+    expect(() => {
+      assertRedacted(
+        `Authorization: Bearer some-very-long-opaque-token-of-unknown-issuer-AAAAAAAA`,
+      )
+    }).toThrow(/credential marker/)
+    // token= / api_key= / secret= heuristic
+    expect(() => {
+      assertRedacted(
+        `payload: api_key=very_long_opaque_value_AAAAAAAAAAAAAAAAAAAAAAAAAAAA`,
+      )
+    }).toThrow(/credential marker/)
   })
 })
 

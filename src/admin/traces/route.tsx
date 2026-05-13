@@ -90,6 +90,43 @@ tracesApp.get("/stream", (c) => {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
+/**
+ * Wrap a Node Readable into a Web ReadableStream so Hono can pipe it back
+ * without blocking the event loop. fs.createReadStream streams bytes in
+ * 64 KB chunks and respects backpressure via `pause()`/`resume()` which the
+ * adapter triggers from the ReadableStream pull/cancel callbacks.
+ */
+function nodeStreamToWeb(filePath: string): ReadableStream<Uint8Array> {
+  const nodeStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 })
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      nodeStream.on("data", (chunk: Buffer | string) => {
+        const bytes =
+          typeof chunk === "string" ?
+            new TextEncoder().encode(chunk)
+          : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+        controller.enqueue(bytes)
+        if ((controller.desiredSize ?? 0) <= 0) nodeStream.pause()
+      })
+      nodeStream.on("end", () => {
+        controller.close()
+      })
+      nodeStream.on("error", (err) => {
+        controller.error(err)
+      })
+    },
+    pull() {
+      nodeStream.resume()
+    },
+    cancel(reason) {
+      consola.debug(
+        `[admin/traces] download cancelled: ${String(reason ?? "client_disconnect")}`,
+      )
+      nodeStream.destroy()
+    },
+  })
+}
+
 tracesApp.get("/:filename", (c) => {
   const filename = c.req.param("filename")
   // Filename must match exactly "YYYY-MM-DD.jsonl" — no slashes, no dots
@@ -102,22 +139,43 @@ tracesApp.get("/:filename", (c) => {
   if (!DATE_RE.test(date)) return c.text("Bad Request", 400)
 
   const base = tracesDir()
+  const baseWithSep = base + path.sep
   const fullPath = path.join(base, `traces-${date}.jsonl`)
-  // Defence-in-depth even though the regex above forbids traversal: ensure
-  // the resolved path is strictly inside the traces directory.
-  if (!fullPath.startsWith(base + path.sep)) {
+
+  // Lexical guard: path.join can't produce a path that escapes `base` once
+  // the regex has stripped slashes from `date`, but keep the check as a
+  // belt for future refactors.
+  if (!fullPath.startsWith(baseWithSep)) {
     consola.warn(`[admin/traces] rejected path-traversal attempt: ${filename}`)
     return c.text("Bad Request", 400)
   }
 
-  let content: string
+  // Defence-in-depth: a symlink at `traces/traces-YYYY-MM-DD.jsonl` could
+  // point outside the traces dir (e.g., -> /etc/passwd). The lexical check
+  // above doesn't follow symlinks; resolve and re-check.
+  let resolved: string
   try {
-    content = fs.readFileSync(fullPath, "utf8")
-  } catch {
-    return c.text("Not Found", 404)
+    resolved = fs.realpathSync.native(fullPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === "ENOENT") return c.text("Not Found", 404)
+    consola.warn(
+      `[admin/traces] realpath failed for ${filename}: ${String(err)}`,
+    )
+    return c.text("Bad Request", 400)
+  }
+  if (!resolved.startsWith(baseWithSep)) {
+    consola.warn(
+      `[admin/traces] rejected symlink escape: ${filename} → ${resolved}`,
+    )
+    return c.text("Bad Request", 400)
   }
 
-  return c.body(content, 200, {
+  // Stream the file rather than readFileSync — traces can be up to
+  // traces_max_bytes (default 100 MB) and a synchronous read would block
+  // the event loop for the duration, freezing all proxy traffic.
+  const stream = nodeStreamToWeb(resolved)
+  return c.body(stream, 200, {
     "Content-Type": "application/x-ndjson; charset=utf-8",
     "Content-Disposition": `attachment; filename="traces-${date}.jsonl"`,
     "Cache-Control": "no-store",

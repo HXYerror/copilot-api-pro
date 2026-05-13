@@ -7,10 +7,19 @@
  * positives (a legitimate token-shaped string redacted) are recoverable;
  * a single leaked secret is not.
  *
- * Defence-in-depth: redactBody() is the primary redaction step, and
- * assertRedacted() is the sanity check run by the writer over the redacted
- * output. If assertRedacted throws, the writer drops the line entirely —
- * we never persist anything that still matches a known secret pattern.
+ * Two-pass defence-in-depth:
+ *   1. `redactBody()` runs BODY_PATTERNS — the issuer-shaped redactions.
+ *   2. `assertRedacted()` runs BODY_PATTERNS again AND a stricter
+ *      generic-shape pass (POST_REDACT_HEURISTICS) over the already-redacted
+ *      output. The second pass catches:
+ *        - bugs in the substitution loop (replace-and-leave-something-behind)
+ *        - secret shapes that exist in real traffic but aren't in
+ *          BODY_PATTERNS (e.g., a leading `Authorization: Bearer <opaque>`).
+ *      Per the crew review of #36, the second pass MUST be a separate
+ *      pattern set so it actually adds defence — running BODY_PATTERNS
+ *      against its own output only catches substitution bugs.
+ *
+ * If `assertRedacted` throws, the writer drops the line entirely.
  */
 
 const REDACTION_PLACEHOLDER = "[REDACTED]"
@@ -66,11 +75,10 @@ export function redactHeaders(
 }
 
 // ---------------------------------------------------------------------------
-// Body redaction
+// Body redaction — issuer-shaped patterns
 //
 // Patterns intentionally match the secret SHAPE, not a specific issuer. The
-// order matters only for performance (cheapest match first) — the writer
-// re-runs the full set as assertRedacted afterwards.
+// order matters only for performance (cheapest match first).
 // ---------------------------------------------------------------------------
 
 /**
@@ -84,10 +92,21 @@ export function redactHeaders(
  *     ghr_  refresh token
  * - `github_pat_[A-Za-z0-9_]{20,}` — fine-grained PATs
  * - `eyJ...eyJ...` — JWT shape (covers the upstream Copilot bearer)
- * - `Iv1\.[a-f0-9]{16}` — the GitHub OAuth client id literal we ship in
- *   `src/lib/api-config.ts` (`Iv1.b507a08c87ecfe98`). It's a constant, not
- *   a secret, but operators rotate the proxy build occasionally and we'd
- *   rather not bake the literal into every captured trace.
+ * - `Iv[0-9]+\.[A-Fa-f0-9]{16,}` — GitHub OAuth client id family. The
+ *   classic `Iv1.b507a08c87ecfe98` is shipped in src/lib/api-config.ts;
+ *   newer GitHub Apps use `Iv23.…`. These are public-by-design but we
+ *   still redact them so captured traces don't bake in the proxy build id.
+ * - `sk-cap-[A-Z2-7]{52}` — THIS proxy's own admin/client bearer tokens.
+ *   They're not GitHub tokens, so the other patterns miss them. Without
+ *   this entry a developer pasting their own key into a chat prompt
+ *   ("hey, what's wrong with this key?") would leak it to disk verbatim.
+ *   Cited in the crew review of #36 as R1.
+ * - `sk-ant-[A-Za-z0-9_-]{40,}` — Anthropic API keys (real users routinely
+ *   accidentally paste these into prompts).
+ * - `sk-[A-Za-z0-9_-]{40,}` — OpenAI-style sk- keys (sk-proj-*, sk-*).
+ *   Order matters: more specific sk-cap and sk-ant patterns run first.
+ * - `AKIA[A-Z0-9]{16}` — AWS access key id.
+ * - Basic-auth URL `://user:pass@host` — common credential-in-URL.
  */
 export const BODY_PATTERNS: ReadonlyArray<RegExp> = [
   /gh[oprsu]_[A-Za-z0-9]{20,}/g,
@@ -96,7 +115,13 @@ export const BODY_PATTERNS: ReadonlyArray<RegExp> = [
   // "eyJ" (the base64url encoding of the JSON header/payload prelude `{"`).
   // Lazy quantifiers keep us from greedily eating adjacent text.
   /eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+/g,
-  /Iv1\.[a-f0-9]{16}/g,
+  /Iv\d+\.[A-Fa-f0-9]{16,}/g,
+  /sk-cap-[A-Z2-7]{52}/g,
+  /sk-ant-[\w-]{40,}/g,
+  /sk-[\w-]{40,}/g,
+  /\bAKIA[A-Z0-9]{16}\b/g,
+  // Basic-auth credential embedded in a URL — captures user:pass@host
+  /(?<=:\/\/)[^:/@\s]+:[^@\s]{1,200}(?=@)/g,
 ]
 
 /**
@@ -123,23 +148,55 @@ export function redactBody(body: string | object | null | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
-// Sanity check
+// Sanity check — independent post-redaction heuristics
+//
+// These regexes look for the SHAPE of "credential adjacent to a marker" —
+// `bearer foo`, `token=foo`, `api_key=foo`, `secret=foo`, etc. They will
+// false-positive on legitimate URLs, hashes, and any long opaque string,
+// which is exactly what we want: redaction errs on the side of "throw and
+// drop the trace" rather than persist anything suspicious.
+//
+// Run AFTER `redactBody`. If any of these match, the redactor missed an
+// issuer pattern and the writer must NOT persist this line.
 // ---------------------------------------------------------------------------
 
+const POST_REDACT_HEURISTICS: ReadonlyArray<RegExp> = [
+  // bearer <opaque-40+-char>
+  /\bbearer\s+[\w+./~=-]{32,}/gi,
+  // api_key=<opaque>, api-key=<opaque>, apikey=<opaque>, token=<opaque>,
+  // secret=<opaque>, password=<opaque>.  The `api[_-]?key` branch already
+  // covers "apikey" (the `?` makes the separator optional).
+  /\b(?:api[_-]?key|token|secret|password)["':=]+\s*["']?[\w+./~=-]{32,}/gi,
+]
+
 /**
- * Throw if `line` still matches any BODY_PATTERN.
+ * Throw if `line` still matches a known issuer pattern OR a generic
+ * "credential adjacent to a marker" heuristic.
  *
- * The writer calls this AFTER its own redaction pass; a throw indicates a
- * defect in the redactor (or an unforeseen secret shape) and the writer
- * drops the trace rather than persist it.
+ * The writer calls this AFTER its own redaction pass. A throw indicates
+ * either a defect in the redactor (substitution bug) OR an unforeseen
+ * secret shape that slipped past BODY_PATTERNS. The writer drops the
+ * trace rather than persist it.
  */
 export function assertRedacted(line: string): void {
+  // Pass 1: did our own substitution leave any of the issuer patterns?
   for (const pattern of BODY_PATTERNS) {
+    // Fresh RE each iteration so global lastIndex is always 0.
     const re = new RegExp(pattern.source, pattern.flags)
-    const match = re.exec(line)
-    if (match) {
+    if (re.test(line)) {
       throw new Error(
         `[trace-redact] assertRedacted: output still matches /${pattern.source}/`,
+      )
+    }
+  }
+  // Pass 2: independent shape heuristics — catches secret families we
+  // haven't enumerated.  The redaction placeholder itself is short and
+  // doesn't match these patterns.
+  for (const pattern of POST_REDACT_HEURISTICS) {
+    const re = new RegExp(pattern.source, pattern.flags)
+    if (re.test(line)) {
+      throw new Error(
+        `[trace-redact] assertRedacted: line contains an unredacted credential marker (/${pattern.source}/) — refusing to persist`,
       )
     }
   }

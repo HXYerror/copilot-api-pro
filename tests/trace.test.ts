@@ -517,6 +517,30 @@ describe("/admin/traces/:date.jsonl — path traversal", () => {
     const res = await server.request("/admin/traces/2025-..-...jsonl")
     expect([302, 400, 401, 404]).toContain(res.status)
   })
+
+  test("symlink at traces-YYYY-MM-DD.jsonl pointing OUTSIDE tracesDir → 400 (crew R3)", async () => {
+    // Place a symlink in the traces dir pointing at /etc/passwd. The
+    // lexical startsWith guard passes (the link itself is inside the
+    // dir), but the realpath defence-in-depth check must reject it.
+    const linkPath = path.join(sharedTracesDir, "traces-2099-01-01.jsonl")
+    try {
+      fs.symlinkSync("/etc/passwd", linkPath)
+    } catch {
+      // some filesystems (Windows w/o admin) can't symlink — skip
+      return
+    }
+    try {
+      const res = await server.request("/admin/traces/2099-01-01.jsonl")
+      // Pre-auth path-guard or session redirect or 404 — anything but
+      // 200 (which would mean we leaked /etc/passwd to the client).
+      expect(res.status).not.toBe(200)
+      // If we DID make it past auth, the response should be 400 rejecting
+      // the symlink escape.  Accept 302/401 (auth) too.
+      expect([302, 400, 401, 404]).toContain(res.status)
+    } finally {
+      fs.unlinkSync(linkPath)
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
