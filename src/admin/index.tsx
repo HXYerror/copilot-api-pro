@@ -3,6 +3,7 @@ import { Hono } from "hono"
 
 import { getConfig } from "~/lib/config-store"
 import { getDb } from "~/lib/db"
+import { countActiveDebugKeys } from "~/services/keys"
 
 import type { SessionVar } from "./session-middleware"
 
@@ -54,9 +55,15 @@ indexApp.get("/", (c) => {
   const config = getConfig()
   const counts = getDbCounts()
   const keyIdSuffix = session.key_id.slice(-4)
+  const debugKeyCount = countActiveDebugKeys()
 
   return c.html(
-    <Layout title="Overview" active="index" csrfToken={session.csrf_token}>
+    <Layout
+      title="Overview"
+      active="index"
+      csrfToken={session.csrf_token}
+      debugKeyCount={debugKeyCount}
+    >
       <h1>Overview</h1>
       <div class="status-grid">
         <div class="status-card">

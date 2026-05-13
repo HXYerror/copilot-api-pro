@@ -11,6 +11,7 @@ export interface KeyRow {
   allowed_models: string // JSON array string e.g. '["*"]'
   rate_limit_override: number | null
   debug_enabled: number // 0 | 1
+  debug_expires_at: number | null // unix ms; NULL if debug is off or no TTL
   created_at: number // unix timestamp ms
   revoked_at: number | null
 }
@@ -20,6 +21,9 @@ const BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
 // Regex that mirrors the upstream model-name validation in config-store (SSRF prevention)
 const MODEL_RE = /^\w[\w.:-]*$/
+
+/** 24 hours in milliseconds — the debug mode TTL */
+export const DEBUG_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
  * Generate a new API key: "sk-cap-" + 52 base32 chars = 59 chars total.
@@ -117,10 +121,12 @@ export function createKey(options: {
   )
 
   const allowedModels = JSON.stringify(options.allowedModels ?? ["*"])
+  const debugEnabled = options.debugEnabled ? 1 : 0
+  const debugExpiresAt = debugEnabled ? now + DEBUG_TTL_MS : null
 
   db.run(
-    `INSERT INTO keys (id, hash, tier, label, allowed_models, rate_limit_override, debug_enabled, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO keys (id, hash, tier, label, allowed_models, rate_limit_override, debug_enabled, debug_expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       hash,
@@ -128,7 +134,8 @@ export function createKey(options: {
       options.label ?? null,
       allowedModels,
       rateLimit,
-      options.debugEnabled ? 1 : 0,
+      debugEnabled,
+      debugExpiresAt,
       now,
     ],
   )
@@ -140,7 +147,8 @@ export function createKey(options: {
     label: options.label ?? null,
     allowed_models: allowedModels,
     rate_limit_override: rateLimit,
-    debug_enabled: options.debugEnabled ? 1 : 0,
+    debug_enabled: debugEnabled,
+    debug_expires_at: debugExpiresAt,
     created_at: now,
     revoked_at: null,
   }
@@ -152,7 +160,6 @@ export function createKey(options: {
  * Revoke a key by ID.
  * Idempotent: only sets revoked_at if the key is currently active.
  * Returns true if the key was revoked, false if not found or already revoked.
- * Callers are responsible for verifying the tier before calling (no tier guard here).
  */
 export function revokeKey(id: string): boolean {
   const result = getDb().run(
@@ -162,10 +169,29 @@ export function revokeKey(id: string): boolean {
   return result.changes === 1
 }
 
-export function listKeys(): Array<KeyRow> {
-  return getDb()
-    .query<KeyRow, []>("SELECT * FROM keys ORDER BY created_at, id")
-    .all()
+export function listKeys(
+  limit = 50,
+  offset = 0,
+): { rows: Array<KeyRow>; total: number } {
+  const db = getDb()
+  const countRow = db
+    .query<{ n: number }, []>("SELECT COUNT(*) as n FROM keys")
+    .get()
+  const total = countRow?.n ?? 0
+  const rows = db
+    .query<
+      KeyRow,
+      [number, number]
+    >("SELECT * FROM keys ORDER BY created_at DESC, id LIMIT ? OFFSET ?")
+    .all(limit, offset)
+  return { rows, total }
+}
+
+export function findKeyById(id: string): KeyRow | null {
+  return (
+    getDb().query<KeyRow, [string]>("SELECT * FROM keys WHERE id = ?").get(id)
+    ?? null
+  )
 }
 
 export function findKeyByHash(hash: string): KeyRow | null {
@@ -186,14 +212,43 @@ export function countActiveAdminKeys(): number {
   return row?.n ?? 0
 }
 
+/** Count keys that currently have debug_enabled=1 and are not revoked. */
+export function countActiveDebugKeys(): number {
+  const row = getDb()
+    .query<
+      { n: number },
+      []
+    >("SELECT COUNT(*) as n FROM keys WHERE debug_enabled = 1 AND revoked_at IS NULL")
+    .get()
+  return row?.n ?? 0
+}
+
 /**
- * Toggle the debug flag on a key.
+ * Set debug mode on a key with a 24h TTL.
  * Returns true if the key was found and updated, false otherwise.
  */
 export function setDebugEnabled(id: string, enabled: boolean): boolean {
-  const result = getDb().run(`UPDATE keys SET debug_enabled = ? WHERE id = ?`, [
-    enabled ? 1 : 0,
-    id,
-  ])
+  const debugExpiresAt = enabled ? Date.now() + DEBUG_TTL_MS : null
+  const result = getDb().run(
+    `UPDATE keys SET debug_enabled = ?, debug_expires_at = ? WHERE id = ?`,
+    [enabled ? 1 : 0, debugExpiresAt, id],
+  )
+  return result.changes === 1
+}
+
+/**
+ * Update a key's scope (allowed_models, rate_limit_override).
+ * Tier is immutable post-create.
+ */
+export function updateKeyScope(
+  id: string,
+  allowedModels: Array<string>,
+  rateLimitOverride: number | null,
+): boolean {
+  validateAllowedModels(allowedModels)
+  const result = getDb().run(
+    `UPDATE keys SET allowed_models = ?, rate_limit_override = ? WHERE id = ? AND revoked_at IS NULL`,
+    [JSON.stringify(allowedModels), rateLimitOverride, id],
+  )
   return result.changes === 1
 }

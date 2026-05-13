@@ -93,7 +93,7 @@ describe("keys CRUD", () => {
 
   test("plain key is never in DB (hash only)", () => {
     const { plain } = createKey({ tier: "client" })
-    const all = listKeys()
+    const all = listKeys().rows
     for (const row of all) {
       expect(row.hash).not.toBe(plain)
     }
@@ -161,11 +161,15 @@ describe("keys CRUD", () => {
     createKey({ tier: "admin" })
     createKey({ tier: "client" })
     createKey({ tier: "admin" })
-    const all = listKeys()
+    const all = listKeys().rows
     expect(all).toHaveLength(3)
-    // Verify order is deterministic (created_at ASC, then id ASC for ties)
-    for (let i = 1; i < all.length; i++) {
-      expect(all[i].created_at).toBeGreaterThanOrEqual(all[i - 1].created_at)
+    // Verify order is deterministic (created_at, then id for ties).
+    // Default order is DESC by created_at for the WebUI; sort here to verify monotonicity.
+    const sorted = [...all].sort((a, b) => a.created_at - b.created_at)
+    for (let i = 1; i < sorted.length; i++) {
+      expect(sorted[i].created_at).toBeGreaterThanOrEqual(
+        sorted[i - 1].created_at,
+      )
     }
   })
 

@@ -19,6 +19,7 @@ import { cacheModels } from "./lib/utils"
 import { warnNoAuth } from "./middleware/auth"
 import { server } from "./server"
 import { audit, initAudit } from "./services/audit"
+import { sweepExpiredDebugKeys } from "./services/debug-ttl-sweeper"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
 
@@ -95,6 +96,16 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       purgeExpiredSessions()
     },
     60 * 60 * 1000,
+  )
+
+  // Sweep expired debug keys on startup, then every 5 minutes.
+  // Auto-disables debug mode when debug_expires_at has passed (24h TTL).
+  sweepExpiredDebugKeys()
+  setInterval(
+    () => {
+      sweepExpiredDebugKeys()
+    },
+    5 * 60 * 1000,
   )
 
   // Emit audit event when starting without authentication

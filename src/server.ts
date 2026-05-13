@@ -6,6 +6,7 @@ import path from "node:path"
 
 import { auditAdminRoute } from "./admin/audit/route"
 import { indexApp } from "./admin/index"
+import { keysApp } from "./admin/keys/route"
 import { loginApp } from "./admin/login"
 import { sessionApp, sessionMiddleware } from "./admin/session-middleware"
 import { getDb } from "./lib/db"
@@ -119,6 +120,7 @@ server.route("/admin/audit", auditAdminRoute)
 const sessionProtected = new Hono()
 sessionProtected.use("*", sessionMiddleware)
 sessionProtected.route("/session", sessionApp)
+sessionProtected.route("/keys", keysApp)
 sessionProtected.route("/", indexApp)
 server.route("/admin", sessionProtected)
 

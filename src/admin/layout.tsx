@@ -22,6 +22,8 @@ interface LayoutProps {
   active?: "index" | "keys" | "usage" | "audit" | "settings"
   /** CSRF token for the logout form (required for session-protected pages). */
   csrfToken?: string
+  /** Number of keys with debug_enabled=1 — when > 0, a warning banner is shown */
+  debugKeyCount?: number
   children?: unknown
 }
 
@@ -29,6 +31,7 @@ export const Layout: FC<LayoutProps> = ({
   title = "Admin",
   active,
   csrfToken,
+  debugKeyCount = 0,
   children,
 }) => {
   const navItems: Array<{
@@ -80,6 +83,13 @@ export const Layout: FC<LayoutProps> = ({
             <button type="submit">Logout</button>
           </form>
         </header>
+        {debugKeyCount > 0 && (
+          <div class="debug-banner" role="alert">
+            ⚠️ <strong>Debug mode active</strong> on {debugKeyCount} key
+            {debugKeyCount === 1 ? "" : "s"} — prompts &amp; responses are being
+            persisted in plaintext. <a href="/admin/keys">Review →</a>
+          </div>
+        )}
         <main class="admin-main">{children}</main>
         <footer class="admin-footer">
           <span>Copilot API Admin</span>
