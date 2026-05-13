@@ -40,24 +40,50 @@ export type TelemetryVar = KeyVar & {
 // Body inspection — only POST routes carry a `model`
 // ---------------------------------------------------------------------------
 
+/** Cap on how much of the request body we'll buffer to look for "model". */
+const MODEL_SNAPSHOT_MAX_BYTES = 16 * 1024
+const MODEL_FIELD_RE = /"model"\s*:\s*"([^"\\]{1,200})"/
+
 /**
  * Best-effort read of the client-facing model from the request body.
  *
- * We read off a cloned Request so the handler can still call c.req.json().
- * Failures (no body, not JSON, etc.) silently fall through to "n/a".
+ * Reads at most MODEL_SNAPSHOT_MAX_BYTES from the cloned body and stops as
+ * soon as a `"model": "..."` substring is found. Never buffers the entire
+ * body — large vision / long-context payloads must not pin memory just for
+ * a label.  Failures (no body, no model field, unreadable) silently fall
+ * through to "n/a".
  */
 async function readModelFromBody(reqClone: Request): Promise<string> {
+  const reader = reqClone.body?.getReader()
+  if (!reader) return "n/a"
+  const decoder = new TextDecoder()
+  let buf = ""
+  let totalBytes = 0
   try {
-    const text = await reqClone.text()
-    if (!text) return "n/a"
-    const parsed = JSON.parse(text) as { model?: unknown }
-    if (typeof parsed.model === "string" && parsed.model.length > 0) {
-      return parsed.model
+    while (totalBytes < MODEL_SNAPSHOT_MAX_BYTES) {
+      const result = (await reader.read()) as {
+        value?: Uint8Array
+        done: boolean
+      }
+      if (result.done) break
+      const value = result.value
+      if (!value) break
+      totalBytes += value.byteLength
+      buf += decoder.decode(value, { stream: true })
+      const m = MODEL_FIELD_RE.exec(buf)
+      if (m && m[1]) return m[1]
     }
   } catch {
-    // not JSON or unreadable — fall through
+    // unreadable — fall through
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {
+      // already closed
+    }
   }
-  return "n/a"
+  const final = MODEL_FIELD_RE.exec(buf)
+  return final && final[1] ? final[1] : "n/a"
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +117,12 @@ function statusToErrorTag(status: number): string | null {
 
 function safeInsertEvent(
   c: Context<{ Variables: TelemetryVar }>,
-  ctx: { start: number; clientModel: string; threw: boolean },
+  ctx: {
+    start: number
+    clientModel: string
+    threw: boolean
+    aborted?: boolean
+  },
 ): void {
   try {
     const key = c.get("key") as KeyVar["key"] | undefined
@@ -99,7 +130,8 @@ function safeInsertEvent(
     const upstream = c.get("upstream_model") ?? ctx.clientModel
 
     const status = ctx.threw ? 500 : c.res.status
-    const errorTag = statusToErrorTag(status)
+    const errorTag =
+      ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status)
     const promptTokens = usage?.prompt_tokens ?? null
     const completionTokens = usage?.completion_tokens ?? null
     const usageUnknown =
@@ -134,13 +166,10 @@ export const telemetryMiddleware: MiddlewareHandler<{
   const start = Date.now()
 
   // Snapshot the client-facing model name BEFORE next() consumes the body.
-  // Hono buffers the body, but we clone defensively so c.req.json() still
-  // works inside the handler.
+  // We clone defensively so c.req.json() still works inside the handler.
   let clientModel = "n/a"
   if (c.req.method === "POST") {
     try {
-      // c.req.raw.clone() returns the undici Request type; cast to lib.dom's
-      // Request shape — readModelFromBody only needs .text().
       clientModel = await readModelFromBody(c.req.raw.clone() as Request)
     } catch (err) {
       consola.debug(`[telemetry] body model snapshot failed: ${String(err)}`)
@@ -180,32 +209,64 @@ function instrumentResponseOrInsert(
     return
   }
 
-  // Streaming path: tee the body through a transform stream and fire the
-  // insert in its `flush` hook (which runs after the source closes — i.e.
-  // after the handler has finished writing chunks and stashed usage on the
-  // context).
+  // Streaming path: wrap the body in a custom ReadableStream so we can hook
+  // BOTH the EOF path (controller.close inside pull) and the cancel path
+  // (downstream client disconnect). The `recorded` guard prevents double
+  // inserts when an EOF arrives after a cancel.
+  //
+  // Note: TransformStream's `cancel` callback is not invoked on downstream
+  // cancel in current Bun runtime, so we hand-roll the wrap.
+  let recorded = false
+  const fire = (extra: { aborted?: boolean } = {}): void => {
+    if (recorded) return
+    recorded = true
+    safeInsertEvent(c, { ...ctx, ...extra })
+  }
+
   try {
-    const transformed = body.pipeThrough(
-      new TransformStream({
-        transform(chunk, controller) {
-          controller.enqueue(chunk)
-        },
-        flush() {
-          safeInsertEvent(c, ctx)
-        },
-      }),
-    )
+    const sourceReader = body.getReader()
+    const wrapped = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const result = (await sourceReader.read()) as {
+            value?: Uint8Array
+            done: boolean
+          }
+          if (result.done) {
+            controller.close()
+            fire()
+            return
+          }
+          if (result.value) controller.enqueue(result.value)
+        } catch (err) {
+          // Upstream errored mid-stream — record and propagate.
+          fire({ aborted: true })
+          controller.error(err)
+        }
+      },
+      cancel(reason) {
+        consola.debug(
+          `[telemetry] stream cancelled: ${String(reason ?? "client_disconnect")}`,
+        )
+        fire({ aborted: true })
+        // Best-effort upstream cancellation.
+        sourceReader.cancel(reason).catch(() => {
+          /* upstream already gone */
+        })
+      },
+    })
+
     // Replace the response with one that wraps the instrumented body but
     // preserves all original headers/status.
-    c.res = new Response(transformed, {
+    c.res = new Response(wrapped, {
       status: c.res.status,
       headers: c.res.headers,
     })
   } catch (err) {
-    // pipeThrough can throw if body is already locked — fall back to immediate
+    // getReader can throw if body is already locked — fall back to immediate
     consola.error(
       `[telemetry] could not instrument response body: ${String(err)}`,
     )
-    safeInsertEvent(c, ctx)
+    fire()
   }
 }

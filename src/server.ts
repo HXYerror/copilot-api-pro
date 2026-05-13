@@ -116,8 +116,14 @@ server.use("*", (c, next) => {
 // ---------------------------------------------------------------------------
 // Telemetry middleware (issue #34, F3.A)
 // Runs AFTER auth (needs c.var.key) and BEFORE route handlers.  Records one
-// row in the `events` table per API-proxy request.  Skipped for the admin
-// WebUI (click events aren't useful) and health probes.
+// row in the `events` table per API-proxy request.
+//
+// Skipped for:
+//   - Root / health probes (/, /healthz, /readyz) — not proxy traffic.
+//   - All /admin/* paths, INCLUDING /admin/audit. The audit endpoint is an
+//     admin API rather than a WebUI page, but it returns operator queries,
+//     not proxied Copilot traffic, so it shouldn't pollute the events table
+//     or count toward usage metrics.
 // ---------------------------------------------------------------------------
 server.use("*", (c, next) => {
   const path = c.req.path
