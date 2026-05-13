@@ -82,7 +82,7 @@ describe("ConfigSchema — validates a complete config", () => {
     const data = result.data
     expect(data.models).toEqual({})
     expect(data.retention.events_days).toBe(90)
-    expect(data.retention.traces_days).toBe(7)
+    expect(data.retention.traces_days).toBe(0)
     expect(data.retention.traces_max_bytes).toBe(104857600)
     expect(data.retention.audit_days).toBe(365)
     expect(data.features.auth).toBe(true)

@@ -15,11 +15,13 @@ import {
   sessionApp,
   sessionMiddleware,
 } from "./admin/session-middleware"
+import { tracesApp } from "./admin/traces/route"
 import { usageApp } from "./admin/usage/route"
 import { getDb } from "./lib/db"
 import { state } from "./lib/state"
 import { authMiddleware } from "./middleware/auth"
 import { telemetryMiddleware } from "./middleware/telemetry"
+import { traceMiddleware } from "./middleware/trace"
 import { completionRoutes } from "./routes/chat-completions/route"
 import { embeddingRoutes } from "./routes/embeddings/route"
 import { messageRoutes } from "./routes/messages/route"
@@ -150,6 +152,33 @@ server.use("*", (c, next) => {
   return mw(c, next)
 })
 
+// ---------------------------------------------------------------------------
+// Trace middleware (issue #36, F4.A)
+// Runs AFTER auth (needs c.var.key) and AFTER telemetry (so telemetry sees
+// the unwrapped response body and isn't blocked by our capture wrap).
+//
+// Skipped for the same routes as telemetry: root, health probes, and
+// /admin/* paths.  Inside the middleware itself, capture only activates
+// when the key has debug_enabled (or admin tier + X-Capi-Debug: 1).
+// ---------------------------------------------------------------------------
+server.use("*", (c, next) => {
+  const path = c.req.path
+  if (
+    path === "/"
+    || path === "/healthz"
+    || path === "/readyz"
+    || path === "/admin"
+    || path.startsWith("/admin/")
+  ) {
+    return next()
+  }
+  const mw = traceMiddleware as unknown as (
+    c: Context,
+    next: Next,
+  ) => Promise<void>
+  return mw(c, next)
+})
+
 // Admin API routes (API-key auth, protected by authMiddleware above)
 server.route("/admin/audit", auditAdminRoute)
 
@@ -163,6 +192,7 @@ sessionProtected.use("*", requireAdminSession)
 sessionProtected.route("/session", sessionApp)
 sessionProtected.route("/keys", keysApp)
 sessionProtected.route("/usage", usageApp)
+sessionProtected.route("/traces", tracesApp)
 sessionProtected.route("/", indexApp)
 server.route("/admin", sessionProtected)
 

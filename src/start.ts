@@ -27,6 +27,7 @@ import { sweepExpiredDebugKeys } from "./services/debug-ttl-sweeper"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
 import { startEventRetention } from "./services/retention"
+import { startTraceRetention } from "./services/trace-retention"
 
 interface RunServerOptions {
   port: number
@@ -102,12 +103,16 @@ function startPeriodicSweepers(): void {
 }
 
 /** Install SIGINT/SIGTERM handlers that flush the DB before exit. */
-function installShutdownHandlers(stopRetention?: () => void): void {
+function installShutdownHandlers(
+  stopFns: Array<(() => void) | undefined> = [],
+): void {
   const shutdown = (code: number): void => {
-    try {
-      stopRetention?.()
-    } catch {
-      // cancellation must not block shutdown
+    for (const stop of stopFns) {
+      try {
+        stop?.()
+      } catch {
+        // cancellation must not block shutdown
+      }
     }
     try {
       closeDb(getDb())
@@ -160,7 +165,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   // Start hourly events retention sweeper (issue #34).
   // Cancel handle is stored on the shutdown hook so SIGINT/SIGTERM stops it.
   const stopEventRetention = startEventRetention()
-  installShutdownHandlers(stopEventRetention)
+  // Start hourly trace retention sweeper (issue #36).
+  const stopTraceRetention = startTraceRetention()
+  installShutdownHandlers([stopEventRetention, stopTraceRetention])
 
   logAuthModeBanner(authMode)
 

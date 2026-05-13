@@ -33,7 +33,11 @@ const ModelEntrySchema = z.object({
 
 const RetentionSchema = z.object({
   events_days: z.number().int().min(0).default(90),
-  traces_days: z.number().int().min(0).default(7),
+  // traces_days = 0 keeps captures in-memory only: the live SSE tail still
+  // works, but nothing is written to disk. This is the privacy-preserving
+  // default per issue #36 — operators must opt in to on-disk persistence by
+  // setting a positive value in ~/.local/share/copilot-api/config.json.
+  traces_days: z.number().int().min(0).default(0),
   traces_max_bytes: z.number().int().min(0).default(104857600), // 100MB
   audit_days: z.number().int().min(0).default(365),
 })

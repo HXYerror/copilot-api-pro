@@ -21,11 +21,14 @@ const CONFIG_PATH = path.join(APP_DIR, "config.json")
 
 const DB_PATH = path.join(APP_DIR, "copilot-api.db")
 
+const TRACES_DIR = path.join(APP_DIR, "traces")
+
 export const PATHS = {
   APP_DIR,
   GITHUB_TOKEN_PATH,
   CONFIG_PATH,
   DB_PATH,
+  TRACES_DIR,
 }
 
 export function configPath(): string {
@@ -34,6 +37,16 @@ export function configPath(): string {
 
 export function dbPath(): string {
   return DB_PATH
+}
+
+/**
+ * Per-day trace JSONL files live here. The directory is created lazily by
+ * the trace-writer with mode 0o700 (this matches the parent APP_DIR
+ * permissions) so test environments that never write a trace don't
+ * accidentally create the directory just by importing this module.
+ */
+export function tracesDir(): string {
+  return TRACES_DIR
 }
 
 export async function ensurePaths(): Promise<void> {

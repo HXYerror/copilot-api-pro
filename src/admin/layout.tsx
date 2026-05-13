@@ -19,7 +19,7 @@ export const ADMIN_SECURITY_HEADERS = {
 
 interface LayoutProps {
   title?: string
-  active?: "index" | "keys" | "usage" | "audit" | "settings"
+  active?: "index" | "keys" | "usage" | "audit" | "traces" | "settings"
   /** CSRF token for the logout form (required for session-protected pages). */
   csrfToken?: string
   /** Number of keys with debug_enabled=1 — when > 0, a warning banner is shown */
@@ -43,6 +43,7 @@ export const Layout: FC<LayoutProps> = ({
     { href: "/admin/keys", label: "Keys", key: "keys" },
     { href: "/admin/usage", label: "Usage", key: "usage" },
     { href: "/admin/audit", label: "Audit", key: "audit" },
+    { href: "/admin/traces", label: "Traces", key: "traces" },
     { href: "/admin/settings", label: "Settings", key: "settings" },
   ]
 

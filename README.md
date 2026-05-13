@@ -278,6 +278,24 @@ risk with `--i-accept-account-suspension-risk`. There is no silent
 backward compatibility for this case — by design, because GitHub may
 treat anonymous abuse as your fault.
 
+### Debug captures
+
+The proxy can persist full request/response pairs to JSONL when a key has
+debug mode enabled (see `/admin/keys`). **This stores other users' prompts on
+your disk** — treat the data directory as sensitive. The default config sets
+`retention.traces_days = 0` which keeps traces in-memory only (live tail at
+`/admin/traces` works; nothing is written to disk). Set `traces_days` to a
+positive number in `~/.local/share/copilot-api/config.json` to opt in to
+on-disk persistence, and `chmod 0700 ~/.local/share/copilot-api`.
+
+Redaction is mandatory and covers GitHub tokens (`gh[ousr]_`, `github_pat_`),
+upstream Copilot JWTs, and the OAuth client id. The writer refuses to
+persist a line that still contains a recognisable secret after redaction.
+
+Admin-tier operators can force capture of a single request by sending
+`X-Capi-Debug: 1` alongside their `Authorization: Bearer …` header — the
+header is stripped before forwarding upstream, so it never reaches GitHub.
+
 ## API Endpoints
 
 The server exposes several endpoints to interact with the Copilot API. It provides OpenAI-compatible endpoints and now also includes support for Anthropic-compatible endpoints, allowing for greater flexibility with different tools and services.

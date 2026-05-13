@@ -558,3 +558,18 @@ button[type="submit"]:hover {
   padding: 1.5rem;
   text-align: center;
 }
+
+/* ── Trace live tail (issue #36) ── */
+.trace-log {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  height: 70vh;
+  overflow: auto;
+  padding: 1rem;
+  white-space: pre;
+}
+.text-muted { color: var(--text-muted); }

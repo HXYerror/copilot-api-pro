@@ -15,7 +15,16 @@ import { findKeyByHash } from "~/services/keys"
 // Types
 // ---------------------------------------------------------------------------
 
-export type KeyVar = { key: KeyRow }
+export type KeyVar = {
+  key: KeyRow
+  /**
+   * Set by authMiddleware when the request arrived with `X-Capi-Debug: 1`
+   * AND the resolved key is admin-tier. The header itself is always
+   * stripped (so it never reaches upstream); downstream middleware (e.g.
+   * the trace capture in middleware/trace.ts) must read this flag instead.
+   */
+  debug_via_header?: boolean
+}
 
 // Regex for full sk-cap- token format: prefix + 52 base32 uppercase chars
 const SK_CAP_RE = /^sk-cap-[A-Z2-7]{52}$/
@@ -230,6 +239,12 @@ export const authMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   c.req.raw.headers.delete("x-capi-debug")
   if (debugHeader !== undefined && keyRecord.tier !== "admin") {
     consola.warn("[auth] Stripped X-Capi-Debug from client-tier request")
+  }
+  // Surface the admin-tier debug-toggle via context so downstream middleware
+  // (trace.ts) can opt in to capture WITHOUT relying on the header (which
+  // we've already deleted to avoid leaking the bit upstream).
+  if (debugHeader === "1" && keyRecord.tier === "admin") {
+    c.set("debug_via_header", true)
   }
 
   try {
