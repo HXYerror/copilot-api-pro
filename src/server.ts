@@ -1,3 +1,5 @@
+import type { Context } from "hono"
+
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { logger } from "hono/logger"
@@ -12,6 +14,7 @@ import { sessionApp, sessionMiddleware } from "./admin/session-middleware"
 import { getDb } from "./lib/db"
 import { state } from "./lib/state"
 import { authMiddleware } from "./middleware/auth"
+import { telemetryMiddleware } from "./middleware/telemetry"
 import { completionRoutes } from "./routes/chat-completions/route"
 import { embeddingRoutes } from "./routes/embeddings/route"
 import { messageRoutes } from "./routes/messages/route"
@@ -108,6 +111,32 @@ server.use("*", (c, next) => {
     return next()
   }
   return authMiddleware(c, next)
+})
+
+// ---------------------------------------------------------------------------
+// Telemetry middleware (issue #34, F3.A)
+// Runs AFTER auth (needs c.var.key) and BEFORE route handlers.  Records one
+// row in the `events` table per API-proxy request.  Skipped for the admin
+// WebUI (click events aren't useful) and health probes.
+// ---------------------------------------------------------------------------
+server.use("*", (c, next) => {
+  const path = c.req.path
+  if (
+    path === "/"
+    || path === "/healthz"
+    || path === "/readyz"
+    || path === "/admin"
+    || path.startsWith("/admin/")
+  ) {
+    return next()
+  }
+  // The telemetry middleware is typed with a Variables shape, but at this
+  // outer mount we only need it as a generic MiddlewareHandler.
+  const mw = telemetryMiddleware as unknown as (
+    c: Context,
+    next: Next,
+  ) => Promise<void>
+  return mw(c, next)
 })
 
 // Admin API routes (API-key auth, protected by authMiddleware above)

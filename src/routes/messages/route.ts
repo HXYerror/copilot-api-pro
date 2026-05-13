@@ -1,11 +1,13 @@
 import { Hono } from "hono"
 
+import type { TelemetryVar } from "~/middleware/telemetry"
+
 import { forwardError } from "~/lib/error"
 
 import { handleCountTokens } from "./count-tokens-handler"
 import { handleCompletion } from "./handler"
 
-export const messageRoutes = new Hono()
+export const messageRoutes = new Hono<{ Variables: TelemetryVar }>()
 
 messageRoutes.post("/", async (c) => {
   try {

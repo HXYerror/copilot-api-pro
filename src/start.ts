@@ -26,6 +26,7 @@ import { audit, initAudit } from "./services/audit"
 import { sweepExpiredDebugKeys } from "./services/debug-ttl-sweeper"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
+import { startEventRetention } from "./services/retention"
 
 interface RunServerOptions {
   port: number
@@ -101,8 +102,13 @@ function startPeriodicSweepers(): void {
 }
 
 /** Install SIGINT/SIGTERM handlers that flush the DB before exit. */
-function installShutdownHandlers(): void {
+function installShutdownHandlers(stopRetention?: () => void): void {
   const shutdown = (code: number): void => {
+    try {
+      stopRetention?.()
+    } catch {
+      // cancellation must not block shutdown
+    }
     try {
       closeDb(getDb())
     } catch {
@@ -151,6 +157,11 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   // Initialize audit log — prunes old files beyond retention
   initAudit()
 
+  // Start hourly events retention sweeper (issue #34).
+  // Cancel handle is stored on the shutdown hook so SIGINT/SIGTERM stops it.
+  const stopEventRetention = startEventRetention()
+  installShutdownHandlers(stopEventRetention)
+
   logAuthModeBanner(authMode)
 
   // First-run admin bootstrap (no-op if auth disabled or keys exist)
@@ -170,8 +181,6 @@ export async function runServer(options: RunServerOptions): Promise<void> {
       },
     })
   }
-
-  installShutdownHandlers()
 
   consola.info(
     `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,

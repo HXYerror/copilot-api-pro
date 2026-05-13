@@ -6,6 +6,53 @@ import {
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
+/**
+ * Telemetry helper (issue #34): inspect a parsed Anthropic stream event and
+ * stash any usage figures it carries on the Hono context for the telemetry
+ * middleware.
+ *
+ * - `message_start.message.usage.input_tokens` is captured ONCE.
+ * - `message_delta.usage.output_tokens` is captured on every delta (the
+ *   final delta carries the cumulative output token count).
+ *
+ * Returns the updated `(input, output)` pair so the caller can keep its own
+ * running state without re-reading the event.
+ */
+export function stashAnthropicUsage(
+  c: {
+    set: (
+      k: "usage",
+      v: { prompt_tokens?: number; completion_tokens?: number },
+    ) => void
+  },
+  parsed: AnthropicStreamEventData,
+  prev: [number | undefined, number | undefined],
+): [number | undefined, number | undefined] {
+  let [input, output] = prev
+  if (parsed.type === "message_start") {
+    const m = parsed.message
+    if (typeof m.usage.input_tokens === "number") {
+      input = m.usage.input_tokens
+    }
+    if (typeof m.usage.output_tokens === "number") {
+      output = m.usage.output_tokens
+    }
+  } else if (parsed.type === "message_delta") {
+    const u = parsed.usage
+    if (u) {
+      if (typeof u.input_tokens === "number") input = u.input_tokens
+      if (typeof u.output_tokens === "number") output = u.output_tokens
+    }
+  }
+  if (input !== undefined || output !== undefined) {
+    c.set("usage", {
+      prompt_tokens: input,
+      completion_tokens: output,
+    })
+  }
+  return [input, output]
+}
+
 function isToolBlockOpen(state: AnthropicStreamState): boolean {
   if (!state.contentBlockOpen) {
     return false

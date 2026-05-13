@@ -28,10 +28,22 @@ export const createChatCompletions = async (
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
 
+  // Issue #34 (F3.A): for streaming requests, ask upstream to emit a final
+  // chunk with usage stats so the telemetry middleware can record real token
+  // counts.  Preserve caller intent — if the client already supplied
+  // stream_options, don't overwrite their choice.
+  // Older Copilot models may ignore this flag; in that case the stream
+  // simply contains no usage chunk and we record usage_unknown=1.
+  // https://github.com/ericc-ch/copilot-api/issues/34
+  const upstreamPayload: ChatCompletionsPayload =
+    payload.stream === true && payload.stream_options === undefined ?
+      { ...payload, stream_options: { include_usage: true } }
+    : payload
+
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(upstreamPayload),
   })
 
   if (!response.ok) {
@@ -135,6 +147,12 @@ export interface ChatCompletionsPayload {
   stop?: string | Array<string> | null
   n?: number | null
   stream?: boolean | null
+  /**
+   * OpenAI-compatible streaming options.  Setting `include_usage = true` asks
+   * upstream to emit a final SSE chunk with a top-level `usage` field so the
+   * telemetry middleware can record token counts (issue #34).
+   */
+  stream_options?: { include_usage?: boolean } | null
 
   frequency_penalty?: number | null
   presence_penalty?: number | null
