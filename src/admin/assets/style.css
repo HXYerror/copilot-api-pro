@@ -499,3 +499,62 @@ button[type="submit"]:hover {
   font-size: 0.88rem;
   margin-bottom: 0.8rem;
 }
+
+/* ── Usage dashboard ── */
+.usage-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.usage-filter {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.8rem;
+  align-items: end;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin-bottom: 1.25rem;
+}
+.usage-filter .form-field { margin-bottom: 0; }
+.usage-filter select[multiple] {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3rem;
+  font-size: 0.85rem;
+}
+.usage-filter .form-actions { margin-top: 0; }
+.usage-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  margin: 1.5rem 0;
+}
+.usage-chart {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.2rem;
+}
+.usage-chart h2 { font-size: 1rem; margin-bottom: 0.6rem; }
+.chart-box { width: 100%; min-height: 240px; }
+.usage-table-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.2rem;
+  margin-bottom: 1rem;
+}
+.usage-table-section h2 { font-size: 1rem; margin-bottom: 0.6rem; }
+.usage-empty {
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  text-align: center;
+}

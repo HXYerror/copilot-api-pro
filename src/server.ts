@@ -11,6 +11,7 @@ import { indexApp } from "./admin/index"
 import { keysApp } from "./admin/keys/route"
 import { loginApp } from "./admin/login"
 import { sessionApp, sessionMiddleware } from "./admin/session-middleware"
+import { usageApp } from "./admin/usage/route"
 import { getDb } from "./lib/db"
 import { state } from "./lib/state"
 import { authMiddleware } from "./middleware/auth"
@@ -156,6 +157,7 @@ const sessionProtected = new Hono()
 sessionProtected.use("*", sessionMiddleware)
 sessionProtected.route("/session", sessionApp)
 sessionProtected.route("/keys", keysApp)
+sessionProtected.route("/usage", usageApp)
 sessionProtected.route("/", indexApp)
 server.route("/admin", sessionProtected)
 
