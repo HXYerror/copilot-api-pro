@@ -404,6 +404,24 @@ describe("CSV RFC 4180 quoting (csvField)", () => {
     expect(csvField("a\nb")).toBe(`"a\nb"`)
     expect(csvField("a\r\nb")).toBe(`"a\r\nb"`)
   })
+
+  test(
+    String.raw`formula-injection: leading =, +, -, @, \t, \r are prefixed with '`,
+    () => {
+      // OWASP CSV-injection vector.  A model name starting with `=` could
+      // execute as an Excel/Numbers formula.  Defang by prefixing apostrophe.
+      expect(csvField("=2+2")).toBe(`'=2+2`)
+      expect(csvField("+SUM(A1:A9)")).toBe(`'+SUM(A1:A9)`)
+      expect(csvField("-1+1")).toBe(`'-1+1`)
+      expect(csvField("@formula")).toBe(`'@formula`)
+      expect(csvField("\tleading-tab")).toBe(`'\tleading-tab`)
+      // Real-world attack payload: no comma/quote/newline so no RFC 4180
+      // quoting is needed — the apostrophe alone defeats Excel's formula parse.
+      expect(csvField(`=cmd|'/c calc'!A1`)).toBe(`'=cmd|'/c calc'!A1`)
+      // Payload with a comma requires both the apostrophe AND quotes.
+      expect(csvField(`=A1,B2`)).toBe(`"'=A1,B2"`)
+    },
+  )
 })
 
 describe("CSV round-trip via the export route's CSV output", () => {

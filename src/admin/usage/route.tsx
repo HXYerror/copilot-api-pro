@@ -91,6 +91,12 @@ function parseFilter(c: {
   const range = parseRange(c.req.query("range"))
   const now = Date.now()
 
+  // Cap on the absolute query window for custom ranges.  Events are already
+  // retention-bounded to features.retention.events_days (90 default), but
+  // an arbitrarily wide WHERE-clause scan still pins a read transaction and
+  // can starve WAL checkpoints.  Cap at 90 days as a defence-in-depth bound.
+  const MAX_WINDOW_MS = 90 * DAY_MS
+
   let since: number
   let until: number
   if (range === "custom") {
@@ -99,6 +105,9 @@ function parseFilter(c: {
     until = untilRaw ?? now
     since = sinceRaw ?? until - DAY_MS
     if (since >= until) since = until - HOUR_MS
+    // Clamp custom range to MAX_WINDOW_MS — preserves `until` so the request
+    // still answers the operator's "look at the most recent N" intent.
+    if (until - since > MAX_WINDOW_MS) since = until - MAX_WINDOW_MS
   } else {
     until = now
     since = until - rangeSpanMs(range)
@@ -152,17 +161,27 @@ function computeStats(
 }
 
 // ---------------------------------------------------------------------------
-// CSV helpers — RFC 4180 quoting
+// CSV helpers — RFC 4180 quoting + formula-injection guard
 //
-// Quote fields that contain a comma, double-quote, CR, or LF; embedded
-// double-quotes are doubled (`"` → `""`).  Everything else is emitted bare.
+// 1. Quote fields containing a comma, double-quote, CR, or LF (RFC 4180);
+//    embedded double-quotes are doubled (`"` → `""`).
+// 2. **Formula-injection defense.** Excel, Numbers, LibreOffice, and Google
+//    Sheets treat a field starting with `=`, `+`, `-`, `@`, `\t`, or `\r`
+//    as a formula expression — a malicious model name like
+//    `=cmd|'/c calc'!A1` could pop a calculator (or worse) when an operator
+//    opens the exported CSV in a spreadsheet. We defang by prefixing such
+//    fields with an apostrophe; spreadsheets render the apostrophe as text
+//    suppression rather than a literal character. See:
+//      https://owasp.org/www-community/attacks/CSV_Injection
 // ---------------------------------------------------------------------------
 
 const NEEDS_QUOTING = /[",\r\n]/
+const RISKY_LEAD = /^[=+\-@\t\r]/
 
 export function csvField(value: string | number | null): string {
   if (value === null) return ""
-  const s = String(value)
+  let s = String(value)
+  if (RISKY_LEAD.test(s)) s = `'${s}` // formula-injection guard
   if (!NEEDS_QUOTING.test(s)) return s
   return `"${s.replaceAll(`"`, `""`)}"`
 }
@@ -284,6 +303,12 @@ usageApp.get("/", (c) => {
 
 // ---------------------------------------------------------------------------
 // GET /admin/usage/export.csv — streamed CSV download
+//
+// Pull-based ReadableStream so the runtime applies backpressure when the
+// client is slow / paused — we don't materialise the entire CSV inside the
+// stream's internal queue.  `cancel()` finalises bun:sqlite's iterator via
+// its optional `.return()` method, releasing the read transaction so WAL
+// checkpointing isn't blocked when a client aborts mid-download.
 // ---------------------------------------------------------------------------
 
 usageApp.get("/export.csv", (c) => {
@@ -291,20 +316,39 @@ usageApp.get("/export.csv", (c) => {
   const dbFilter = emptyFilter(filter)
   const tsTag = new Date().toISOString().replaceAll(/[:.]/g, "-")
   const headerLine = CSV_HEADERS.join(",")
+  const encoder = new TextEncoder()
+
+  const iter = streamEventsForCsv(dbFilter)
+  let wroteHeader = false
 
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const encoder = new TextEncoder()
+    pull(controller) {
       try {
-        controller.enqueue(encoder.encode(`${headerLine}\n`))
-        for (const row of streamEventsForCsv(dbFilter)) {
-          controller.enqueue(encoder.encode(`${eventRowToCsv(row)}\n`))
+        if (!wroteHeader) {
+          controller.enqueue(encoder.encode(`${headerLine}\n`))
+          wroteHeader = true
+          return
         }
+        const result = iter.next()
+        if (result.done) {
+          controller.close()
+          return
+        }
+        controller.enqueue(encoder.encode(`${eventRowToCsv(result.value)}\n`))
       } catch (err) {
-        consola.error(`[admin/usage] CSV export failed: ${String(err)}`)
-      } finally {
-        controller.close()
+        consola.error(`[admin/usage] CSV export pull failed: ${String(err)}`)
+        controller.error(err)
+        // Best-effort iterator cleanup so the read txn doesn't linger.
+        iter.return?.()
       }
+    },
+    cancel(reason) {
+      consola.debug(
+        `[admin/usage] CSV export cancelled: ${String(reason ?? "client_disconnect")}`,
+      )
+      // Finalise the bun:sqlite iterator so the read transaction is closed
+      // and the prepared statement is reset.
+      iter.return?.()
     },
   })
 

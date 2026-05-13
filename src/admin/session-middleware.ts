@@ -141,6 +141,34 @@ export const sessionMiddleware: MiddlewareHandler<{
   c.res.headers.append("Set-Cookie", sessionCookieValue(session.id))
 }
 
+/**
+ * Defense-in-depth guard: re-verify the underlying key is still admin-tier
+ * and not revoked, on every request to a session-protected admin route.
+ *
+ * The login flow already rejects non-admin keys (src/admin/login.tsx), so the
+ * only way to obtain a session is to authenticate as admin.  This middleware
+ * protects against a regression in that flow, AND against the case where the
+ * key is revoked after the session is created (in which case the session
+ * must be terminated and the user redirected to login).
+ */
+export const requireAdminSession: MiddlewareHandler<{
+  Variables: SessionVar
+}> = async (c, next) => {
+  const session = c.get("session")
+  // Lazy require to avoid a cycle with services/keys → lib/db.
+  const { findKeyById } = await import("~/services/keys")
+  const key = findKeyById(session.key_id)
+  if (!key || key.revoked_at !== null || key.tier !== "admin") {
+    // The session refers to a key that's no longer trustworthy. Tear the
+    // session down and bounce to login so the operator has to re-authenticate.
+    deleteSession(session.id)
+    const headers = new Headers({ Location: "/admin/login" })
+    headers.set("Set-Cookie", clearSessionCookieValue())
+    return new Response(null, { status: 302, headers })
+  }
+  await next()
+}
+
 /** Try to read a CSRF token from an application/x-www-form-urlencoded body. */
 async function extractCsrfBody(c: Context): Promise<string | undefined> {
   const ct = c.req.header("content-type") ?? ""

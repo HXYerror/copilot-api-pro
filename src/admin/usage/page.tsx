@@ -273,13 +273,19 @@ export const UsagePage: FC<UsagePageProps> = (props) => {
   // This is the CSP-safe alternative to inline JS: usage.js reads the payload
   // via document.getElementById("usage-data").textContent and feeds uPlot.
   //
-  // Defence in depth: any literal "</" inside the JSON would prematurely end
-  // the <script> tag.  Escape the forward slash so the JSON parser still gets
-  // valid input but the HTML tokenizer sees an opaque payload.
-  const payload = JSON.stringify({ rpm, tokens, latency, filter }).replaceAll(
-    "</",
-    String.raw`<\/`,
-  )
+  // Defence in depth: an attacker-controlled string value (e.g. a model name)
+  // must not be able to break out of the <script> data state or trip the HTML
+  // parser into a script-data-double-escaped state. Escape every HTML special
+  // character to its \uXXXX form before embedding — JSON.parse decodes the
+  // escapes transparently, but the HTML tokenizer sees an opaque payload.
+  // (Original guard only escaped "</"; this guard also blocks "<!--<script>"
+  // double-escape and the U+2028 / U+2029 line-separator JS-parser killers.)
+  const payload = JSON.stringify({ rpm, tokens, latency, filter })
+    .replaceAll("<", String.raw`\u003c`)
+    .replaceAll(">", String.raw`\u003e`)
+    .replaceAll("&", String.raw`\u0026`)
+    .replaceAll("\u2028", String.raw`\u2028`)
+    .replaceAll("\u2029", String.raw`\u2029`)
 
   return (
     <div class="usage-page">

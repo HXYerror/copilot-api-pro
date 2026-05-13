@@ -10,7 +10,11 @@ import { auditAdminRoute } from "./admin/audit/route"
 import { indexApp } from "./admin/index"
 import { keysApp } from "./admin/keys/route"
 import { loginApp } from "./admin/login"
-import { sessionApp, sessionMiddleware } from "./admin/session-middleware"
+import {
+  requireAdminSession,
+  sessionApp,
+  sessionMiddleware,
+} from "./admin/session-middleware"
 import { usageApp } from "./admin/usage/route"
 import { getDb } from "./lib/db"
 import { state } from "./lib/state"
@@ -155,6 +159,7 @@ server.route("/admin/audit", auditAdminRoute)
 // is set by authMiddleware in no-auth mode, which is fine here too.
 const sessionProtected = new Hono()
 sessionProtected.use("*", sessionMiddleware)
+sessionProtected.use("*", requireAdminSession)
 sessionProtected.route("/session", sessionApp)
 sessionProtected.route("/keys", keysApp)
 sessionProtected.route("/usage", usageApp)
