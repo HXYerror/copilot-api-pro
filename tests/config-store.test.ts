@@ -6,6 +6,7 @@ import path from "node:path"
 import {
   ConfigSchema,
   type Config,
+  _resetRuntimeOverrides_TEST_ONLY,
   getConfig,
   loadConfig,
   saveConfig,
@@ -84,7 +85,7 @@ describe("ConfigSchema — validates a complete config", () => {
     expect(data.retention.traces_days).toBe(7)
     expect(data.retention.traces_max_bytes).toBe(104857600)
     expect(data.retention.audit_days).toBe(365)
-    expect(data.features.auth).toBe(false)
+    expect(data.features.auth).toBe(true)
     expect(data.features.telemetry).toBe(false)
     expect(data.features.debug).toBe(false)
   })
@@ -423,7 +424,7 @@ describe("setRuntimeAuthOverride()", () => {
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true })
-    setRuntimeAuthOverride(undefined)
+    _resetRuntimeOverrides_TEST_ONLY()
   })
 
   test("override wins over persisted config", async () => {

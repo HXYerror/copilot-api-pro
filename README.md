@@ -69,6 +69,14 @@ bun install
 
 ## Using with Docker
 
+> [!IMPORTANT]
+> The container entrypoint automatically passes `--host 0.0.0.0` so
+> `docker run -p 4141:4141 ...` keeps working with the v0.8 host default.
+> Auth is **on by default**; the bootstrap admin key is written to the
+> mounted `/root/.local/share/copilot-api/admin.key.txt`. Read that file
+> after first run and delete it. Pass `--no-auth` (appended after the
+> image name) for the legacy unauthenticated behavior on loopback only.
+
 Build image
 
 ```sh
@@ -252,9 +260,9 @@ the `/admin` overview labels this `auth_mode: off (acknowledged risk)`.
 
 v0.7 had no authentication and no admin plane. To migrate to v0.8:
 
-1. **Loopback users (the common case).** Add `--host 127.0.0.1 --no-auth`
-   to your existing start command. Behavior is identical to v0.7, no
-   bootstrap key needed.
+1. **Loopback users (the common case).** Add `--no-auth` to your existing
+   start command. (`--host 127.0.0.1` is the new default, so no extra
+   flag is needed.) Behavior is identical to v0.7, no bootstrap key needed.
 2. **Network-exposed users.** Run `copilot-api start` once, copy the
    bootstrap admin key from `~/.local/share/copilot-api/admin.key.txt`,
    then update your downstream tools to send `Authorization: Bearer <key>`

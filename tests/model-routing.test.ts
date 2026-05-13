@@ -443,7 +443,17 @@ async function loadModelsConfig(
   models: Record<string, { upstream: string; enabled?: boolean }>,
 ): Promise<void> {
   const filePath = join(tmpdir(), `models-route-test-${Date.now()}.json`)
-  await writeFile(filePath, JSON.stringify({ version: 1, models }), "utf8")
+  await writeFile(
+    filePath,
+    JSON.stringify({
+      version: 1,
+      models,
+      // These tests pre-date the v0.8 auth-on default; keep auth off so they
+      // can hit /v1/models without setting up keys + sessions.
+      features: { auth: false, telemetry: false, debug: false },
+    }),
+    "utf8",
+  )
   await loadConfig(filePath)
 }
 

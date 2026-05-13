@@ -39,7 +39,11 @@ const RetentionSchema = z.object({
 })
 
 const FeaturesSchema = z.object({
-  auth: z.boolean().default(false),
+  // v0.8 breaking change: authentication is required by default.
+  // To opt out on loopback, pass `--no-auth` on the CLI (see lib/auth-mode.ts).
+  // Setting this to `false` in config.json is equivalent to passing `--no-auth`
+  // and is still subject to the same safety guard.
+  auth: z.boolean().default(true),
   telemetry: z.boolean().default(false),
   debug: z.boolean().default(false),
 })

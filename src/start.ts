@@ -9,7 +9,11 @@ import invariant from "tiny-invariant"
 import { purgeExpiredSessions } from "./admin/session"
 import { logAuthModeBanner, resolveAuthMode } from "./lib/auth-mode"
 import { runBootstrap } from "./lib/bootstrap"
-import { getConfig, setRuntimeAuthOverride } from "./lib/config-store"
+import {
+  getConfig,
+  loadConfig,
+  setRuntimeAuthOverride,
+} from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
@@ -17,7 +21,6 @@ import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels } from "./lib/utils"
-import { warnNoAuth } from "./middleware/auth"
 import { server } from "./server"
 import { audit, initAudit } from "./services/audit"
 import { sweepExpiredDebugKeys } from "./services/debug-ttl-sweeper"
@@ -116,16 +119,27 @@ function installShutdownHandlers(): void {
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
-  // Resolve auth mode FIRST — this throws before any side-effects if
-  // --no-auth is requested on a non-loopback host without acknowledgement.
+  // Load config FIRST so we can read features.auth before resolving auth mode.
+  // This also creates the config.json file with defaults on first run.
+  await ensurePaths()
+  await loadConfig()
+
+  // Resolve auth mode — this throws before any HTTP/network side-effects if
+  // --no-auth (or config features.auth=false) is requested on a non-loopback
+  // host without acknowledgement.
   const authMode = resolveAuthMode({
     noAuth: options.noAuth,
     acceptRisk: options.acceptRisk,
     host: options.host,
     port: options.port,
+    configAuth: getConfig().features.auth,
   })
-  // The CLI flag wins over whatever is in config.json.
-  setRuntimeAuthOverride(authMode.authEnabled)
+  // Apply the runtime override ONLY when the operator explicitly opted out
+  // via --no-auth. Otherwise the config value is authoritative — the safety
+  // guard above has already validated the combination.
+  if (options.noAuth) {
+    setRuntimeAuthOverride(false)
+  }
   state.authModeLabel = authMode.label
   state.bindAddress = authMode.bindAddress
 
@@ -138,7 +152,6 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   initAudit()
 
   logAuthModeBanner(authMode)
-  warnNoAuth()
 
   // First-run admin bootstrap (no-op if auth disabled or keys exist)
   runBootstrap()

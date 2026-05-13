@@ -8,9 +8,12 @@
  *
  * Policy (v0.8+):
  *   - Default: auth ON (bootstrap admin key on first run).
- *   - `--no-auth` on loopback host: allowed with a yellow warning.
- *   - `--no-auth` on non-loopback host: REFUSED unless the operator passes
- *     `--i-accept-account-suspension-risk` explicitly.
+ *   - "Disable auth" can come from either the `--no-auth` CLI flag or from
+ *     `features.auth=false` in config.json — both flow through the same
+ *     safety guard so a config-only escape doesn't bypass it.
+ *   - Disabled-auth on a loopback host: allowed with a yellow warning.
+ *   - Disabled-auth on a non-loopback host: REFUSED unless the operator
+ *     passes `--i-accept-account-suspension-risk` explicitly.
  */
 
 import consola from "consola"
@@ -19,24 +22,48 @@ import consola from "consola"
 // Loopback detection
 // ---------------------------------------------------------------------------
 
-// Strict per-octet check for 127.0.0.0/8 plus IPv6 ::1 and the localhost name.
 const IPV4_LOOPBACK_RE = /^127(?:\.\d{1,3}){3}$/
 const LOOPBACK_LITERALS = new Set(["::1", "[::1]", "localhost"])
+// Un-shortened IPv6 loopback forms (RFC 4291 §2.2 long form).
+// We don't try to be a full IPv6 parser; we only accept exact-equality with
+// the canonical zero-padded variants since that's all an operator could plausibly type.
+const IPV6_LOOPBACK_LONG = new Set([
+  "0:0:0:0:0:0:0:1",
+  "0000:0000:0000:0000:0000:0000:0000:0001",
+  // IPv4-mapped IPv6 loopback (RFC 4291 §2.5.5.2)
+  "::ffff:127.0.0.1",
+])
 
 export function isLoopbackHost(host: string): boolean {
   const trimmed = host.trim().toLowerCase()
   if (LOOPBACK_LITERALS.has(trimmed)) return true
+
   // Strip IPv6 brackets if present
   const bare = trimmed.replaceAll(/^\[|\]$/g, "")
   if (bare === "::1") return true
+  if (IPV6_LOOPBACK_LONG.has(bare)) return true
+
   if (IPV4_LOOPBACK_RE.test(bare)) {
-    // Also reject e.g. 127.999.999.999 (regex allows 1-3 digits per octet)
+    // Reject 127.0.0.999 (regex allows 1-3 digits but per-octet bound is 255).
     return bare.split(".").every((octet) => {
       const n = Number.parseInt(octet, 10)
       return n >= 0 && n <= 255
     })
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// Bind-address formatting (IPv6-aware)
+// ---------------------------------------------------------------------------
+
+export function formatBindAddress(host: string, port: number): string {
+  // IPv6 addresses contain colons, which collide with the port separator.
+  // Wrap in brackets per RFC 3986 §3.2.2 unless already bracketed.
+  if (host.includes(":") && !host.startsWith("[")) {
+    return `[${host}]:${port}`
+  }
+  return `${host}:${port}`
 }
 
 // ---------------------------------------------------------------------------
@@ -52,14 +79,20 @@ export interface AuthModeResult {
 }
 
 export interface AuthModeOptions {
-  /** `--no-auth` flag. If false, auth is on regardless. */
+  /** `--no-auth` flag (explicit CLI request to disable auth). */
   noAuth: boolean
   /** `--i-accept-account-suspension-risk` flag. */
   acceptRisk: boolean
   /** Bind hostname (e.g. "127.0.0.1", "0.0.0.0", "::"). */
   host: string
-  /** Bind port — only included in error/log messages. */
+  /** Bind port — included in error/log messages. */
   port: number
+  /**
+   * Persisted `features.auth` from config.json. When omitted, treated as
+   * `true` (auth ON). Either this being false OR `noAuth` being true counts
+   * as a request to disable auth — both must clear the safety guard.
+   */
+  configAuth?: boolean
 }
 
 /**
@@ -69,27 +102,32 @@ export interface AuthModeOptions {
  * tests as well as the CLI. The CLI catches and prints a red message.
  */
 export function resolveAuthMode(options: AuthModeOptions): AuthModeResult {
-  const bindAddress = `${options.host}:${options.port}`
+  const bindAddress = formatBindAddress(options.host, options.port)
+  const configAuth = options.configAuth ?? true
+  const wantsAuthOff = options.noAuth || !configAuth
 
-  if (!options.noAuth) {
+  if (!wantsAuthOff) {
     return { authEnabled: true, label: "on", bindAddress }
   }
 
-  // --no-auth was passed.
+  // Auth is disabled (via flag or config).
   if (isLoopbackHost(options.host)) {
     return { authEnabled: false, label: "off (loopback)", bindAddress }
   }
 
-  // Non-loopback + --no-auth → require explicit ack.
+  // Non-loopback + auth off → require explicit ack.
   if (!options.acceptRisk) {
+    const source =
+      options.noAuth ?
+        "--no-auth on a non-loopback host"
+      : "features.auth=false (config.json) with a non-loopback bind"
     throw new Error(
-      "REFUSING TO START: --no-auth on a non-loopback host "
-        + `(${bindAddress}) is unsafe.\n\n`
+      `REFUSING TO START: ${source} (${bindAddress}) is unsafe.\n\n`
         + "Anyone who can reach this port will burn your GitHub Copilot quota\n"
         + "and may trigger GitHub abuse-detection (account suspension).\n\n"
         + "Either:\n"
         + "  1. Bind to loopback only:   --host 127.0.0.1\n"
-        + "  2. Enable auth (recommended): drop --no-auth\n"
+        + "  2. Enable auth (recommended): drop --no-auth (and set features.auth=true)\n"
         + "  3. Explicitly accept the risk:\n"
         + "       --no-auth --i-accept-account-suspension-risk\n\n"
         + "See README → Admin Plane / Authentication.",
