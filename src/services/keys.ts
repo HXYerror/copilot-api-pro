@@ -212,15 +212,29 @@ export function countActiveAdminKeys(): number {
   return row?.n ?? 0
 }
 
-/** Count keys that currently have debug_enabled=1 and are not revoked. */
+/** Count keys that are currently in active debug mode (TTL not yet expired). */
 export function countActiveDebugKeys(): number {
   const row = getDb()
-    .query<
-      { n: number },
-      []
-    >("SELECT COUNT(*) as n FROM keys WHERE debug_enabled = 1 AND revoked_at IS NULL")
-    .get()
+    .query<{ n: number }, [number]>(
+      `SELECT COUNT(*) as n FROM keys
+       WHERE debug_enabled = 1
+         AND revoked_at IS NULL
+         AND (debug_expires_at IS NULL OR debug_expires_at > ?)`,
+    )
+    .get(Date.now())
   return row?.n ?? 0
+}
+
+/**
+ * Single source of truth for "is debug effectively active right now".
+ * `debug_enabled = 1` alone is not enough: the row may be revoked, or the
+ * TTL may have passed but the periodic sweeper has not yet run.
+ */
+export function isDebugActive(row: KeyRow, now: number = Date.now()): boolean {
+  if (row.debug_enabled !== 1) return false
+  if (row.revoked_at !== null) return false
+  if (row.debug_expires_at !== null && row.debug_expires_at <= now) return false
+  return true
 }
 
 /**

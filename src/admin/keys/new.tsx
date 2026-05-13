@@ -7,37 +7,6 @@ import { getConfig } from "~/lib/config-store"
 // Sub-components
 // ---------------------------------------------------------------------------
 
-const DEBUG_MODAL_SCRIPT = `
-(function() {
-  var cb = document.getElementById('debug-checkbox');
-  var modal = document.getElementById('debug-modal');
-  var confirmBtn = document.getElementById('debug-confirm');
-  var cancelBtn = document.getElementById('debug-cancel');
-  var confirmed = false;
-
-  cb.addEventListener('change', function() {
-    if (cb.checked && !confirmed) {
-      cb.checked = false;
-      modal.style.display = 'flex';
-    } else if (!cb.checked) {
-      confirmed = false;
-    }
-  });
-
-  confirmBtn.addEventListener('click', function() {
-    confirmed = true;
-    cb.checked = true;
-    modal.style.display = 'none';
-  });
-
-  cancelBtn.addEventListener('click', function() {
-    confirmed = false;
-    cb.checked = false;
-    modal.style.display = 'none';
-  });
-})();
-`.trim()
-
 const DebugConfirmModal: FC<{ tracesDays: number }> = ({ tracesDays }) => (
   <div id="debug-modal" class="modal" style="display:none">
     <div class="modal-backdrop" />
@@ -76,6 +45,7 @@ const NewKeyFormFields: FC<{ modelAliases: Array<string> }> = ({
         name="label"
         placeholder="e.g. claude-code-laptop"
         required
+        maxlength="200"
       />
     </div>
 
@@ -101,6 +71,10 @@ const NewKeyFormFields: FC<{ modelAliases: Array<string> }> = ({
           </label>
         ))}
       </div>
+      {/* Sentinel: a present-but-empty value means "the form intentionally
+          submitted models" so an unchecked-everything submission can be rejected
+          server-side rather than silently widened to "*". */}
+      <input type="hidden" name="allowed_models_present" value="1" />
     </div>
 
     <div class="form-field">
@@ -124,6 +98,15 @@ const NewKeyFormFields: FC<{ modelAliases: Array<string> }> = ({
         />
         <span>Enable debug mode (persists traces for 24h)</span>
       </label>
+      {/* Populated by keys.js to "yes" after the modal is acknowledged.
+          The server REJECTS debug_enabled=1 without debug_confirm=yes — this
+          is the actual gate, not just UX. */}
+      <input
+        type="hidden"
+        id="debug-confirm-field"
+        name="debug_confirm"
+        value=""
+      />
     </div>
   </>
 )
@@ -164,10 +147,7 @@ export const NewKeyForm: FC<NewKeyFormProps> = ({
           </a>
         </div>
       </form>
-      <script
-        // biome-ignore lint/security/noDangerouslySetInnerHtml: intentional inline script for admin-only page
-        dangerouslySetInnerHTML={{ __html: DEBUG_MODAL_SCRIPT }}
-      />
+      <script src="/admin/assets/keys.js" />
     </div>
   )
 }
@@ -175,23 +155,6 @@ export const NewKeyForm: FC<NewKeyFormProps> = ({
 // ---------------------------------------------------------------------------
 // Flash banner: one-time key display
 // ---------------------------------------------------------------------------
-
-const KEY_GATE_SCRIPT = `
-(function(){
-  var gate = document.getElementById('copied-gate');
-  var link = document.getElementById('continue-link');
-  gate.addEventListener('change', function() {
-    link.style.pointerEvents = gate.checked ? '' : 'none';
-    link.style.opacity = gate.checked ? '1' : '0.5';
-  });
-  window.addEventListener('beforeunload', function(e) {
-    if (!gate.checked) {
-      e.preventDefault();
-      e.returnValue = 'Have you copied your API key?';
-    }
-  });
-})();
-`.trim()
 
 interface KeyCreatedBannerProps {
   plain: string
@@ -212,11 +175,7 @@ export const KeyCreatedBanner: FC<KeyCreatedBannerProps> = ({
       <code id="plain-key" class="key-value">
         {plain}
       </code>
-      <button
-        type="button"
-        class="btn btn-sm"
-        onclick={`navigator.clipboard.writeText(document.getElementById('plain-key').textContent).then(function(){this.textContent='Copied!'}.bind(this),function(){})`}
-      >
+      <button type="button" id="copy-btn" class="btn btn-sm">
         Copy
       </button>
     </div>
@@ -234,9 +193,6 @@ export const KeyCreatedBanner: FC<KeyCreatedBannerProps> = ({
         Continue to key details →
       </a>
     </div>
-    <script
-      // biome-ignore lint/security/noDangerouslySetInnerHtml: intentional inline script for admin-only page
-      dangerouslySetInnerHTML={{ __html: KEY_GATE_SCRIPT }}
-    />
+    <script src="/admin/assets/keys.js" />
   </div>
 )

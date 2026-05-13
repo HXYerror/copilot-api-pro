@@ -3,6 +3,8 @@ import type { FC } from "hono/jsx"
 
 import type { KeyRow } from "~/services/keys"
 
+import { isDebugActive } from "~/services/keys"
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -91,6 +93,7 @@ export const KeyList: FC<KeyListProps> = ({
           </a>
         )}
       </div>
+      <script src="/admin/assets/keys.js" />
     </div>
   )
 }
@@ -106,7 +109,7 @@ interface KeyRowProps {
 
 const KeyRow: FC<KeyRowProps> = ({ row, csrfToken }) => {
   const isRevoked = row.revoked_at !== null
-  const debugOn = row.debug_enabled === 1
+  const debugOn = isDebugActive(row)
   const idSuffix = row.id.slice(-8)
   const expiresStr =
     row.debug_expires_at ? ` (exp ${fmtDate(row.debug_expires_at)})` : ""
@@ -148,7 +151,7 @@ const KeyRow: FC<KeyRowProps> = ({ row, csrfToken }) => {
             method="post"
             action={`/admin/keys/${row.id}/revoke`}
             class="inline-form"
-            onsubmit="return confirm('Revoke this key? This cannot be undone.')"
+            data-confirm="Revoke this key? This cannot be undone."
           >
             <input type="hidden" name="csrf_token" value={csrfToken} />
             <button type="submit" class="btn btn-sm btn-danger">

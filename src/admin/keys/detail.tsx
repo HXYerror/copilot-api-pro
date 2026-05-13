@@ -3,6 +3,8 @@ import type { FC } from "hono/jsx"
 
 import type { KeyRow } from "~/services/keys"
 
+import { isDebugActive } from "~/services/keys"
+
 import { fmtDate, fmtModels } from "./list"
 
 // ---------------------------------------------------------------------------
@@ -13,7 +15,7 @@ const KeyMeta: FC<{ row: KeyRow; expiresStr: string }> = ({
   row,
   expiresStr,
 }) => {
-  const debugOn = row.debug_enabled === 1
+  const debugOn = isDebugActive(row)
   return (
     <div class="key-meta">
       <dl>
@@ -96,36 +98,34 @@ const DebugEnabledControls: FC<{
       Debug is <strong>ON</strong>. Traces persist in plaintext. Retention:{" "}
       {tracesDays} days.{expiresStr}
     </p>
-    <form method="post" action={`/admin/keys/${row.id}/debug`}>
+    {/* Disable form */}
+    <form
+      method="post"
+      action={`/admin/keys/${row.id}/debug`}
+      style="display:inline"
+    >
       <input type="hidden" name="csrf_token" value={csrfToken} />
       <input type="hidden" name="debug_enabled" value="0" />
       <button type="submit" class="btn btn-sm">
         Disable Debug
       </button>
-      <button
-        type="submit"
-        name="renew"
-        value="1"
-        class="btn btn-sm btn-warning"
-      >
+    </form>
+    {/* Renew form: separate POST with action=renew so the handler bumps TTL
+        instead of clearing it (the previous shared form silently disabled). */}
+    <form
+      method="post"
+      action={`/admin/keys/${row.id}/debug`}
+      style="display:inline"
+    >
+      <input type="hidden" name="csrf_token" value={csrfToken} />
+      <input type="hidden" name="action" value="renew" />
+      <input type="hidden" name="debug_confirm" value="yes" />
+      <button type="submit" class="btn btn-sm btn-warning">
         Renew 24h TTL
       </button>
     </form>
   </>
 )
-
-const DEBUG_ENABLE_SCRIPT = `
-(function(){
-  var btn = document.getElementById('debug-btn');
-  var modal = document.getElementById('debug-modal');
-  var form = document.getElementById('debug-form');
-  var confirmBtn = document.getElementById('debug-confirm');
-  var cancelBtn = document.getElementById('debug-cancel');
-  btn.addEventListener('click', function(e){ e.preventDefault(); modal.style.display='flex'; });
-  confirmBtn.addEventListener('click', function(){ modal.style.display='none'; form.submit(); });
-  cancelBtn.addEventListener('click', function(){ modal.style.display='none'; });
-})();
-`.trim()
 
 const DebugDisabledControls: FC<{
   row: KeyRow
@@ -158,14 +158,18 @@ const DebugDisabledControls: FC<{
     <form method="post" action={`/admin/keys/${row.id}/debug`} id="debug-form">
       <input type="hidden" name="csrf_token" value={csrfToken} />
       <input type="hidden" name="debug_enabled" value="1" />
+      {/* keys.js sets this to "yes" after the modal is acknowledged.
+          The server REJECTS debug_enabled=1 without it. */}
+      <input
+        type="hidden"
+        id="debug-confirm-field"
+        name="debug_confirm"
+        value=""
+      />
       <button type="submit" id="debug-btn" class="btn btn-warning">
         Enable Debug (24h)
       </button>
     </form>
-    <script
-      // biome-ignore lint/security/noDangerouslySetInnerHtml: intentional inline script for admin-only page
-      dangerouslySetInnerHTML={{ __html: DEBUG_ENABLE_SCRIPT }}
-    />
   </>
 )
 
@@ -178,7 +182,7 @@ const RevokeSection: FC<{ row: KeyRow; csrfToken: string }> = ({
     <form
       method="post"
       action={`/admin/keys/${row.id}/revoke`}
-      onsubmit="return confirm('Revoke this key? This cannot be undone.')"
+      data-confirm="Revoke this key? This cannot be undone."
     >
       <input type="hidden" name="csrf_token" value={csrfToken} />
       <button type="submit" class="btn btn-danger">
@@ -208,7 +212,7 @@ export const KeyDetail: FC<KeyDetailProps> = ({
   success,
 }) => {
   const isRevoked = row.revoked_at !== null
-  const debugOn = row.debug_enabled === 1
+  const debugOn = isDebugActive(row)
   const idSuffix = row.id.slice(-8)
   const expiresStr =
     row.debug_expires_at ?
@@ -264,6 +268,7 @@ export const KeyDetail: FC<KeyDetailProps> = ({
           <RevokeSection row={row} csrfToken={csrfToken} />
         </>
       )}
+      <script src="/admin/assets/keys.js" />
     </div>
   )
 }

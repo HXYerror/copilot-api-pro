@@ -1,5 +1,7 @@
 /** @jsxImportSource hono/jsx */
+import consola from "consola"
 import { Hono } from "hono"
+import crypto from "node:crypto"
 
 import { getConfig } from "~/lib/config-store"
 import { audit } from "~/services/audit"
@@ -23,6 +25,10 @@ import { KeyCreatedBanner, NewKeyForm } from "./new"
 // ---------------------------------------------------------------------------
 // In-memory flash store (process-lifetime): plain key, shown once then gone.
 // Key: random flash token  Value: { plain, keyId, expires }
+//
+// Note: on process restart this is lost. A user who didn't view the page yet
+// will be redirected to /admin/keys with an explicit error message and must
+// revoke + recreate the key (covered in handleMissingFlash below).
 // ---------------------------------------------------------------------------
 
 interface FlashEntry {
@@ -58,19 +64,67 @@ function consumeFlash(token: string): FlashEntry | null {
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE = 50
+const MAX_LABEL_LEN = 200
+// UUID v4 / v7 style id (services/keys.ts uses crypto.randomUUID())
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-function parseAllowedModels(
-  raw: string | Array<string> | undefined,
-): Array<string> {
-  if (!raw) return ["*"]
-  if (Array.isArray(raw)) return raw.length > 0 ? raw : ["*"]
-  return [raw]
+/**
+ * Parse the allowed_models field from a parsed form body.
+ *
+ * Behaviour:
+ * - field absent AND `allowed_models_present` sentinel absent → undefined
+ *   (caller decides: for /new this becomes the default; for /scope it means
+ *   "no field, no update").
+ * - field present (even if empty array) → return the explicit list. An
+ *   empty list is a privilege-narrowing operation that callers must REJECT
+ *   rather than widen to "*".
+ */
+function parseAllowedModels(body: Record<string, unknown>): {
+  explicit: boolean
+  models: Array<string>
+} {
+  const raw = body["allowed_models"]
+  const hasSentinel =
+    typeof body["allowed_models_present"] === "string"
+    && body["allowed_models_present"] === "1"
+
+  let list: Array<string>
+  if (Array.isArray(raw)) {
+    list = raw.filter((m): m is string => typeof m === "string")
+  } else if (typeof raw === "string" && raw.length > 0) {
+    list = [raw]
+  } else {
+    list = []
+  }
+
+  const explicit = hasSentinel || list.length > 0
+  return { explicit, models: list }
 }
 
 function parseIntOrNull(raw: string | undefined): number | null {
   if (!raw || raw.trim() === "") return null
   const n = Number.parseInt(raw, 10)
   return Number.isFinite(n) && n >= 0 ? n : null
+}
+
+function parsePageParam(raw: string | undefined): number {
+  if (!raw) return 1
+  const n = Number.parseInt(raw, 10)
+  return Number.isFinite(n) && n >= 1 ? n : 1
+}
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value)
+}
+
+/** Best-effort audit: log but never let a failing audit break a mutation. */
+function safeAudit(event: Parameters<typeof audit>[0]): void {
+  try {
+    audit(event)
+  } catch (err) {
+    consola.error(`[admin] audit failed (continuing): ${String(err)}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +147,7 @@ keysApp.use("*", async (c, next) => {
 
 keysApp.get("/", (c) => {
   const session = c.get("session")
-  const page = Math.max(1, Number.parseInt(c.req.query("page") ?? "1", 10))
+  const page = parsePageParam(c.req.query("page"))
   const offset = (page - 1) * PAGE_SIZE
   const { rows, total } = listKeys(PAGE_SIZE, offset)
   const debugKeyCount = countActiveDebugKeys()
@@ -141,33 +195,53 @@ keysApp.get("/new", (c) => {
 keysApp.post("/new", async (c) => {
   const session = c.get("session")
   const body = await c.req.parseBody()
+  const config = getConfig()
 
-  const label = typeof body["label"] === "string" ? body["label"].trim() : ""
-  if (!label) {
-    const config = getConfig()
-    return c.html(
+  const renderErr = (msg: string): Response =>
+    c.html(
       <Layout title="New Key" active="keys" csrfToken={session.csrf_token}>
         <NewKeyForm
           csrfToken={session.csrf_token}
           tracesDays={config.retention.traces_days}
-          error="Label is required"
+          error={msg}
         />
       </Layout>,
       400,
     )
+
+  // Label validation
+  const label = typeof body["label"] === "string" ? body["label"].trim() : ""
+  if (!label) return renderErr("Label is required")
+  if (label.length > MAX_LABEL_LEN) {
+    return renderErr(`Label too long (max ${MAX_LABEL_LEN} chars)`)
   }
 
   const tier =
     body["tier"] === "admin" || body["tier"] === "client" ?
       body["tier"]
     : "client"
-  const allowedModels = parseAllowedModels(
-    body["allowed_models"] as string | Array<string> | undefined,
-  )
+
+  // Allowed models: parse, reject empty-when-explicit (privilege widening)
+  const { explicit, models } = parseAllowedModels(body)
+  if (explicit && models.length === 0) {
+    return renderErr("Select at least one allowed model (or '*')")
+  }
+  const allowedModels = explicit ? models : ["*"]
+
   const rateLimitOverride =
     parseIntOrNull(body["rate_limit_override"] as string | undefined)
     ?? undefined
   const debugEnabled = body["debug_enabled"] === "1"
+
+  // Server-side gate: debug requires explicit confirmation token, not just
+  // the checkbox value. The frontend modal sets debug_confirm=yes after the
+  // operator acknowledges the trace-persistence warning. This makes the gate
+  // real (CSP-independent) rather than purely UX.
+  if (debugEnabled && body["debug_confirm"] !== "yes") {
+    return renderErr(
+      "Debug mode requires explicit confirmation. Re-check the box and confirm the modal.",
+    )
+  }
 
   try {
     const { plain, row } = createKey({
@@ -178,7 +252,7 @@ keysApp.post("/new", async (c) => {
       debugEnabled,
     })
 
-    audit({
+    safeAudit({
       actor_key_id: session.key_id,
       actor_tier: "admin",
       action: "key.create",
@@ -195,17 +269,7 @@ keysApp.post("/new", async (c) => {
     const flashToken = createFlash(plain, row.id)
     return c.redirect(`/admin/keys/created?flash=${flashToken}`, 303)
   } catch (err) {
-    const config = getConfig()
-    return c.html(
-      <Layout title="New Key" active="keys" csrfToken={session.csrf_token}>
-        <NewKeyForm
-          csrfToken={session.csrf_token}
-          tracesDays={config.retention.traces_days}
-          error={String(err)}
-        />
-      </Layout>,
-      400,
-    )
+    return renderErr(String(err))
   }
 })
 
@@ -219,7 +283,21 @@ keysApp.get("/created", (c) => {
   const entry = consumeFlash(flashToken)
 
   if (!entry) {
-    return c.redirect("/admin/keys", 302)
+    // Two reasons we end up here: token already consumed (back/refresh) or
+    // process restarted between the POST and this GET. In either case the
+    // plaintext is gone forever; surface it visibly rather than silently
+    // redirecting.
+    return c.html(
+      <Layout title="Key Lost" active="keys" csrfToken={session.csrf_token}>
+        <div class="form-error">
+          <strong>Plaintext no longer available.</strong> The one-time view of
+          this key has been consumed or expired (server may have restarted).
+          Revoke this key and create a new one if you didn't copy it.{" "}
+          <a href="/admin/keys">Back to keys</a>
+        </div>
+      </Layout>,
+      410,
+    )
   }
 
   return c.html(
@@ -236,6 +314,7 @@ keysApp.get("/created", (c) => {
 keysApp.get("/:id", (c) => {
   const session = c.get("session")
   const id = c.req.param("id")
+  if (!isUuid(id)) return c.text("Key not found", 404)
   const row = findKeyById(id)
   if (!row) return c.text("Key not found", 404)
 
@@ -261,12 +340,13 @@ keysApp.get("/:id", (c) => {
 keysApp.post("/:id/revoke", (c) => {
   const session = c.get("session")
   const id = c.req.param("id")
+  if (!isUuid(id)) return c.text("Key not found", 404)
   const row = findKeyById(id)
   if (!row) return c.text("Key not found", 404)
 
   const changed = revokeKey(id)
   if (changed) {
-    audit({
+    safeAudit({
       actor_key_id: session.key_id,
       actor_tier: "admin",
       action: "key.revoke",
@@ -284,73 +364,105 @@ keysApp.post("/:id/revoke", (c) => {
 keysApp.post("/:id/scope", async (c) => {
   const session = c.get("session")
   const id = c.req.param("id")
+  if (!isUuid(id)) return c.text("Key not found", 404)
   const row = findKeyById(id)
   if (!row) return c.text("Key not found", 404)
   if (row.revoked_at !== null) return c.text("Key is revoked", 400)
 
   const body = await c.req.parseBody()
-  const allowedModels = parseAllowedModels(
-    body["allowed_models"] as string | Array<string> | undefined,
-  )
+  const { explicit, models } = parseAllowedModels(body)
+  const config = getConfig()
+
+  const renderErr = (msg: string, status: 400): Response =>
+    c.html(
+      <Layout title="Key Detail" active="keys" csrfToken={session.csrf_token}>
+        <KeyDetail
+          row={findKeyById(id) ?? row}
+          csrfToken={session.csrf_token}
+          tracesDays={config.retention.traces_days}
+          error={msg}
+        />
+      </Layout>,
+      status,
+    )
+
+  if (!explicit) {
+    return renderErr("Form did not submit any allowed_models field", 400)
+  }
+  if (models.length === 0) {
+    return renderErr("Select at least one allowed model (or '*')", 400)
+  }
+
   const rateLimitOverride = parseIntOrNull(
     body["rate_limit_override"] as string | undefined,
   )
 
   try {
-    const changed = updateKeyScope(id, allowedModels, rateLimitOverride)
+    const changed = updateKeyScope(id, models, rateLimitOverride)
     if (changed) {
-      audit({
+      safeAudit({
         actor_key_id: session.key_id,
         actor_tier: "admin",
         action: "key.scope_update",
         target: id,
         after: {
-          allowed_models: allowedModels,
+          allowed_models: models,
           rate_limit_override: rateLimitOverride,
         },
       })
     }
     return c.redirect(`/admin/keys/${id}?success=scope_updated`, 303)
   } catch (err) {
-    const config = getConfig()
-    const updatedRow = findKeyById(id) ?? row
-    return c.html(
-      <Layout title="Key Detail" active="keys" csrfToken={session.csrf_token}>
-        <KeyDetail
-          row={updatedRow}
-          csrfToken={session.csrf_token}
-          tracesDays={config.retention.traces_days}
-          error={String(err)}
-        />
-      </Layout>,
-      400,
-    )
+    return renderErr(String(err), 400)
   }
 })
 
 // ---------------------------------------------------------------------------
 // POST /admin/keys/:id/debug
+//
+// Three actions, mutually exclusive:
+// - action=renew  → bump debug_expires_at by 24h (debug must already be on)
+// - debug_enabled=1 with debug_confirm=yes  → enable + 24h TTL
+// - debug_enabled=0  → disable + clear TTL
 // ---------------------------------------------------------------------------
 
 keysApp.post("/:id/debug", async (c) => {
   const session = c.get("session")
   const id = c.req.param("id")
+  if (!isUuid(id)) return c.text("Key not found", 404)
   const row = findKeyById(id)
   if (!row) return c.text("Key not found", 404)
   if (row.revoked_at !== null) return c.text("Key is revoked", 400)
 
   const body = await c.req.parseBody()
+  const action = body["action"]
   const enabledRaw = body["debug_enabled"]
-  const enabled = enabledRaw === "1" || enabledRaw === "true"
+  const confirm = body["debug_confirm"]
 
-  // Require explicit confirmation for enabling debug (body must contain debug_enabled=1)
-  // Disabling and renewing don't need extra confirmation
-  setDebugEnabled(id, enabled)
+  let auditAction: string
+  if (action === "renew") {
+    // Refresh TTL: treat as enable (setDebugEnabled(true) bumps TTL).
+    setDebugEnabled(id, true)
+    auditAction = "key.debug_renew"
+  } else if (enabledRaw === "1" || enabledRaw === "true") {
+    // Enabling requires explicit confirmation token from the modal.
+    if (confirm !== "yes") {
+      return c.text(
+        "Debug enable requires explicit confirmation (debug_confirm=yes)",
+        400,
+      )
+    }
+    setDebugEnabled(id, true)
+    auditAction = "key.debug_enable"
+  } else {
+    setDebugEnabled(id, false)
+    auditAction = "key.debug_disable"
+  }
 
-  audit({
+  safeAudit({
     actor_key_id: session.key_id,
     actor_tier: "admin",
-    action: enabled ? "key.debug_enable" : "key.debug_disable",
+    action: auditAction,
     target: id,
   })
 

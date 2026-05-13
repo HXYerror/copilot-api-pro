@@ -98,15 +98,12 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     60 * 60 * 1000,
   )
 
-  // Sweep expired debug keys on startup, then every 5 minutes.
-  // Auto-disables debug mode when debug_expires_at has passed (24h TTL).
+  // Sweep expired debug keys on startup, then every 60 seconds.
+  // The interval is purely a cleanup; correctness gates use isDebugActive(row).
   sweepExpiredDebugKeys()
-  setInterval(
-    () => {
-      sweepExpiredDebugKeys()
-    },
-    5 * 60 * 1000,
-  )
+  setInterval(() => {
+    sweepExpiredDebugKeys()
+  }, 60 * 1000)
 
   // Emit audit event when starting without authentication
   if (!getConfig().features.auth) {

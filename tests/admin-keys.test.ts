@@ -17,6 +17,7 @@ import {
   countActiveDebugKeys,
   createKey,
   findKeyById,
+  isDebugActive,
   listKeys,
   revokeKey,
   setDebugEnabled,
@@ -259,7 +260,7 @@ describe("keys service: debug TTL", () => {
     expect(staleAfter?.debug_expires_at).toBeNull()
   })
 
-  test("countActiveDebugKeys counts only debug_enabled non-revoked keys", () => {
+  test("countActiveDebugKeys counts only debug_enabled non-revoked NON-expired keys", () => {
     createKey({ tier: "admin", debugEnabled: false })
     createKey({ tier: "admin", debugEnabled: true })
     const { row: revoked } = createKey({
@@ -268,7 +269,28 @@ describe("keys service: debug TTL", () => {
     })
     revokeKey(revoked.id)
 
+    // A debug-enabled key whose TTL has already passed should NOT count
+    const { row: expired } = createKey({ tier: "admin", debugEnabled: true })
+    getDb().run("UPDATE keys SET debug_expires_at = 1 WHERE id = ?", [
+      expired.id,
+    ])
+
     expect(countActiveDebugKeys()).toBe(1)
+  })
+
+  test("isDebugActive returns false for revoked or expired keys", () => {
+    const { row: fresh } = createKey({ tier: "admin", debugEnabled: true })
+    expect(isDebugActive(fresh)).toBe(true)
+
+    const { row: revoked } = createKey({ tier: "admin", debugEnabled: true })
+    revokeKey(revoked.id)
+    const revokedAfter = findKeyById(revoked.id)
+    expect(revokedAfter && isDebugActive(revokedAfter)).toBe(false)
+
+    const { row: stale } = createKey({ tier: "admin", debugEnabled: true })
+    getDb().run("UPDATE keys SET debug_expires_at = 1 WHERE id = ?", [stale.id])
+    const staleAfter = findKeyById(stale.id)
+    expect(staleAfter && isDebugActive(staleAfter)).toBe(false)
   })
 })
 
@@ -371,13 +393,17 @@ describe("POST /admin/keys/new", () => {
     expect(html1).toContain("sk-cap-")
     expect(html1).toContain("Key Created")
 
-    // Second view with the same flash token: must redirect back (token consumed)
+    // Second view with the same flash token: must NOT replay plaintext;
+    // returns 410 Gone with an explicit error message instead of silently
+    // redirecting.
     const secondView = await server.request(loc, {
       method: "GET",
       headers: { Cookie: cookieHeader },
     })
-    expect(secondView.status).toBe(302)
-    expect(secondView.headers.get("location")).toBe("/admin/keys")
+    expect(secondView.status).toBe(410)
+    const secondHtml = await secondView.text()
+    expect(secondHtml).toContain("Plaintext no longer available")
+    expect(secondHtml).not.toContain("sk-cap-")
   })
 
   test("rejects missing CSRF", async () => {
@@ -498,7 +524,26 @@ describe("POST /admin/keys/:id/scope", () => {
 // ---------------------------------------------------------------------------
 
 describe("POST /admin/keys/:id/debug", () => {
-  test("enabling debug sets TTL and audit-logs", async () => {
+  test("enabling debug requires debug_confirm=yes (server gate)", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const { row } = createKey({ tier: "client" })
+
+    // Without confirmation token → 400, debug stays off
+    const noConfirm = await server.request(`/admin/keys/${row.id}/debug`, {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=1`,
+    })
+    expect(noConfirm.status).toBe(400)
+    const stillOff = findKeyById(row.id)
+    expect(stillOff?.debug_enabled).toBe(0)
+  })
+
+  test("enabling debug with confirmation sets TTL and audit-logs", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { row } = createKey({ tier: "client" })
 
@@ -509,12 +554,38 @@ describe("POST /admin/keys/:id/debug", () => {
         "Content-Type": "application/x-www-form-urlencoded",
         "Sec-Fetch-Site": "same-origin",
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=1`,
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=1&debug_confirm=yes`,
     })
     expect(res.status).toBe(303)
     const updated = findKeyById(row.id)
     expect(updated?.debug_enabled).toBe(1)
     expect(updated?.debug_expires_at).not.toBeNull()
+  })
+
+  test("renew action bumps debug_expires_at forward", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const { row } = createKey({ tier: "client", debugEnabled: true })
+
+    // Wind back the TTL so we can detect a renewal
+    const oldExp = Date.now() + 60_000
+    getDb().run("UPDATE keys SET debug_expires_at = ? WHERE id = ?", [
+      oldExp,
+      row.id,
+    ])
+
+    const res = await server.request(`/admin/keys/${row.id}/debug`, {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&action=renew`,
+    })
+    expect(res.status).toBe(303)
+    const updated = findKeyById(row.id)
+    expect(updated?.debug_enabled).toBe(1)
+    expect(updated?.debug_expires_at).toBeGreaterThan(oldExp + 60_000)
   })
 
   test("disabling debug clears TTL", async () => {
@@ -577,5 +648,148 @@ describe("Active debug banner", () => {
     const html = await res.text()
     expect(html).toContain("Debug mode active")
     expect(html).toContain("2 keys")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Input validation + safety
+// ---------------------------------------------------------------------------
+
+describe("Input validation and safety", () => {
+  test("GET /admin/keys/<non-uuid> returns 404 without touching DB", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    const res = await server.request("/admin/keys/not-a-uuid", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    expect(res.status).toBe(404)
+  })
+
+  test("POST /admin/keys/<non-uuid>/revoke returns 404", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const res = await server.request("/admin/keys/bogus/revoke", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}`,
+    })
+    expect(res.status).toBe(404)
+  })
+
+  test("POST /admin/keys/new rejects labels longer than 200 chars", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const longLabel = "x".repeat(201)
+    const res = await server.request("/admin/keys/new", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=${longLabel}&tier=client&allowed_models=*&allowed_models_present=1`,
+    })
+    expect(res.status).toBe(400)
+    const html = await res.text()
+    expect(html).toContain("Label too long")
+  })
+
+  test("Label with HTML tags is rendered as escaped text on list page", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    createKey({ tier: "client", label: "<script>alert(1)</script>" })
+
+    const res = await server.request("/admin/keys", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    const html = await res.text()
+    // Raw script tag must NOT appear; escaped form must
+    expect(html).not.toContain("<script>alert(1)</script>")
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;")
+  })
+
+  test("POST /admin/keys/new with empty allowed_models is rejected (no privilege widening)", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    // Send allowed_models_present=1 but no allowed_models entries
+    const res = await server.request("/admin/keys/new", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=test&tier=client&allowed_models_present=1`,
+    })
+    expect(res.status).toBe(400)
+    const html = await res.text()
+    expect(html).toContain("Select at least one allowed model")
+  })
+
+  test("POST /admin/keys/new with no allowed_models field at all defaults to ['*']", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    // No sentinel: simulates an AJAX caller or a form without the models block
+    const res = await server.request("/admin/keys/new", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=default-test&tier=client`,
+    })
+    expect(res.status).toBe(303)
+  })
+
+  test("GET /admin/keys?page=abc falls back to page 1 (no NaN)", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    const res = await server.request("/admin/keys?page=abc", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain("Page 1")
+  })
+
+  test("GET /admin/keys/created?flash=<unknown> renders explicit error (not silent redirect)", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    const res = await server.request(
+      "/admin/keys/created?flash=00000000-0000-0000-0000-000000000000",
+      {
+        method: "GET",
+        headers: { Cookie: sidCookie },
+      },
+    )
+    expect(res.status).toBe(410)
+    const html = await res.text()
+    expect(html).toContain("Plaintext no longer available")
+  })
+
+  test("Sweeper runs frequently enough to keep banner consistent (60s interval)", () => {
+    const { row } = createKey({ tier: "admin", debugEnabled: true })
+    // Manually expire
+    getDb().run("UPDATE keys SET debug_expires_at = 1 WHERE id = ?", [row.id])
+
+    // countActiveDebugKeys uses the TTL-aware query: count is 0 even before sweep
+    expect(countActiveDebugKeys()).toBe(0)
+
+    // After sweep the flag is also cleared
+    sweepExpiredDebugKeys()
+    const after = findKeyById(row.id)
+    expect(after?.debug_enabled).toBe(0)
+  })
+
+  test("Static asset /admin/assets/keys.js is served with correct MIME", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    const res = await server.request("/admin/assets/keys.js", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toContain("javascript")
+    const body = await res.text()
+    expect(body).toContain("wireDetailDebugModal")
   })
 })
