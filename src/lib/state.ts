@@ -16,6 +16,11 @@ export interface State {
   // Rate limiting configuration
   rateLimitSeconds?: number
   lastRequestTimestamp?: number
+
+  // Auth-mode information set by start.ts after resolveAuthMode().
+  // Surfaced on the /admin overview page and in startup logs.
+  authModeLabel?: "on" | "off (loopback)" | "off (acknowledged risk)"
+  bindAddress?: string
 }
 
 export const state: State = {

@@ -170,6 +170,43 @@ export async function loadConfig(filePath = configPath()): Promise<Config> {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime overrides
+//
+// Some settings (notably features.auth) can be flipped by CLI flags at startup
+// and must win over whatever is persisted in config.json. We keep them in a
+// separate slot so getConfig() always reflects them but watchConfig reloads
+// don't clobber them.
+// ---------------------------------------------------------------------------
+
+interface RuntimeOverrides {
+  authEnabled?: boolean
+}
+
+let _overrides: RuntimeOverrides = {}
+
+/** Set a runtime override that wins over the persisted config until cleared. */
+export function setRuntimeAuthOverride(value: boolean | undefined): void {
+  if (value === undefined) {
+    delete _overrides.authEnabled
+  } else {
+    _overrides.authEnabled = value
+  }
+}
+
+/** Test-only: clear all runtime overrides. */
+export function _resetRuntimeOverrides_TEST_ONLY(): void {
+  _overrides = {}
+}
+
+function applyOverrides(cfg: Config): Config {
+  if (_overrides.authEnabled === undefined) return cfg
+  return {
+    ...cfg,
+    features: { ...cfg.features, auth: _overrides.authEnabled },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // getConfig — deeply frozen snapshot
 // ---------------------------------------------------------------------------
 
@@ -183,7 +220,7 @@ function deepFreeze<T>(obj: T): T {
 }
 
 export function getConfig(): Readonly<Config> {
-  return deepFreeze(structuredClone(_currentConfig))
+  return deepFreeze(applyOverrides(structuredClone(_currentConfig)))
 }
 
 // ---------------------------------------------------------------------------
@@ -236,9 +273,9 @@ export function watchConfig(
         }
 
         _currentConfig = result.data
-        // Pass a frozen snapshot to the callback so callers cannot accidentally
-        // mutate the shared in-memory config through the callback argument.
-        onChange(deepFreeze(structuredClone(result.data)))
+        // Pass a frozen snapshot with runtime overrides applied so subscribers
+        // see the effective config, consistent with getConfig().
+        onChange(deepFreeze(applyOverrides(structuredClone(result.data))))
       })().catch((err: unknown) => {
         consola.error(
           `config.json reload: unexpected error in onChange callback: ${String(err)}`,

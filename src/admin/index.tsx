@@ -3,6 +3,7 @@ import { Hono } from "hono"
 
 import { getConfig } from "~/lib/config-store"
 import { getDb } from "~/lib/db"
+import { state } from "~/lib/state"
 import { countActiveDebugKeys } from "~/services/keys"
 
 import type { SessionVar } from "./session-middleware"
@@ -56,6 +57,11 @@ indexApp.get("/", (c) => {
   const counts = getDbCounts()
   const keyIdSuffix = session.key_id.slice(-4)
   const debugKeyCount = countActiveDebugKeys()
+  // Fall back to deriving from the config flag when state has not been set
+  // (e.g. tests that invoke server.request without going through runServer).
+  const authModeLabel =
+    state.authModeLabel ?? (config.features.auth ? "on" : "off (loopback)")
+  const bindAddress = state.bindAddress ?? "unknown"
 
   return c.html(
     <Layout
@@ -72,7 +78,11 @@ indexApp.get("/", (c) => {
         </div>
         <div class="status-card">
           <dt>Auth Mode</dt>
-          <dd>{config.features.auth ? "Enabled" : "Disabled (no-auth)"}</dd>
+          <dd>{authModeLabel}</dd>
+        </div>
+        <div class="status-card">
+          <dt>Bind Address</dt>
+          <dd class="mono">{bindAddress}</dd>
         </div>
         <div class="status-card">
           <dt>Active Keys</dt>

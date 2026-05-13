@@ -9,6 +9,7 @@ import {
   getConfig,
   loadConfig,
   saveConfig,
+  setRuntimeAuthOverride,
   watchConfig,
 } from "../src/lib/config-store"
 
@@ -403,5 +404,55 @@ describe("getConfig()", () => {
       // @ts-expect-error — intentional mutation attempt
       snap.features.debug = true
     }).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Runtime auth override (#33)
+// ---------------------------------------------------------------------------
+
+describe("setRuntimeAuthOverride()", () => {
+  let tmpDir: string
+  let cfgPath: string
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir()
+    cfgPath = makeConfigPath(tmpDir)
+    saveConfig(validComplete, cfgPath)
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    setRuntimeAuthOverride(undefined)
+  })
+
+  test("override wins over persisted config", async () => {
+    await loadConfig(cfgPath)
+    // validComplete has features.auth = true
+    expect(getConfig().features.auth).toBe(true)
+
+    setRuntimeAuthOverride(false)
+    expect(getConfig().features.auth).toBe(false)
+
+    setRuntimeAuthOverride(true)
+    expect(getConfig().features.auth).toBe(true)
+  })
+
+  test("clearing the override falls back to the file value", async () => {
+    await loadConfig(cfgPath)
+    setRuntimeAuthOverride(false)
+    expect(getConfig().features.auth).toBe(false)
+    setRuntimeAuthOverride(undefined)
+    expect(getConfig().features.auth).toBe(true)
+  })
+
+  test("override survives a config reload", async () => {
+    await loadConfig(cfgPath)
+    setRuntimeAuthOverride(false)
+    expect(getConfig().features.auth).toBe(false)
+
+    // Reload — file says auth=true, but the override still wins.
+    await loadConfig(cfgPath)
+    expect(getConfig().features.auth).toBe(false)
   })
 })

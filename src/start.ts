@@ -7,8 +7,9 @@ import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
 import { purgeExpiredSessions } from "./admin/session"
+import { logAuthModeBanner, resolveAuthMode } from "./lib/auth-mode"
 import { runBootstrap } from "./lib/bootstrap"
-import { getConfig } from "./lib/config-store"
+import { getConfig, setRuntimeAuthOverride } from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
@@ -25,6 +26,7 @@ import { getVSCodeVersion } from "./services/get-vscode-version"
 
 interface RunServerOptions {
   port: number
+  host: string
   verbose: boolean
   accountType: string
   manual: boolean
@@ -34,6 +36,8 @@ interface RunServerOptions {
   claudeCode: boolean
   showToken: boolean
   proxyEnv: boolean
+  noAuth: boolean
+  acceptRisk: boolean
 }
 
 /** Apply CLI options to mutable state and kick off version fetches. */
@@ -74,21 +78,8 @@ async function applyOptions(options: RunServerOptions): Promise<void> {
   await cacheModels()
 }
 
-export async function runServer(options: RunServerOptions): Promise<void> {
-  await applyOptions(options)
-
-  // Run DB migrations BEFORE binding HTTP listener (no schema race)
-  initDb()
-
-  // Initialize audit log — prunes old files beyond retention
-  initAudit()
-
-  // Warn if --no-auth mode is active (safe to call unconditionally)
-  warnNoAuth()
-
-  // First-run admin bootstrap (no-op if auth disabled or keys exist)
-  runBootstrap()
-
+/** Start the session + debug-TTL background sweepers. */
+function startPeriodicSweepers(): void {
   // Purge expired sessions on startup, then sweep hourly.
   purgeExpiredSessions()
   setInterval(
@@ -104,18 +95,10 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   setInterval(() => {
     sweepExpiredDebugKeys()
   }, 60 * 1000)
+}
 
-  // Emit audit event when starting without authentication
-  if (!getConfig().features.auth) {
-    audit({
-      actor_key_id: "__system__",
-      actor_tier: "system",
-      action: "server.start_no_auth",
-    })
-  }
-
-  // Graceful shutdown: close DB before exit to flush WAL and release locks.
-  // Guard getDb() — if initDb threw, db is undefined and getDb() would throw.
+/** Install SIGINT/SIGTERM handlers that flush the DB before exit. */
+function installShutdownHandlers(): void {
   const shutdown = (code: number): void => {
     try {
       closeDb(getDb())
@@ -130,6 +113,52 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   process.on("SIGTERM", () => {
     shutdown(0)
   })
+}
+
+export async function runServer(options: RunServerOptions): Promise<void> {
+  // Resolve auth mode FIRST — this throws before any side-effects if
+  // --no-auth is requested on a non-loopback host without acknowledgement.
+  const authMode = resolveAuthMode({
+    noAuth: options.noAuth,
+    acceptRisk: options.acceptRisk,
+    host: options.host,
+    port: options.port,
+  })
+  // The CLI flag wins over whatever is in config.json.
+  setRuntimeAuthOverride(authMode.authEnabled)
+  state.authModeLabel = authMode.label
+  state.bindAddress = authMode.bindAddress
+
+  await applyOptions(options)
+
+  // Run DB migrations BEFORE binding HTTP listener (no schema race)
+  initDb()
+
+  // Initialize audit log — prunes old files beyond retention
+  initAudit()
+
+  logAuthModeBanner(authMode)
+  warnNoAuth()
+
+  // First-run admin bootstrap (no-op if auth disabled or keys exist)
+  runBootstrap()
+
+  startPeriodicSweepers()
+
+  // Emit audit event when starting without authentication, with bind context.
+  if (!getConfig().features.auth) {
+    audit({
+      actor_key_id: "__system__",
+      actor_tier: "system",
+      action: "server.start_no_auth",
+      after: {
+        bind_address: authMode.bindAddress,
+        auth_mode: authMode.label,
+      },
+    })
+  }
+
+  installShutdownHandlers()
 
   consola.info(
     `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
@@ -188,6 +217,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   serve({
     fetch: server.fetch as ServerHandler,
     port: options.port,
+    hostname: options.host,
   })
 }
 
@@ -202,6 +232,24 @@ export const start = defineCommand({
       type: "string",
       default: "4141",
       description: "Port to listen on",
+    },
+    host: {
+      type: "string",
+      default: "127.0.0.1",
+      description:
+        "Bind hostname. Default 127.0.0.1 (loopback only). Use 0.0.0.0 or :: to expose to LAN — requires auth or --i-accept-account-suspension-risk.",
+    },
+    "no-auth": {
+      type: "boolean",
+      default: false,
+      description:
+        "DISABLE authentication. Refused on non-loopback bind unless --i-accept-account-suspension-risk is also set.",
+    },
+    "i-accept-account-suspension-risk": {
+      type: "boolean",
+      default: false,
+      description:
+        "Acknowledge that running --no-auth on a non-loopback bind can burn Copilot quota and trigger GitHub abuse detection.",
     },
     verbose: {
       alias: "v",
@@ -264,6 +312,7 @@ export const start = defineCommand({
 
     return runServer({
       port: Number.parseInt(args.port, 10),
+      host: args.host,
       verbose: args.verbose,
       accountType: args["account-type"],
       manual: args.manual,
@@ -273,6 +322,13 @@ export const start = defineCommand({
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
+      noAuth: args["no-auth"],
+      acceptRisk: args["i-accept-account-suspension-risk"],
+    }).catch((err: unknown) => {
+      // Auth-mode safety guard throws before any side-effects; surface the
+      // message in red and exit with status 2 (distinguishes from other errors).
+      consola.error(`\x1B[31m${String(err)}\x1B[0m`)
+      process.exit(2)
     })
   },
 })

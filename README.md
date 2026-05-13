@@ -17,6 +17,16 @@
 >
 > Use this proxy responsibly to avoid account restrictions.
 
+> [!CAUTION]
+> **DO NOT run `--no-auth` on a public-facing port.**
+>
+> Starting with v0.8 this proxy requires API-key authentication by default. The
+> safety guard refuses to start with `--no-auth` on a non-loopback host unless
+> you also pass `--i-accept-account-suspension-risk`. Anyone who can reach an
+> unauthenticated port can burn your Copilot quota and trip GitHub's
+> abuse-detection — see the section "Admin Plane / Authentication" below for
+> migration guidance.
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E519XS7W)
 
 ---
@@ -176,6 +186,89 @@ The following command line options are available for the `start` command:
 | Option | Description               | Default | Alias |
 | ------ | ------------------------- | ------- | ----- |
 | --json | Output debug info as JSON | false   | none  |
+
+## Admin Plane / Authentication
+
+Starting with **v0.8** the server enforces API-key authentication by default
+and ships a small admin WebUI at `/admin`. The legacy "no auth on every port"
+behavior is still available but gated behind explicit safety flags.
+
+### First-time setup (recommended)
+
+```bash
+copilot-api start
+```
+
+On the first run with auth enabled, the server generates a single admin
+API key, writes it to `~/.local/share/copilot-api/admin.key.txt` (mode
+`0600`), and prints its location. **Read the file, copy the key, then
+delete the file.** Use that key as `Authorization: Bearer …` for API
+requests, or paste it into `/admin/login` for the WebUI.
+
+Need a fresh admin key after losing the original?
+
+```bash
+copilot-api admin recover --force
+```
+
+### Running on loopback without auth (development)
+
+```bash
+copilot-api start --no-auth --host 127.0.0.1
+```
+
+This is allowed with a yellow warning. Only loopback clients can reach the
+port; any process able to read `localhost` already has at least as much
+access to your machine as your local user.
+
+### Running on a public port without auth (DON'T)
+
+```bash
+copilot-api start --no-auth --host 0.0.0.0
+# → REFUSING TO START: --no-auth on a non-loopback host (0.0.0.0:4141) is unsafe.
+```
+
+The safety guard refuses to start. If you have a *specific* reason to do
+this (and you understand the risk):
+
+```bash
+copilot-api start --no-auth --host 0.0.0.0 --i-accept-account-suspension-risk
+```
+
+Audit log records `server.start_no_auth` with the bind address each time;
+the `/admin` overview labels this `auth_mode: off (acknowledged risk)`.
+
+### Auth-mode summary
+
+| Flags                                                                | Bind         | Result                          |
+| -------------------------------------------------------------------- | ------------ | ------------------------------- |
+| *(none)*                                                             | 127.0.0.1    | `auth_mode: on` (default v0.8)  |
+| *(none)*                                                             | 0.0.0.0      | `auth_mode: on`                 |
+| `--no-auth`                                                          | 127.0.0.1    | `auth_mode: off (loopback)`     |
+| `--no-auth`                                                          | 0.0.0.0      | **refused**                     |
+| `--no-auth --i-accept-account-suspension-risk`                       | 0.0.0.0      | `auth_mode: off (acknowledged risk)` |
+
+### Migrating from v0.7
+
+v0.7 had no authentication and no admin plane. To migrate to v0.8:
+
+1. **Loopback users (the common case).** Add `--host 127.0.0.1 --no-auth`
+   to your existing start command. Behavior is identical to v0.7, no
+   bootstrap key needed.
+2. **Network-exposed users.** Run `copilot-api start` once, copy the
+   bootstrap admin key from `~/.local/share/copilot-api/admin.key.txt`,
+   then update your downstream tools to send `Authorization: Bearer <key>`
+   on every request. Use `/admin/keys` to mint client-tier keys per tool
+   so revocation is granular.
+3. **Docker / CI users.** Either bake the bootstrap key into the
+   container env, or mount `~/.local/share/copilot-api/` so the key
+   persists across restarts.
+
+If you depended on the v0.7 no-auth behavior on a public port, you must
+now choose between (a) enabling auth or (b) explicitly acknowledging the
+risk with `--i-accept-account-suspension-risk`. There is no silent
+backward compatibility for this case — by design, because GitHub may
+treat anonymous abuse as your fault.
 
 ## API Endpoints
 
