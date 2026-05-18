@@ -13,7 +13,7 @@ export default defineConfig({
   // invocation runs on the Bun runtime.
   platform: "node",
 
-  sourcemap: true,
+  sourcemap: false,
   clean: true,
   removeNodeProtocol: false,
 

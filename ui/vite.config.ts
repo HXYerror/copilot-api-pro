@@ -20,7 +20,7 @@ export default defineConfig({
   build: {
     outDir: "../dist/ui",
     emptyOutDir: true,
-    sourcemap: true,
+    sourcemap: false,
     rollupOptions: {
       output: {
         // Keep the bundle small and predictable — one app chunk plus

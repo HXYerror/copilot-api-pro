@@ -27,7 +27,7 @@
   "scripts": {
     "build": "bun run build:server && bun run build:ui",
     "build:server": "tsdown",
-    "build:ui": "bun --cwd ui install && bun run --cwd ui build",
+    "build:ui": "bun install --cwd ui && bun run --cwd ui build",
     "dev": "bun run --watch ./src/main.ts",
     "dev:ui": "bun run --cwd ui dev",
     "knip": "knip-bun",

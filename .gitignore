@@ -10,9 +10,13 @@ node_modules/
 # eslint cache
 .eslintcache
 
-# build output
-dist/
+# build output — dist/ is checked in so `bunx github:HXYerror/copilot-api`
+# works without re-running prepare on the user's machine. Source-maps and
+# the legacy crew working dir we still keep out.
+dist/**/*.map
+dist/.crew/
 ui/node_modules/
+ui/bun.lock
 
 # editor / OS
 .DS_Store
