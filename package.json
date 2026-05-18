@@ -8,17 +8,16 @@
     "openai-compatible",
     "admin-ui"
   ],
-  "homepage": "https://github.com/HXYerror/copilot-api",
-  "bugs": "https://github.com/HXYerror/copilot-api/issues",
+  "homepage": "https://github.com/HXYerror/copilot-api-pro",
+  "bugs": "https://github.com/HXYerror/copilot-api-pro/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/HXYerror/copilot-api.git"
+    "url": "git+https://github.com/HXYerror/copilot-api-pro.git"
   },
   "author": "Erick Christian <erickchristian48@gmail.com> (upstream), HXYerror (fork)",
   "type": "module",
   "bin": {
-    "copilot-api-pro": "./dist/main.js",
-    "copilot-api": "./dist/main.js"
+    "copilot-api-pro": "./dist/main.js"
   },
   "files": [
     "dist",
