@@ -11,4 +11,26 @@ node_modules/
 .eslintcache
 
 # build output
-dist/.crew/
+dist/
+ui/node_modules/
+
+# editor / OS
+.DS_Store
+*.swp
+
+# Claude Code / harness state
+.claude/
+.crew/
+.harness/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local debug/scratch files
+abc.txt
+eval-engineer*.md
+move-eval.sh
+probe*.md
+probe*.sh
+test-write.md
