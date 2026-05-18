@@ -7,6 +7,7 @@ import fs from "node:fs"
 import path from "node:path"
 
 import { auditAdminRoute } from "./admin/audit/route"
+import { apiApp } from "./admin/api/route"
 import { indexApp } from "./admin/index"
 import { keysApp } from "./admin/keys/route"
 import { loginApp } from "./admin/login"
@@ -15,6 +16,7 @@ import {
   sessionApp,
   sessionMiddleware,
 } from "./admin/session-middleware"
+import { settingsApp } from "./admin/settings/route"
 import { tracesApp } from "./admin/traces/route"
 import { usageApp } from "./admin/usage/route"
 import { getDb } from "./lib/db"
@@ -62,7 +64,83 @@ server.get("/readyz", (c) => {
 // Admin WebUI (session-based, NOT behind API-key auth middleware)
 // ---------------------------------------------------------------------------
 
-// Static assets — served before session check
+// ---------------------------------------------------------------------------
+// Admin SPA (React + Tremor)
+//
+// The new admin UI is a Vite-built React SPA that lives under /admin. The
+// flow is:
+//   /admin/_app/*          → static files (JS, CSS, sourcemaps) from dist/ui
+//   /admin/api/*           → JSON endpoints (session-protected)
+//   /admin/login           → unauthenticated HTML login (legacy, still used)
+//   /admin/legacy/*        → legacy SSR pages (Keys / Usage / Audit / etc.),
+//                            preserved while we migrate page-by-page
+//   /admin/*               → fall back to dist/ui/index.html (React Router)
+//
+// `dist/ui/` is produced by `bun --cwd ui run build`. We probe two candidate
+// paths so this works whether we're running `bun run src/main.ts` (dev) or
+// `bun dist/main.js` (prod):
+//
+//   import.meta.dirname  candidate path
+//   ───────────────────  ──────────────────────────────
+//   <repo>/src           <repo>/dist/ui  (../dist/ui)
+//   <repo>/dist          <repo>/dist/ui  (./ui)
+// ---------------------------------------------------------------------------
+
+const SPA_DIR = (() => {
+  const here = import.meta.dirname
+  for (const candidate of [
+    path.resolve(here, "../dist/ui"),
+    path.resolve(here, "ui"),
+  ]) {
+    if (fs.existsSync(path.join(candidate, "index.html"))) return candidate
+  }
+  return path.resolve(here, "../dist/ui")
+})()
+
+const SPA_INDEX = path.join(SPA_DIR, "index.html")
+
+const MIME: Record<string, string> = {
+  ".css": "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ico": "image/x-icon",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+}
+
+function mimeFor(p: string): string {
+  const ext = path.extname(p).toLowerCase()
+  return MIME[ext] ?? "application/octet-stream"
+}
+
+// Vite-built static assets. Path-traversal guarded; cached aggressively
+// because Vite emits hashed filenames.
+server.get("/admin/_app/*", (c) => {
+  const reqPath = c.req.path.replace(/^\/admin\/_app\//, "")
+  const filePath = path.resolve(SPA_DIR, reqPath)
+  if (!filePath.startsWith(SPA_DIR + path.sep)) {
+    return c.text("Not Found", 404)
+  }
+  try {
+    const body = fs.readFileSync(filePath)
+    return c.body(body, 200, {
+      "Content-Type": mimeFor(filePath),
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+  } catch {
+    return c.text("Not Found", 404)
+  }
+})
+
+// Legacy SSR asset handler (kept while the old pages still ship). The new
+// SPA does not load anything from here — but the legacy pages under
+// /admin/legacy/* still reference /admin/assets/style.css and friends.
 server.get("/admin/assets/*", (c) => {
   const assetsDir = path.join(import.meta.dirname, "admin/assets") + path.sep
   const reqPath = c.req.path.replace("/admin/assets/", "")
@@ -106,15 +184,12 @@ server.route("/admin/login", loginApp)
 // Auth middleware on every other route.
 // New routes are protected by default; add explicit exceptions above this line
 // for intentionally public paths (health checks, metrics, etc.).
-// The session-based admin WebUI paths (/admin, /admin/session) bypass this
-// because they do their own session-cookie auth inside sessionProtected.
+// The session-based admin WebUI paths (/admin/*) bypass this because they do
+// their own session-cookie auth inside sessionProtected.
 server.use("*", (c, next) => {
   // Skip API-key auth for session-based admin WebUI paths
   const path = c.req.path
-  if (
-    path === "/admin"
-    || (path.startsWith("/admin/") && !path.startsWith("/admin/audit"))
-  ) {
+  if (path === "/admin" || path.startsWith("/admin/")) {
     return next()
   }
   return authMiddleware(c, next)
@@ -127,10 +202,8 @@ server.use("*", (c, next) => {
 //
 // Skipped for:
 //   - Root / health probes (/, /healthz, /readyz) — not proxy traffic.
-//   - All /admin/* paths, INCLUDING /admin/audit. The audit endpoint is an
-//     admin API rather than a WebUI page, but it returns operator queries,
-//     not proxied Copilot traffic, so it shouldn't pollute the events table
-//     or count toward usage metrics.
+//   - All /admin/* paths — operator queries shouldn't pollute the events
+//     table or count toward usage metrics.
 // ---------------------------------------------------------------------------
 server.use("*", (c, next) => {
   const path = c.req.path
@@ -179,9 +252,6 @@ server.use("*", (c, next) => {
   return mw(c, next)
 })
 
-// Admin API routes (API-key auth, protected by authMiddleware above)
-server.route("/admin/audit", auditAdminRoute)
-
 // Session routes (logout — session middleware verifies)
 // Note: these also run through authMiddleware, but sessionMiddleware takes
 // priority because it checks the session cookie first. The NO_AUTH_SENTINEL
@@ -190,10 +260,56 @@ const sessionProtected = new Hono()
 sessionProtected.use("*", sessionMiddleware)
 sessionProtected.use("*", requireAdminSession)
 sessionProtected.route("/session", sessionApp)
-sessionProtected.route("/keys", keysApp)
-sessionProtected.route("/usage", usageApp)
+sessionProtected.route("/api", apiApp)
+
+// Legacy SSR pages — preserved while the React SPA pages are still being
+// migrated page-by-page. The SPA's <PlaceholderPage> deep-links here.
+// We re-mount each legacy route under a `legacy/...` prefix in addition to
+// the historic path so both the new SPA and any old bookmarks keep working.
+const legacyApp = new Hono()
+legacyApp.route("/keys", keysApp)
+legacyApp.route("/usage", usageApp)
+legacyApp.route("/audit", auditAdminRoute)
+legacyApp.route("/traces", tracesApp)
+legacyApp.route("/settings", settingsApp)
+legacyApp.route("/", indexApp)
+sessionProtected.route("/legacy", legacyApp)
+// Hono treats `/legacy` and `/legacy/` differently when the inner route is
+// `/` — only the former matches the index page. Redirect the trailing-slash
+// form to keep both URLs viable for operators typing the path manually.
+sessionProtected.get("/legacy/", (c) => c.redirect("/admin/legacy", 302))
+
+// Historic mount points — kept only for paths the SPA still depends on.
+// As pages migrate to React their /admin/<page> HTML mount is removed so the
+// SPA fallback (catch-all below) serves the React shell instead.
+//   - keys:     migrated Phase 2 → removed
+//   - usage:    migrated Phase 3 → removed (CSV moved to /admin/api/usage/export.csv)
+//   - logs:     migrated Phase 4
+//   - audit:    migrated Phase 5 → removed
+//   - settings: migrated Phase 5 → removed
+//   - models:   net-new Phase 5
+//
+// `/admin/traces` stays mounted because the SPA Logs page subscribes to
+// `/admin/traces/stream` (SSE) and downloads `/admin/traces/<date>.jsonl`
+// files. Its index HTML is shadowed by the SPA fallback below — only the
+// SSE + file routes survive.
 sessionProtected.route("/traces", tracesApp)
-sessionProtected.route("/", indexApp)
+
+// SPA fallback: serve dist/ui/index.html for any GET inside /admin that
+// didn't match a more specific route above. POST / PUT / DELETE fall
+// through to a 404 (no SSR page accepts them at this path).
+sessionProtected.get("*", (c) => {
+  try {
+    const html = fs.readFileSync(SPA_INDEX, "utf8")
+    return c.html(html)
+  } catch {
+    return c.text(
+      "Admin UI not built — run `bun --cwd ui run build` first.",
+      503,
+    )
+  }
+})
+
 server.route("/admin", sessionProtected)
 
 server.route("/chat/completions", completionRoutes)

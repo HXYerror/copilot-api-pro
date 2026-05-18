@@ -23,6 +23,8 @@ import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+import type { UpstreamCaptureFn } from "./create-chat-completions"
+
 /**
  * Forward an Anthropic-format request directly to Copilot's native `/v1/messages`
  * endpoint, preserving all fields (thinking, signature, top_k, cache_control, …).
@@ -33,11 +35,16 @@ import { state } from "~/lib/state"
  */
 export const createMessagesNative = async (
   payload: AnthropicMessagesPayload,
+  onUpstream?: UpstreamCaptureFn,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
   const hasVision = messageHasImages(payload)
   const headers = buildNativeHeaders(hasVision, Boolean(payload.stream))
+  // X-Initiator parity with /chat/completions and /responses: tells upstream
+  // whether this turn is operator-initiated ("user") or part of an
+  // automated/agent loop. Detected from the message history.
+  headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user"
 
   const upstream = `${copilotBaseUrl(state)}/v1/messages`
   consola.debug("Native Anthropic upstream:", upstream)
@@ -50,6 +57,25 @@ export const createMessagesNative = async (
     headers,
     body: JSON.stringify(body),
   })
+
+  // Trace upstream-leg capture (task #25). Error bodies are captured too —
+  // they're small and tell us why upstream rejected the request.
+  if (onUpstream) {
+    try {
+      const responseBody =
+        payload.stream ? undefined : await response.clone().text()
+      onUpstream({
+        req: { method: "POST", url: upstream, headers, body },
+        res: {
+          status: response.status,
+          headers: response.headers,
+          body: responseBody,
+        },
+      })
+    } catch (err) {
+      consola.warn(`[trace] upstream capture failed: ${String(err)}`)
+    }
+  }
 
   if (!response.ok) {
     consola.error("Native Anthropic upstream error", response.status)
@@ -160,6 +186,31 @@ function messageHasImages(payload: AnthropicMessagesPayload): boolean {
     if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "image") return true
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Heuristic for X-Initiator: returns true when the message history makes this
+ * look like an automated agent loop rather than the first turn of a manual
+ * conversation. Mirrors `isAgentCall` in create-responses.ts and the inline
+ * detector in create-chat-completions.ts:
+ *
+ *  - any prior assistant message → multi-turn → "agent"
+ *  - any tool_result block in user content → tool-driven → "agent"
+ *  - any tool_use in assistant content → "agent"
+ *  - otherwise → "user"
+ */
+function isAgentMessagesCall(payload: AnthropicMessagesPayload): boolean {
+  for (const msg of payload.messages) {
+    if (msg.role === "assistant") return true
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_result" || block.type === "tool_use") {
+          return true
+        }
       }
     }
   }

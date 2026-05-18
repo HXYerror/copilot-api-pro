@@ -1,29 +1,34 @@
 {
-  "name": "copilot-api",
-  "version": "0.7.0",
-  "description": "Turn GitHub Copilot into OpenAI/Anthropic API compatible server. Usable with Claude Code!",
+  "name": "copilot-api-pro",
+  "version": "0.8.0",
+  "description": "GitHub Copilot → OpenAI/Anthropic-compatible API with an admin WebUI (React/Tremor), per-key debug capture, telemetry, audit log, and config hot-reload. Fork of ericc-ch/copilot-api.",
   "keywords": [
     "proxy",
     "github-copilot",
-    "openai-compatible"
+    "openai-compatible",
+    "admin-ui"
   ],
-  "homepage": "https://github.com/ericc-ch/copilot-api",
-  "bugs": "https://github.com/ericc-ch/copilot-api/issues",
+  "homepage": "https://github.com/HXYerror/copilot-api",
+  "bugs": "https://github.com/HXYerror/copilot-api/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ericc-ch/copilot-api.git"
+    "url": "git+https://github.com/HXYerror/copilot-api.git"
   },
-  "author": "Erick Christian <erickchristian48@gmail.com>",
+  "author": "Erick Christian <erickchristian48@gmail.com> (upstream), HXYerror (fork)",
   "type": "module",
   "bin": {
-    "copilot-api": "./dist/main.js"
+    "copilot-api-pro": "./dist/main.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
-    "build": "tsdown",
+    "build": "bun run build:server && bun run build:ui",
+    "build:server": "tsdown",
+    "build:ui": "bun run --cwd ui build",
     "dev": "bun run --watch ./src/main.ts",
+    "dev:ui": "bun run --cwd ui dev",
     "knip": "knip-bun",
     "lint": "eslint --cache",
     "lint:all": "eslint --cache .",

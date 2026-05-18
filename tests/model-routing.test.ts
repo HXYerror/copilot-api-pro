@@ -90,7 +90,12 @@ describe("getModelMode — with loaded models list", () => {
     expect(getModelMode("future-responses-model")).toBe("responses")
   })
 
-  test("model with explicit capabilities.type=chat in list → chat (upstream authoritative)", () => {
+  test("capabilities.type='chat' is NOT trusted for known responses-only models (Copilot upstream lies)", () => {
+    // Real-world observation (May 2026): Copilot serves gpt-5.x codex with
+    // `capabilities.type: "chat"` but rejects /chat/completions requests for
+    // those models. We deliberately ignore `type='chat'` and let the static
+    // codex/o-pro heuristic win, so routing stays correct even without the
+    // `supported_endpoints` field. See src/lib/model-routing.ts.
     state.models = {
       object: "list",
       data: [
@@ -113,8 +118,61 @@ describe("getModelMode — with loaded models list", () => {
         },
       ],
     }
-    // capabilities.type = "chat" is authoritative → returns "chat" even though name contains "codex"
-    expect(getModelMode("gpt-5-codex")).toBe("chat")
+    expect(getModelMode("gpt-5-codex")).toBe("responses")
+  })
+
+  test("supported_endpoints is authoritative: only /responses → responses mode", () => {
+    state.models = {
+      object: "list",
+      data: [
+        {
+          id: "gpt-5.5",
+          vendor: "OpenAI",
+          name: "GPT-5.5",
+          object: "model",
+          version: "1",
+          preview: false,
+          model_picker_enabled: true,
+          supported_endpoints: ["/responses", "ws:/responses"],
+          capabilities: {
+            family: "x",
+            limits: {},
+            object: "model_capabilities",
+            supports: {},
+            tokenizer: "o200k_base",
+            type: "chat", // upstream lies, but supported_endpoints is authoritative
+          },
+        } as unknown as (typeof state.models.data)[number],
+      ],
+    }
+    expect(getModelMode("gpt-5.5")).toBe("responses")
+  })
+
+  test("supported_endpoints listing /chat/completions wins over heuristic name match", () => {
+    state.models = {
+      object: "list",
+      data: [
+        {
+          id: "hypothetical-codex-chat",
+          vendor: "OpenAI",
+          name: "ChatCodex",
+          object: "model",
+          version: "1",
+          preview: false,
+          model_picker_enabled: true,
+          supported_endpoints: ["/chat/completions"],
+          capabilities: {
+            family: "x",
+            limits: {},
+            object: "model_capabilities",
+            supports: {},
+            tokenizer: "cl100k_base",
+            type: "chat",
+          },
+        } as unknown as (typeof state.models.data)[number],
+      ],
+    }
+    expect(getModelMode("hypothetical-codex-chat")).toBe("chat")
   })
 
   test("regular chat model → chat", () => {

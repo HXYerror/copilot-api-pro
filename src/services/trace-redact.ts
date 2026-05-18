@@ -151,22 +151,37 @@ export function redactBody(body: string | object | null | undefined): string {
 // Sanity check — independent post-redaction heuristics
 //
 // These regexes look for the SHAPE of "credential adjacent to a marker" —
-// `bearer foo`, `token=foo`, `api_key=foo`, `secret=foo`, etc. They will
-// false-positive on legitimate URLs, hashes, and any long opaque string,
-// which is exactly what we want: redaction errs on the side of "throw and
-// drop the trace" rather than persist anything suspicious.
+// `Authorization: Bearer foo`, `api_key=foo`, etc. They run AFTER `redactBody`.
+// If any matches, the redactor missed an issuer pattern and the writer must
+// NOT persist this line.
 //
-// Run AFTER `redactBody`. If any of these match, the redactor missed an
-// issuer pattern and the writer must NOT persist this line.
+// IMPORTANT: model output (Anthropic thinking blocks, Claude reasoning traces,
+// generated code, JSON snippets) routinely contains natural-language strings
+// like `the token: abc...` or quoted JSON keys like `"api_key": "..."` that
+// have nothing to do with real credentials. The old generic
+// `\b(token|secret|...)["':=]+ <opaque>` regex over-matched and caused
+// `assertRedacted` to throw → trace-writer dropped the whole JSONL line.
+//
+// Tighter regexes below require either:
+//   - an HTTP-style header context (`Authorization: Bearer X-secret`),
+//   - a form-data assignment shape (`api_key=...` or `api-key=...`) with no
+//     surrounding quotes (legitimate JSON values are quoted), or
+//   - a `Cookie:` header line.
+// Free-text JSON content survives these — letting legitimate trace bodies
+// (including thinking blocks) through while still catching the few classes
+// of real leakage these heuristics existed to defend against.
 // ---------------------------------------------------------------------------
 
 const POST_REDACT_HEURISTICS: ReadonlyArray<RegExp> = [
-  // bearer <opaque-40+-char>
-  /\bbearer\s+[\w+./~=-]{32,}/gi,
-  // api_key=<opaque>, api-key=<opaque>, apikey=<opaque>, token=<opaque>,
-  // secret=<opaque>, password=<opaque>.  The `api[_-]?key` branch already
-  // covers "apikey" (the `?` makes the separator optional).
-  /\b(?:api[_-]?key|token|secret|password)["':=]+\s*["']?[\w+./~=-]{32,}/gi,
+  // Authorization / Proxy-Authorization HTTP header.
+  /\b(?:Authorization|Proxy-Authorization)\s*:\s*Bearer\s+[\w+./~=-]{32,}/gi,
+  // Cookie header value
+  /\bCookie\s*:\s*[\w+./~=-]{32,}/gi,
+  // Form-style assignment: `api_key=...`, `apikey=...`, `password=...`
+  // (no surrounding quote on the value — legitimate JSON would be quoted).
+  // Matching is anchored so it can't be triggered by text like
+  // `"the token: 12345..."` inside a JSON string value.
+  /(?:^|[?&;\s])(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)=[\w+./~=-]{32,}/gi,
 ]
 
 /**

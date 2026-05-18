@@ -5,7 +5,10 @@ import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { state } from "~/lib/state"
-import { createResponses } from "~/services/copilot/create-responses"
+import {
+  createResponses,
+  type UpstreamCaptureFn,
+} from "~/services/copilot/create-responses"
 
 import type { ResponsesPayload, ResponsesResponse } from "./types"
 
@@ -34,7 +37,9 @@ export async function handleResponses(c: Context): Promise<Response> {
     await awaitApproval()
   }
 
-  const response = await createResponses(payload)
+  const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
+    .trace_capture_upstream
+  const response = await createResponses(payload, onUpstream)
 
   if (!payload.stream) {
     const sanitised = sanitiseResponsesOutput(response as ResponsesResponse)

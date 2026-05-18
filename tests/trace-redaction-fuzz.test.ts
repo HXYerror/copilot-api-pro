@@ -264,6 +264,26 @@ describe("redactBody — fuzz", () => {
       )
     }).toThrow(/credential marker/)
   })
+
+  test("assertRedacted does NOT throw on natural-language content with token-like words", () => {
+    // Claude thinking blocks routinely contain free-text reasoning that
+    // mentions "token", "secret", or "password" as English words, plus
+    // model-emitted JSON snippets with quoted keys. Previously the
+    // post-redact heuristic matched `\b(token|secret|...)["':=]+ <opaque>`
+    // anywhere and threw, dropping the entire trace. The tightened heuristic
+    // requires an HTTP-header context or unquoted form-data shape, so the
+    // following must all pass through cleanly.
+    const benignSamples = [
+      "the JWT token: eyJzdWIiOiJleGFtcGxlLW5hbWUifQ-thisIsNotARealOne",
+      "the model emitted: {\"api_key\":\"this is just a string in JSON content\"}",
+      "the user asked about the secret to good code: simplicity-thats-it-AAAAAAAAA",
+      `<thinking>The password field is rendered as a string of asterisks like AAAAAAAAAAAAAAAA</thinking>`,
+      `the bearer of bad news: this is what users hear after deploying-broken-code-aaa`,
+    ]
+    for (const s of benignSamples) {
+      expect(() => assertRedacted(s)).not.toThrow()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------

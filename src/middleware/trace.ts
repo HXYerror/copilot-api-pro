@@ -2,14 +2,16 @@
  * Trace middleware (issue #36, F4.A).
  *
  * Captures the full client→proxy request and proxy→client response for the
- * subset of requests that opted in to debug capture. Activates when either:
+ * subset of requests that opted in to debug capture. Activates when ANY of:
  *
  *  - `c.var.key.debug_enabled === 1` and the key is not revoked and
  *    `debug_expires_at > now` (canonical check: services/keys.isDebugActive),
- *    OR
  *  - the request carries `X-Capi-Debug: 1` and the caller's tier is "admin"
  *    (auth.ts strips the header for non-admin keys, so the cheap tier check
- *    here is defence-in-depth).
+ *    here is defence-in-depth),
+ *  - `config.features.debug === true` (operator-flipped global switch in the
+ *    Settings UI — captures every request regardless of key state, intended
+ *    for short-lived debugging sessions).
  *
  * Sits after authMiddleware and telemetryMiddleware, before route handlers,
  * mounted on the same proxied routes as telemetry (excludes /admin/* and
@@ -18,9 +20,11 @@
  * Body capture is capped at MAX_BODY_BYTES per leg; anything beyond is
  * replaced with "[TRUNCATED]".
  *
- * v1 scope: we capture the CLIENT→PROXY and PROXY→CLIENT legs only. Upstream
- * legs (proxy→GitHub Copilot) require plumbing a callback through every
- * copilot-service helper — see TODO at the bottom of the file.
+ * Coverage: client→proxy and proxy→client are captured by the middleware
+ * directly. The upstream legs (proxy→GitHub Copilot) are captured by helpers
+ * in src/services/copilot/* via the `c.var.trace_capture_upstream` callback
+ * we expose here — see the "Note on upstream capture" near the bottom of
+ * this file for the contract.
  */
 
 import type { Context, MiddlewareHandler } from "hono"
@@ -28,6 +32,7 @@ import type { Context, MiddlewareHandler } from "hono"
 import consola from "consola"
 import { randomUUID } from "node:crypto"
 
+import { getConfig } from "~/lib/config-store"
 import { isDebugActive } from "~/services/keys"
 import { writeTrace, type TraceLeg } from "~/services/trace-writer"
 
@@ -36,12 +41,40 @@ import type { KeyVar } from "./auth"
 const MAX_BODY_BYTES = 256 * 1024 // 256 KB per leg
 
 // ---------------------------------------------------------------------------
+// Upstream-capture API
+//
+// Copilot service helpers (src/services/copilot/*) can call
+// `c.var.trace_capture_upstream({req, res})` to record the proxy → GitHub
+// Copilot leg of the request.  The trace middleware reads this back in its
+// finally hook and emits it as upstream_req / upstream_res in the JSONL line.
+//
+// When debug capture is NOT active, the setter is a no-op stub — helpers
+// can call it unconditionally without any branching at call sites.
+// ---------------------------------------------------------------------------
+
+export interface UpstreamCapture {
+  req: TraceLeg
+  res?: TraceLeg
+}
+
+export type TraceCaptureUpstream = (capture: UpstreamCapture) => void
+
+export type TraceVar = KeyVar & {
+  trace_capture_upstream?: TraceCaptureUpstream
+}
+
+// ---------------------------------------------------------------------------
 // Activation check
 // ---------------------------------------------------------------------------
 
 function shouldCapture(c: Context<{ Variables: KeyVar }>): boolean {
   const key = c.get("key") as KeyVar["key"] | undefined
   if (!key) return false
+
+  // Global override from config.features.debug — captures every request
+  // regardless of key state. Operator-flipped via Settings UI; intended for
+  // short-lived debug sessions because trace files can grow fast.
+  if (getConfig().features.debug) return true
 
   // Key-level debug opt-in (the canonical "trace this key" signal).
   if (isDebugActive(key)) return true
@@ -263,6 +296,23 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   const reqLeg = await captureRequest(c)
   const key = c.get("key") as KeyVar["key"] | undefined
 
+  // Install the upstream-capture sink. Helpers under
+  // src/services/copilot/* call this with their fetch req+res shape so we
+  // can record the proxy→Copilot leg of the request.
+  // v1 supports a SINGLE upstream pair (most routes make exactly one
+  // upstream call); subsequent captures within the same request overwrite.
+  let upstreamReq: TraceLeg | undefined
+  let upstreamRes: TraceLeg | undefined
+  const capture: TraceCaptureUpstream = (cap) => {
+    upstreamReq = cap.req
+    if (cap.res) upstreamRes = cap.res
+  }
+  // Type-safe set; helpers retrieve via c.var.trace_capture_upstream.
+  ;(c as Context<{ Variables: TraceVar }>).set(
+    "trace_capture_upstream",
+    capture,
+  )
+
   let threw = false
   let thrown: unknown = null
   try {
@@ -280,6 +330,8 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
         key_id: key?.id ?? "__noauth__",
         route: c.req.path,
         req: reqLeg,
+        upstream_req: upstreamReq,
+        upstream_res: upstreamRes,
         res: {
           status: c.res.status,
           headers: headersToObj(c.res.headers),
@@ -300,11 +352,8 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   wrapResponseForCapture(c, finishTrace)
 }
 
-// TODO(upstream-capture): the proxy→Copilot leg is not captured in v1. To
-// capture both halves we need to plumb a callback through each upstream
-// helper (services/copilot/create-chat-completions.ts and its siblings) and
-// have them invoke c.set("trace_capture", fn) with the upstream request +
-// response shape. The redaction + write pipeline above already supports
-// upstream_req / upstream_res fields, so wiring this up is purely a
-// matter of touching each fetch site. Tracked separately so this PR
-// remains scoped to the writer/broadcaster/middleware seam.
+// Note on upstream capture: the trace middleware exports a
+// TraceCaptureUpstream function via c.var.trace_capture_upstream when debug
+// is active. Helpers under src/services/copilot/* call this after each
+// upstream fetch to record the proxy→Copilot leg. When debug is NOT active,
+// the var is undefined so helpers' branch goes no-op without overhead.

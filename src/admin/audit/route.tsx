@@ -1,14 +1,17 @@
+/** @jsxImportSource hono/jsx */
 import { Hono } from "hono"
 import fs from "node:fs"
 
-import type { KeyVar } from "~/middleware/auth"
+import type { SessionVar } from "~/admin/session-middleware"
 import type { AuditEvent } from "~/services/audit"
 
-import { requireAdminMiddleware } from "~/middleware/auth"
+import { ADMIN_SECURITY_HEADERS } from "~/admin/layout"
 import { auditFilePath, todayDateStr } from "~/services/audit"
 
+import { AuditPage } from "./page"
+
 // ---------------------------------------------------------------------------
-// Helpers
+// Param parsing
 // ---------------------------------------------------------------------------
 
 function parseDateParam(dateParam: string | undefined): string {
@@ -63,29 +66,57 @@ function readAuditEvents(
       events.push(parsed)
     }
   }
-  return events
+  // Newest first — matches every other admin page.
+  return events.reverse()
 }
 
 // ---------------------------------------------------------------------------
 // Route
 // ---------------------------------------------------------------------------
 
-const auditAdminRoute = new Hono<{ Variables: KeyVar }>()
-
-auditAdminRoute.use("*", requireAdminMiddleware)
+export const auditAdminRoute = new Hono<{ Variables: SessionVar }>()
 
 auditAdminRoute.get("/", (c) => {
   const dateStr = parseDateParam(c.req.query("date"))
-  const actionFilter = c.req.query("action")
-  const limit = Math.max(1, parseIntParam(c.req.query("limit"), 100))
+  const actionFilterRaw = c.req.query("action")
+  const actionFilter =
+    actionFilterRaw && actionFilterRaw.length > 0 ? actionFilterRaw : undefined
+  const limit = Math.max(
+    1,
+    Math.min(500, parseIntParam(c.req.query("limit"), 100)),
+  )
   const offset = Math.max(0, parseIntParam(c.req.query("offset"), 0))
 
   const events = readAuditEvents(dateStr, actionFilter)
   const total = events.length
   const page = events.slice(offset, offset + limit)
-  const has_more = offset + limit < total
+  const hasMore = offset + limit < total
 
-  return c.json({ events: page, total, has_more })
+  // Distinct action list for the filter dropdown — built from the loaded
+  // (already date-filtered) events so it always reflects what's on disk for
+  // the chosen day. Sorted for stable rendering.
+  const availableActions = [...new Set(events.map((e) => e.action))].sort()
+
+  // Accept-aware: keep a JSON shape for scripted callers (jq, dashboards).
+  const accept = c.req.header("accept") ?? ""
+  if (accept.includes("application/json") && !accept.includes("text/html")) {
+    return c.json({ events: page, total, has_more: hasMore })
+  }
+
+  const session = c.get("session")
+  return c.html(
+    <AuditPage
+      csrfToken={session.csrf_token}
+      date={dateStr}
+      actionFilter={actionFilter ?? ""}
+      events={page}
+      total={total}
+      limit={limit}
+      offset={offset}
+      hasMore={hasMore}
+      availableActions={availableActions}
+    />,
+    200,
+    ADMIN_SECURITY_HEADERS,
+  )
 })
-
-export { auditAdminRoute }

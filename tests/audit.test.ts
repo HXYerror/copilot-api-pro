@@ -486,7 +486,41 @@ describe("auth.reject — token value never logged", () => {
 
 // ---------------------------------------------------------------------------
 // GET /admin/audit — integration tests
+//
+// /admin/audit is now a session-protected HTML page (mounted on the same
+// sessionProtected sub-app as Keys/Usage/Traces/Settings). Browsers see
+// HTML; scripted callers can pass `Accept: application/json` to get the
+// same JSON shape the old API-key endpoint used to return. These tests
+// exercise the JSON path so they don't have to parse HTML.
+//
+// Auth model:
+//   - No session cookie → 302 → /admin/login (matches every other admin page)
+//   - Session for a non-admin key → never reachable: login refuses to mint
+//     a session for non-admin tiers, so we don't have a "logged in as client"
+//     state to test against here. (Login refusal is covered separately in
+//     tests/admin-login.test.ts.)
 // ---------------------------------------------------------------------------
+
+async function loginAndGetCookie(plain: string): Promise<string> {
+  const res = await server.request("/admin/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `key=${encodeURIComponent(plain)}`,
+  })
+  // Hono exposes both forms depending on runtime version.
+  const setCookies =
+    typeof (res.headers as { getSetCookie?: () => Array<string> }).getSetCookie
+    === "function" ?
+      (res.headers as { getSetCookie: () => Array<string> }).getSetCookie()
+    : res.headers.get("set-cookie") ?
+      [res.headers.get("set-cookie") as string]
+    : []
+  const sid =
+    setCookies.find((c) => c.startsWith("sid="))?.split(";")[0] ?? ""
+  const csrf =
+    setCookies.find((c) => c.startsWith("csrf_cookie="))?.split(";")[0] ?? ""
+  return [sid, csrf].filter(Boolean).join("; ")
+}
 
 describe("GET /admin/audit", () => {
   let dir: string
@@ -515,20 +549,26 @@ describe("GET /admin/audit", () => {
     ).catch(() => {})
   })
 
-  test("returns 403 for client-tier key", async () => {
-    const { plain } = createKey({ tier: "client" })
+  test("client-tier key cannot log in → audit page never reached", async () => {
+    // Login refuses non-admin tiers (verified in admin-login tests). With no
+    // session cookie, /admin/audit redirects to login like every other admin page.
+    createKey({ tier: "client" })
     const res = await server.request("/admin/audit", {
       method: "GET",
-      headers: { Authorization: `Bearer ${plain}` },
     })
-    expect(res.status).toBe(403)
+    expect(res.status).toBe(302)
+    expect(res.headers.get("location")).toBe("/admin/login")
   })
 
-  test("returns 200 + events array for admin key (empty file = empty events)", async () => {
+  test("returns 200 + events array for admin session (empty file = empty events)", async () => {
     const { plain } = createKey({ tier: "admin" })
-    const res = await server.request("/admin/audit", {
+    const cookieHeader = await loginAndGetCookie(plain)
+    const res = await server.request("/admin/api/audit", {
       method: "GET",
-      headers: { Authorization: `Bearer ${plain}` },
+      headers: {
+        Cookie: cookieHeader,
+        Accept: "application/json",
+      },
     })
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
@@ -541,9 +581,10 @@ describe("GET /admin/audit", () => {
     expect(typeof body.has_more).toBe("boolean")
   })
 
-  test("returns 401 without any auth header", async () => {
+  test("redirects to /admin/login without a session cookie", async () => {
     const res = await server.request("/admin/audit", { method: "GET" })
-    expect(res.status).toBe(401)
+    expect(res.status).toBe(302)
+    expect(res.headers.get("location")).toBe("/admin/login")
   })
 })
 
@@ -580,9 +621,13 @@ describe("GET /admin/audit — filtering and pagination", () => {
 
   test("date filter: non-existent date returns empty events", async () => {
     const { plain } = createKey({ tier: "admin" })
-    const res = await server.request("/admin/audit?date=2020-01-01", {
+    const cookieHeader = await loginAndGetCookie(plain)
+    const res = await server.request("/admin/api/audit?date=2020-01-01", {
       method: "GET",
-      headers: { Authorization: `Bearer ${plain}` },
+      headers: {
+        Cookie: cookieHeader,
+        Accept: "application/json",
+      },
     })
     expect(res.status).toBe(200)
     const body = (await res.json()) as { events: Array<AuditEvent> }

@@ -18,6 +18,7 @@ import {
   createChatCompletions,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
+  type UpstreamCaptureFn,
 } from "~/services/copilot/create-chat-completions"
 
 export async function handleCompletion(
@@ -99,7 +100,11 @@ export async function handleCompletion(
     consola.debug("Set max_tokens to:", JSON.stringify(payload.max_tokens))
   }
 
-  const response = await createChatCompletions(payload)
+  // Pull the trace upstream-capture sink off the context if debug is active
+  // (set by src/middleware/trace.ts). undefined when no debug → no overhead.
+  const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
+    .trace_capture_upstream
+  const response = await createChatCompletions(payload, onUpstream)
 
   if (isNonStreaming(response)) {
     consola.debug("Non-streaming response:", JSON.stringify(response))

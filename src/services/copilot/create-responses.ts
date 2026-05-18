@@ -14,6 +14,12 @@ import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+import type { UpstreamCaptureFn } from "./create-chat-completions"
+
+// Re-export for ergonomics — handlers that only import from this module
+// shouldn't need to dig into create-chat-completions.ts for the type.
+export type { UpstreamCaptureFn } from "./create-chat-completions"
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -58,6 +64,7 @@ export function isAgentCall(payload: ResponsesPayload): boolean {
 
 export const createResponses = async (
   payload: ResponsesPayload,
+  onUpstream?: UpstreamCaptureFn,
 ): Promise<ResponsesResponse | AsyncIterable<ServerSentEventMessage>> => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -70,11 +77,31 @@ export const createResponses = async (
     "X-Initiator": initiator,
   }
 
-  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
+  const url = `${copilotBaseUrl(state)}/responses`
+  const response = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
   })
+
+  // Trace upstream-leg capture (task #25). Error bodies are captured too —
+  // they're small and tell us why upstream rejected the request.
+  if (onUpstream) {
+    try {
+      const responseBody =
+        payload.stream ? undefined : await response.clone().text()
+      onUpstream({
+        req: { method: "POST", url, headers, body: payload },
+        res: {
+          status: response.status,
+          headers: response.headers,
+          body: responseBody,
+        },
+      })
+    } catch (err) {
+      consola.warn(`[trace] upstream capture failed: ${String(err)}`)
+    }
+  }
 
   if (!response.ok) {
     consola.error("Failed to create responses", response)

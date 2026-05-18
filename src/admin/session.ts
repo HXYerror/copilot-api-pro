@@ -102,14 +102,26 @@ export function purgeExpiredSessions(): void {
   getDb().run(`DELETE FROM sessions WHERE expires_at <= ?`, [Date.now()])
 }
 
+/**
+ * Whether session cookies should be flagged `Secure` (HTTPS-only). Defaults
+ * to true. When ADMIN_INSECURE_HTTP=true is set, the operator has opted into
+ * plain-HTTP admin access on LAN, and `Secure` must be dropped — browsers
+ * silently discard Secure cookies received over HTTP, which would manifest
+ * as a "login loop" (server sets cookies, browser drops them, next request
+ * has no session → redirect back to login).
+ */
+function cookieSecureFlag(): string {
+  return process.env.ADMIN_INSECURE_HTTP === "true" ? "" : "; Secure"
+}
+
 /** Build the Set-Cookie header value for the session cookie. */
 export function sessionCookieValue(sessionId: string): string {
-  return `${SESSION_COOKIE}=${sessionId}; HttpOnly; Secure; SameSite=Strict; Path=/admin; Max-Age=${SESSION_LIFETIME_MS / 1000}`
+  return `${SESSION_COOKIE}=${sessionId}; HttpOnly${cookieSecureFlag()}; SameSite=Strict; Path=/admin; Max-Age=${SESSION_LIFETIME_MS / 1000}`
 }
 
 /** Build a Set-Cookie value that clears the session cookie. */
 export function clearSessionCookieValue(): string {
-  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/admin; Max-Age=0`
+  return `${SESSION_COOKIE}=; HttpOnly${cookieSecureFlag()}; SameSite=Strict; Path=/admin; Max-Age=0`
 }
 
 /** Extract the session id from the Cookie header. */

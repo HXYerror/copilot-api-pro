@@ -11,7 +11,7 @@ import { logAuthModeBanner, resolveAuthMode } from "./lib/auth-mode"
 import { runBootstrap } from "./lib/bootstrap"
 import {
   getConfig,
-  loadConfig,
+  initConfig,
   setRuntimeAuthOverride,
 } from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
@@ -132,8 +132,15 @@ function installShutdownHandlers(
 export async function runServer(options: RunServerOptions): Promise<void> {
   // Load config FIRST so we can read features.auth before resolving auth mode.
   // This also creates the config.json file with defaults on first run.
+  // initConfig() also installs an fs.watch on the parent dir so subsequent
+  // edits (Settings page POST or hand-edits) are picked up live without a
+  // restart — the dispose handle is wired into installShutdownHandlers below.
   await ensurePaths()
-  await loadConfig()
+  const stopConfigWatcher = await initConfig((next) => {
+    consola.info(
+      `config.json reloaded (models=${Object.keys(next.models).length}, telemetry=${String(next.features.telemetry)}, debug=${String(next.features.debug)}, traces_days=${String(next.retention.traces_days)})`,
+    )
+  })
 
   // Resolve auth mode — this throws before any HTTP/network side-effects if
   // --no-auth (or config features.auth=false) is requested on a non-loopback
@@ -154,6 +161,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.authModeLabel = authMode.label
   state.bindAddress = authMode.bindAddress
 
+  // Plain-HTTP bypass for admin WebUI — operator-acknowledged convenience for
+  // LAN-only self-hosted setups. Session cookies travel in the clear; never
+  // expose this server to the open internet with this flag on.
+  if (process.env.ADMIN_INSECURE_HTTP === "true") {
+    consola.warn(
+      "ADMIN_INSECURE_HTTP=true — admin WebUI HTTPS check disabled. "
+        + "Session cookies are sent in the clear. LAN-only use ONLY; "
+        + "never expose this port to the open internet.",
+    )
+  }
+
   await applyOptions(options)
 
   // Run DB migrations BEFORE binding HTTP listener (no schema race)
@@ -167,7 +185,11 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   const stopEventRetention = startEventRetention()
   // Start hourly trace retention sweeper (issue #36).
   const stopTraceRetention = startTraceRetention()
-  installShutdownHandlers([stopEventRetention, stopTraceRetention])
+  installShutdownHandlers([
+    stopEventRetention,
+    stopTraceRetention,
+    stopConfigWatcher,
+  ])
 
   logAuthModeBanner(authMode)
 
@@ -268,11 +290,15 @@ export const start = defineCommand({
       description:
         "Bind hostname. Default 127.0.0.1 (loopback only). Use 0.0.0.0 or :: to expose to LAN — requires auth or --i-accept-account-suspension-risk.",
     },
-    "no-auth": {
+    // citty interprets `--no-auth` as setting `auth=false` (the citty
+    // convention is `--no-X` toggles a boolean named `X`). We declare the
+    // positive form `auth` here with default `true`. The CLI flag exposed
+    // to the user remains `--no-auth`, but inside `args` we read `args.auth`.
+    auth: {
       type: "boolean",
-      default: false,
+      default: true,
       description:
-        "DISABLE authentication. Refused on non-loopback bind unless --i-accept-account-suspension-risk is also set.",
+        "Authentication. Pass --no-auth to DISABLE. Refused on non-loopback bind unless --i-accept-account-suspension-risk is also set.",
     },
     "i-accept-account-suspension-risk": {
       type: "boolean",
@@ -351,7 +377,7 @@ export const start = defineCommand({
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
-      noAuth: args["no-auth"],
+      noAuth: !args.auth,
       acceptRisk: args["i-accept-account-suspension-risk"],
     }).catch((err: unknown) => {
       // Auth-mode safety guard throws before any side-effects; surface the

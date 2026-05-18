@@ -18,6 +18,7 @@ import {
 import type { SessionVar } from "../session-middleware"
 
 import { ADMIN_SECURITY_HEADERS, Layout } from "../layout"
+import { recentCallsForKey, usageForKey } from "../usage/queries"
 import { KeyDetail } from "./detail"
 import { KeyList } from "./list"
 import { KeyCreatedBanner, NewKeyForm } from "./new"
@@ -194,7 +195,12 @@ keysApp.get("/new", (c) => {
 
 keysApp.post("/new", async (c) => {
   const session = c.get("session")
-  const body = await c.req.parseBody()
+  // `{ all: true }` so multi-value fields (allowed_models checkboxes) come
+  // back as arrays. The session middleware also parses the body (to extract
+  // the CSRF token) and Hono caches the parsed result, so we keep both
+  // call sites aligned on `{ all: true }` to avoid the cache producing a
+  // flattened (single-value) view here.
+  const body = await c.req.parseBody({ all: true })
   const config = getConfig()
 
   const renderErr = (msg: string): Response =>
@@ -321,13 +327,27 @@ keysApp.get("/:id", (c) => {
   const config = getConfig()
   const success = c.req.query("success")
 
+  // Per-key usage summaries over three windows + recent calls (task #26).
+  // Pulled with separate queries so each window can use its own ts range
+  // (the events table is indexed on (key_id, ts)).
+  const DAY = 86_400_000
+  const usage24h = usageForKey(id, DAY)
+  const usage7d = usageForKey(id, 7 * DAY)
+  const usage30d = usageForKey(id, 30 * DAY)
+  const recent = recentCallsForKey(id, 20)
+
   return c.html(
     <Layout title="Key Detail" active="keys" csrfToken={session.csrf_token}>
       <KeyDetail
         row={row}
         csrfToken={session.csrf_token}
         tracesDays={config.retention.traces_days}
+        availableAliases={Object.keys(config.models)}
         success={success}
+        usage24h={usage24h}
+        usage7d={usage7d}
+        usage30d={usage30d}
+        recent={recent}
       />
     </Layout>,
   )
@@ -369,22 +389,34 @@ keysApp.post("/:id/scope", async (c) => {
   if (!row) return c.text("Key not found", 404)
   if (row.revoked_at !== null) return c.text("Key is revoked", 400)
 
-  const body = await c.req.parseBody()
+  // `{ all: true }` so multi-value fields (allowed_models checkboxes) come
+  // back as arrays. The session middleware also parses the body (to extract
+  // the CSRF token) and Hono caches the parsed result, so we keep both
+  // call sites aligned on `{ all: true }` to avoid the cache producing a
+  // flattened (single-value) view here.
+  const body = await c.req.parseBody({ all: true })
   const { explicit, models } = parseAllowedModels(body)
   const config = getConfig()
 
-  const renderErr = (msg: string, status: 400): Response =>
-    c.html(
+  const renderErr = (msg: string, status: 400): Response => {
+    const DAY = 86_400_000
+    return c.html(
       <Layout title="Key Detail" active="keys" csrfToken={session.csrf_token}>
         <KeyDetail
           row={findKeyById(id) ?? row}
           csrfToken={session.csrf_token}
           tracesDays={config.retention.traces_days}
+          availableAliases={Object.keys(config.models)}
           error={msg}
+          usage24h={usageForKey(id, DAY)}
+          usage7d={usageForKey(id, 7 * DAY)}
+          usage30d={usageForKey(id, 30 * DAY)}
+          recent={recentCallsForKey(id, 20)}
         />
       </Layout>,
       status,
     )
+  }
 
   if (!explicit) {
     return renderErr("Form did not submit any allowed_models field", 400)

@@ -17,6 +17,7 @@ import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
+  type UpstreamCaptureFn,
 } from "~/services/copilot/create-chat-completions"
 import { createMessagesNative } from "~/services/copilot/create-messages-native"
 import { createResponses } from "~/services/copilot/create-responses"
@@ -107,7 +108,9 @@ async function handleNative(
 ): Promise<Response> {
   consola.debug("Using native Anthropic pass-through for", payload.model)
 
-  const response = await createMessagesNative(payload)
+  const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
+    .trace_capture_upstream
+  const response = await createMessagesNative(payload, onUpstream)
 
   if (!payload.stream) {
     // Non-streaming: upstream already returned a complete Anthropic response
@@ -181,10 +184,16 @@ async function handleAnthropicViaResponses(
   }
 
   const responsesPayload = translateAnthropicToResponses(payload)
-  const rawResponse = await createResponses({
-    ...responsesPayload,
-    stream: false,
-  })
+  const onUpstreamRes = (
+    c.var as { trace_capture_upstream?: UpstreamCaptureFn }
+  ).trace_capture_upstream
+  const rawResponse = await createResponses(
+    {
+      ...responsesPayload,
+      stream: false,
+    },
+    onUpstreamRes,
+  )
 
   // Runtime guard: createResponses returns ResponsesResponse for stream:false,
   // but TypeScript types the return as a union — narrow explicitly.
@@ -248,7 +257,9 @@ async function handleTranslated(
     JSON.stringify(openAIPayload),
   )
 
-  const response = await createChatCompletions(openAIPayload)
+  const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
+    .trace_capture_upstream
+  const response = await createChatCompletions(openAIPayload, onUpstream)
 
   if (isNonStreaming(response)) {
     consola.debug(
@@ -328,11 +339,17 @@ function streamResponsesAsAnthropic(
   payload: AnthropicMessagesPayload,
 ): Response {
   const responsesPayload = translateAnthropicToResponses(payload)
+  const onUpstreamStream = (
+    c.var as { trace_capture_upstream?: UpstreamCaptureFn }
+  ).trace_capture_upstream
   return streamSSE(c, async (stream) => {
-    const rawResponse = await createResponses({
-      ...responsesPayload,
-      stream: true,
-    })
+    const rawResponse = await createResponses(
+      {
+        ...responsesPayload,
+        stream: true,
+      },
+      onUpstreamStream,
+    )
     const streamState = makeResponsesStreamState()
     let inputTokens: number | undefined
     let outputTokens: number | undefined

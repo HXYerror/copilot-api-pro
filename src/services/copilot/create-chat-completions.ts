@@ -5,8 +5,28 @@ import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+/**
+ * Optional callback for capturing the proxy→Copilot leg of a request.
+ * Set by the trace middleware on c.var when debug capture is active.
+ * Undefined → no capture, zero overhead.
+ */
+export type UpstreamCaptureFn = (capture: {
+  req: {
+    method: string
+    url: string
+    headers: Record<string, string> | Headers
+    body: unknown
+  }
+  res?: {
+    status: number
+    headers: Record<string, string> | Headers
+    body: unknown
+  }
+}) => void
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
+  onUpstream?: UpstreamCaptureFn,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -40,11 +60,36 @@ export const createChatCompletions = async (
       { ...payload, stream_options: { include_usage: true } }
     : payload
 
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
+  const url = `${copilotBaseUrl(state)}/chat/completions`
+  const response = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify(upstreamPayload),
   })
+
+  // Trace upstream-leg capture (task #25). For non-streaming responses
+  // (success OR error) we .clone() and read the body without consuming
+  // the original — error bodies are small and crucial for debugging.
+  // For streaming responses we capture headers+status only; the body is
+  // an SSE stream that gets consumed by events() below, and the
+  // proxy→client SSE leg is already captured by the trace middleware
+  // wrapper on c.res.
+  if (onUpstream) {
+    try {
+      const responseBody =
+        payload.stream ? undefined : await response.clone().text()
+      onUpstream({
+        req: { method: "POST", url, headers, body: upstreamPayload },
+        res: {
+          status: response.status,
+          headers: response.headers,
+          body: responseBody,
+        },
+      })
+    } catch (err) {
+      consola.warn(`[trace] upstream capture failed: ${String(err)}`)
+    }
+  }
 
   if (!response.ok) {
     consola.error("Failed to create chat completions", response)

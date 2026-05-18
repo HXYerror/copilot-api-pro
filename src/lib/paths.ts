@@ -13,7 +13,11 @@ function resolveXdgDataHome(): string {
 
 const XDG_DATA_HOME = resolveXdgDataHome()
 
-const APP_DIR = path.join(XDG_DATA_HOME, "copilot-api")
+// This fork ("copilot-api-pro") uses its OWN data directory so it doesn't
+// clobber data files written by upstream ericc-ch/copilot-api running on the
+// same machine. Old data in `~/.local/share/copilot-api/` is ignored —
+// re-run `auth` to log in fresh.
+const APP_DIR = path.join(XDG_DATA_HOME, "copilot-api-pro")
 
 const GITHUB_TOKEN_PATH = path.join(APP_DIR, "github_token")
 

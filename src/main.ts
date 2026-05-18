@@ -18,9 +18,9 @@ const admin = defineCommand({
 
 const main = defineCommand({
   meta: {
-    name: "copilot-api",
+    name: "copilot-api-pro",
     description:
-      "A wrapper around GitHub Copilot API to make it OpenAI compatible, making it usable for other tools.",
+      "GitHub Copilot proxy with an admin WebUI, per-key debug capture, telemetry, and audit logging. Fork of ericc-ch/copilot-api.",
   },
   subCommands: { auth, start, "check-usage": checkUsage, debug, admin },
 })

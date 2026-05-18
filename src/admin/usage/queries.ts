@@ -315,3 +315,209 @@ export function distinctModels(): Array<string> {
     .all()
   return rows.map((r) => r.model)
 }
+
+// ---------------------------------------------------------------------------
+// Per-key usage summary (used by /admin/keys/:id detail page)
+//
+// Returns the aggregate stats for a single key over a time window. All
+// queries use idx_events_key_ts (covering for key_id + ts predicate).
+// ---------------------------------------------------------------------------
+
+export interface KeyUsageSummary {
+  total_requests: number
+  total_prompt_tokens: number
+  total_completion_tokens: number
+  errors: number
+  error_rate: number // 0-1
+  p95_latency_ms: number | null // null when no events
+  last_used_ts: number | null // null when never used
+}
+
+export function usageForKey(keyId: string, windowMs: number): KeyUsageSummary {
+  const db = getDb()
+  const now = Date.now()
+  const since = now - windowMs
+
+  // Single SELECT covers totals + error count
+  const agg = db
+    .query<
+      {
+        total_requests: number
+        total_prompt: number | null
+        total_completion: number | null
+        errors: number
+        last_ts: number | null
+      },
+      [string, number]
+    >(
+      `SELECT
+         COUNT(*) AS total_requests,
+         SUM(prompt_tokens) AS total_prompt,
+         SUM(completion_tokens) AS total_completion,
+         SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
+         MAX(ts) AS last_ts
+       FROM events
+       WHERE key_id = ? AND ts >= ?`,
+    )
+    .get(keyId, since)
+
+  const totalReq = agg?.total_requests ?? 0
+  if (totalReq === 0) {
+    return {
+      total_requests: 0,
+      total_prompt_tokens: 0,
+      total_completion_tokens: 0,
+      errors: 0,
+      error_rate: 0,
+      p95_latency_ms: null,
+      last_used_ts: null,
+    }
+  }
+
+  // p95 via OFFSET (no window functions in bun:sqlite). For one key with one
+  // window this is cheap — the key_id + ts index keeps the row set bounded.
+  const offset = Math.floor(0.95 * (totalReq - 1))
+  const p95Row = db
+    .query<{ latency_ms: number }, [string, number]>(
+      `SELECT latency_ms FROM events
+       WHERE key_id = ? AND ts >= ?
+       ORDER BY latency_ms ASC
+       LIMIT 1 OFFSET ${offset}`,
+    )
+    .get(keyId, since)
+
+  const errors = agg?.errors ?? 0
+  return {
+    total_requests: totalReq,
+    total_prompt_tokens: agg?.total_prompt ?? 0,
+    total_completion_tokens: agg?.total_completion ?? 0,
+    errors,
+    error_rate: totalReq > 0 ? errors / totalReq : 0,
+    p95_latency_ms: p95Row?.latency_ms ?? null,
+    last_used_ts: agg?.last_ts ?? null,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-key recent calls — last N events for this key (for detail page table)
+// ---------------------------------------------------------------------------
+
+export interface RecentCallRow {
+  id: number
+  ts: number
+  model: string
+  upstream_model: string
+  status: number
+  latency_ms: number
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  error: string | null
+}
+
+export function recentCallsForKey(
+  keyId: string,
+  limit = 20,
+): Array<RecentCallRow> {
+  return getDb()
+    .query<RecentCallRow, [string, number]>(
+      `SELECT id, ts, model, upstream_model, status, latency_ms,
+              prompt_tokens, completion_tokens, error
+         FROM events
+         WHERE key_id = ?
+         ORDER BY ts DESC
+         LIMIT ?`,
+    )
+    .all(keyId, limit)
+}
+
+// ---------------------------------------------------------------------------
+// latencyPercentiles — p50 / p95 / p99 per hour
+//
+// Uses the same OFFSET trick as p95LatencyPerHour but returns all three
+// percentiles in one pass over the per-bucket count list. The inner SELECT
+// runs three times per bucket (one per percentile) which is fine for the
+// dashboard window: at 24h × 3 buckets/hr × 3 percentiles = 216 lookups,
+// each constrained to a 1-hour window by idx_events_ts.
+// ---------------------------------------------------------------------------
+
+export interface LatencyPercentilesPoint {
+  ts: number
+  p50: number
+  p95: number
+  p99: number
+}
+
+export function latencyPercentiles(
+  filter: UsageFilter,
+): Array<LatencyPercentilesPoint> {
+  const where = buildWhere(filter)
+  const buckets = getDb()
+    .query<{ bucket: number; count: number }, Array<unknown>>(
+      `SELECT (ts / ${HOUR_MS}) * ${HOUR_MS} AS bucket, COUNT(*) AS count
+         FROM events
+        WHERE ${where.sql}
+        GROUP BY bucket
+        ORDER BY bucket ASC`,
+    )
+    .all(...where.params)
+
+  const tailParams = where.params.slice(2)
+  const tailSql = where.sql.split(" AND ").slice(2).join(" AND ")
+  const innerWhere =
+    tailSql.length > 0 ?
+      `ts >= ? AND ts < ? AND ${tailSql}`
+    : `ts >= ? AND ts < ?`
+
+  const out: Array<LatencyPercentilesPoint> = []
+  for (const b of buckets) {
+    if (b.count === 0) continue
+    const bucketEnd = b.bucket + HOUR_MS
+    const pick = (frac: number): number => {
+      const offset = Math.floor(frac * (b.count - 1))
+      const innerSql = `SELECT latency_ms FROM events
+            WHERE ${innerWhere}
+            ORDER BY latency_ms ASC
+            LIMIT 1 OFFSET ${offset}`
+      const row = getDb()
+        .query<{ latency_ms: number }, Array<unknown>>(innerSql)
+        .get(b.bucket, bucketEnd, ...tailParams)
+      return row?.latency_ms ?? 0
+    }
+    out.push({
+      ts: b.bucket,
+      p50: pick(0.5),
+      p95: pick(0.95),
+      p99: pick(0.99),
+    })
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// errorBreakdownByStatus — counts grouped by status code (only error rows)
+// ---------------------------------------------------------------------------
+
+export interface ErrorByStatusRow {
+  status: number
+  count: number
+  sample_error: string | null
+}
+
+export function errorBreakdownByStatus(
+  filter: UsageFilter,
+): Array<ErrorByStatusRow> {
+  const where = buildWhere(filter)
+  const sql = `SELECT status,
+              COUNT(*) AS count,
+              MAX(error) AS sample_error
+         FROM events
+        WHERE ${where.sql} AND status >= 400
+        GROUP BY status
+        ORDER BY count DESC, status ASC`
+  return getDb()
+    .query<
+      { status: number; count: number; sample_error: string | null },
+      Array<unknown>
+    >(sql)
+    .all(...where.params)
+}

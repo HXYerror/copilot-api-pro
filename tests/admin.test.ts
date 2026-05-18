@@ -338,6 +338,41 @@ describe("isRequestAllowed", () => {
       ),
     ).toBe(false)
   })
+
+  test("ADMIN_INSECURE_HTTP=true allows plain HTTP from non-loopback", () => {
+    const prev = process.env.ADMIN_INSECURE_HTTP
+    process.env.ADMIN_INSECURE_HTTP = "true"
+    try {
+      expect(
+        isRequestAllowed(
+          makeIsAllowedCtx({
+            host: "1.2.3.4:4141",
+            url: "http://1.2.3.4:4141/admin",
+          }),
+        ),
+      ).toBe(true)
+    } finally {
+      if (prev === undefined) delete process.env.ADMIN_INSECURE_HTTP
+      else process.env.ADMIN_INSECURE_HTTP = prev
+    }
+  })
+
+  test("ADMIN_INSECURE_HTTP unset still blocks non-loopback HTTP", () => {
+    const prev = process.env.ADMIN_INSECURE_HTTP
+    delete process.env.ADMIN_INSECURE_HTTP
+    try {
+      expect(
+        isRequestAllowed(
+          makeIsAllowedCtx({
+            host: "1.2.3.4:4141",
+            url: "http://1.2.3.4:4141/admin",
+          }),
+        ),
+      ).toBe(false)
+    } finally {
+      if (prev !== undefined) process.env.ADMIN_INSECURE_HTTP = prev
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -574,14 +609,29 @@ describe("Session-protected /admin routes", () => {
     const sidCookie = cookies.find((c) => c.startsWith("sid="))
     const sidValue = sidCookie?.split(";")[0] ?? ""
 
-    // Access /admin with session cookie
+    // Access /admin with session cookie. The new React SPA shell is served
+    // here; previously this was the legacy SSR Overview page. The shell
+    // contains the SPA bootstrap script — assert on that. We separately
+    // assert against the legacy SSR markup below.
     const res = await server.request("/admin", {
       method: "GET",
       headers: { Cookie: sidValue },
     })
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).toContain("Overview")
+    // SPA shell loaded — Vite emits a /admin/_app/assets/... module script.
+    expect(body).toContain("/admin/_app/")
+    expect(body).toContain("Copilot API Admin")
+
+    // Legacy SSR Overview is still available under /admin/legacy during the
+    // page-by-page migration. Assert it still works.
+    const legacyRes = await server.request("/admin/legacy", {
+      method: "GET",
+      headers: { Cookie: sidValue },
+    })
+    expect(legacyRes.status).toBe(200)
+    const legacyBody = await legacyRes.text()
+    expect(legacyBody).toContain("Overview")
   })
 
   test("POST /admin/session/logout clears session cookie (CSRF via form body)", async () => {
@@ -721,7 +771,10 @@ describe("HTML snapshot tests", () => {
     const sidValue =
       cookies.find((c) => c.startsWith("sid="))?.split(";")[0] ?? ""
 
-    const res = await server.request("/admin", {
+    // The /admin shell is now the React SPA — nav links live inside the
+    // bundled JS, not the initial HTML. Assert the legacy SSR view (kept
+    // available at /admin/legacy during migration) still renders the nav.
+    const res = await server.request("/admin/legacy", {
       method: "GET",
       headers: { Cookie: sidValue },
     })

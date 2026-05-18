@@ -320,128 +320,132 @@ describe("keys service: updateKeyScope", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Integration: GET /admin/keys
+// Integration: GET /admin/api/keys (JSON contract — Phase 2 SPA)
 // ---------------------------------------------------------------------------
 
-describe("GET /admin/keys", () => {
-  test("redirects to /admin/login without a session", async () => {
+describe("GET /admin/api/keys", () => {
+  test("redirects to /admin/login without a session (SSR shell)", async () => {
     const res = await server.request("/admin/keys", { method: "GET" })
     expect(res.status).toBe(302)
     expect(res.headers.get("location")).toContain("/admin/login")
   })
 
-  test("returns 200 with key list for admin session", async () => {
+  test("returns JSON list for admin session", async () => {
     const { sidCookie } = await loginAsAdmin()
     createKey({ tier: "client", label: "alpha" })
     createKey({ tier: "client", label: "beta" })
 
-    const res = await server.request("/admin/keys", {
+    const res = await server.request("/admin/api/keys", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
-    const html = await res.text()
-    expect(html).toContain("alpha")
-    expect(html).toContain("beta")
-    expect(html).toContain("API Keys")
+    const body = (await res.json()) as {
+      items: Array<{ label: string | null; tier: string; allowed_models: Array<string> }>
+      pagination: { total: number }
+      summary: { total_keys: number; debug_active: number }
+    }
+    const labels = body.items.map((k) => k.label)
+    expect(labels).toContain("alpha")
+    expect(labels).toContain("beta")
+    expect(body.pagination.total).toBeGreaterThanOrEqual(3) // 2 + the admin login key
+    expect(typeof body.summary.debug_active).toBe("number")
   })
 
-  test("pagination: page=2 shows next 50", async () => {
+  test("pagination: page=2 shows next page", async () => {
     const { sidCookie } = await loginAsAdmin()
-    // Already have 1 admin key from login; add 60 more
     for (let i = 0; i < 60; i++) {
       createKey({ tier: "client", label: `bulk-${i}` })
     }
-    const res = await server.request("/admin/keys?page=2", {
+    const res = await server.request("/admin/api/keys?page=2&page_size=50", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
-    const html = await res.text()
-    expect(html).toContain("Page 2")
+    const body = (await res.json()) as {
+      items: Array<unknown>
+      pagination: { page: number; total: number; total_pages: number }
+    }
+    expect(body.pagination.page).toBe(2)
+    expect(body.items.length).toBeGreaterThan(0)
+    expect(body.pagination.total).toBeGreaterThanOrEqual(61)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Integration: POST /admin/keys/new — flash + non-replayable plaintext
+// Integration: POST /admin/api/keys — create, single-shot plaintext
 // ---------------------------------------------------------------------------
 
-describe("POST /admin/keys/new", () => {
-  test("creates key, redirects to /admin/keys/created with flash, plaintext non-replayable", async () => {
+describe("POST /admin/api/keys", () => {
+  test("creates key, returns plaintext exactly once in the response body", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
 
-    const createRes = await server.request("/admin/keys/new", {
+    const createRes = await server.request("/admin/api/keys", {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=my-key&tier=client&allowed_models=*`,
+      body: JSON.stringify({ label: "my-key", tier: "client", allowed_models: ["*"] }),
     })
-    expect(createRes.status).toBe(303)
-    const loc = createRes.headers.get("location") ?? ""
-    expect(loc).toContain("/admin/keys/created?flash=")
+    expect(createRes.status).toBe(201)
+    const body = (await createRes.json()) as {
+      plain: string
+      key: { id: string; label: string; tier: string; allowed_models: Array<string> }
+    }
+    expect(body.plain).toMatch(/^sk-cap-/)
+    expect(body.key.label).toBe("my-key")
+    expect(body.key.tier).toBe("client")
 
-    // First view: should show the plain key
-    const firstView = await server.request(loc, {
+    // The detail endpoint never returns plaintext
+    const detailRes = await server.request(`/admin/api/keys/${body.key.id}`, {
       method: "GET",
       headers: { Cookie: cookieHeader },
     })
-    expect(firstView.status).toBe(200)
-    const html1 = await firstView.text()
-    expect(html1).toContain("sk-cap-")
-    expect(html1).toContain("Key Created")
-
-    // Second view with the same flash token: must NOT replay plaintext;
-    // returns 410 Gone with an explicit error message instead of silently
-    // redirecting.
-    const secondView = await server.request(loc, {
-      method: "GET",
-      headers: { Cookie: cookieHeader },
-    })
-    expect(secondView.status).toBe(410)
-    const secondHtml = await secondView.text()
-    expect(secondHtml).toContain("Plaintext no longer available")
-    expect(secondHtml).not.toContain("sk-cap-")
+    expect(detailRes.status).toBe(200)
+    const detail = (await detailRes.json()) as { key: Record<string, unknown> }
+    expect(JSON.stringify(detail)).not.toContain(body.plain)
   })
 
   test("rejects missing CSRF", async () => {
     const { sidCookie } = await loginAsAdmin()
-    const res = await server.request("/admin/keys/new", {
+    const res = await server.request("/admin/api/keys", {
       method: "POST",
       headers: {
         Cookie: sidCookie,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
       },
-      body: `label=foo&tier=client`,
+      body: JSON.stringify({ label: "foo", tier: "client" }),
     })
     expect(res.status).toBe(403)
   })
 
   test("rejects empty label", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
-    const res = await server.request("/admin/keys/new", {
+    const res = await server.request("/admin/api/keys", {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=&tier=client`,
+      body: JSON.stringify({ label: "", tier: "client" }),
     })
     expect(res.status).toBe(400)
-    const html = await res.text()
-    expect(html).toContain("Label is required")
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain("Label is required")
   })
 })
 
 // ---------------------------------------------------------------------------
-// Integration: POST /admin/keys/:id/revoke
+// Integration: POST /admin/api/keys/:id/revoke
 // ---------------------------------------------------------------------------
 
-describe("POST /admin/keys/:id/revoke", () => {
+describe("POST /admin/api/keys/:id/revoke", () => {
   test("revokes key, audit-logs, and the revoked key fails next API request with 401", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { plain, row } = createKey({ tier: "client", label: "doomed" })
@@ -454,16 +458,19 @@ describe("POST /admin/keys/:id/revoke", () => {
     expect(before.status).toBe(200)
 
     // Revoke
-    const revokeRes = await server.request(`/admin/keys/${row.id}/revoke`, {
+    const revokeRes = await server.request(`/admin/api/keys/${row.id}/revoke`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}`,
+      body: JSON.stringify({}),
     })
-    expect(revokeRes.status).toBe(303)
+    expect(revokeRes.status).toBe(200)
+    const body = (await revokeRes.json()) as { ok: true; revoked: boolean }
+    expect(body.revoked).toBe(true)
 
     // Verify the key is now revoked in the DB
     const after = findKeyById(row.id)
@@ -480,15 +487,16 @@ describe("POST /admin/keys/:id/revoke", () => {
   test("returns 404 for non-existent key id", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const res = await server.request(
-      `/admin/keys/00000000-0000-0000-0000-000000000000/revoke`,
+      `/admin/api/keys/00000000-0000-0000-0000-000000000000/revoke`,
       {
         method: "POST",
         headers: {
           Cookie: cookieHeader,
-          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Type": "application/json",
           "Sec-Fetch-Site": "same-origin",
+          "X-CSRF-Token": csrfValue,
         },
-        body: `csrf_token=${encodeURIComponent(csrfValue)}`,
+        body: JSON.stringify({}),
       },
     )
     expect(res.status).toBe(404)
@@ -496,47 +504,52 @@ describe("POST /admin/keys/:id/revoke", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Integration: POST /admin/keys/:id/scope
+// Integration: POST /admin/api/keys/:id/scope
 // ---------------------------------------------------------------------------
 
-describe("POST /admin/keys/:id/scope", () => {
+describe("POST /admin/api/keys/:id/scope", () => {
   test("updates allowed_models", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { row } = createKey({ tier: "client", allowedModels: ["*"] })
 
-    const res = await server.request(`/admin/keys/${row.id}/scope`, {
+    const res = await server.request(`/admin/api/keys/${row.id}/scope`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&allowed_models=*&rate_limit_override=15`,
+      body: JSON.stringify({
+        allowed_models: ["*"],
+        rate_limit_override: 15,
+      }),
     })
-    expect(res.status).toBe(303)
+    expect(res.status).toBe(200)
     const updated = findKeyById(row.id)
     expect(updated?.rate_limit_override).toBe(15)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Integration: POST /admin/keys/:id/debug
+// Integration: POST /admin/api/keys/:id/debug
 // ---------------------------------------------------------------------------
 
-describe("POST /admin/keys/:id/debug", () => {
-  test("enabling debug requires debug_confirm=yes (server gate)", async () => {
+describe("POST /admin/api/keys/:id/debug", () => {
+  test("enabling debug requires confirm: true (server gate)", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { row } = createKey({ tier: "client" })
 
     // Without confirmation token → 400, debug stays off
-    const noConfirm = await server.request(`/admin/keys/${row.id}/debug`, {
+    const noConfirm = await server.request(`/admin/api/keys/${row.id}/debug`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=1`,
+      body: JSON.stringify({ enabled: true }),
     })
     expect(noConfirm.status).toBe(400)
     const stillOff = findKeyById(row.id)
@@ -547,16 +560,17 @@ describe("POST /admin/keys/:id/debug", () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { row } = createKey({ tier: "client" })
 
-    const res = await server.request(`/admin/keys/${row.id}/debug`, {
+    const res = await server.request(`/admin/api/keys/${row.id}/debug`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=1&debug_confirm=yes`,
+      body: JSON.stringify({ enabled: true, confirm: true }),
     })
-    expect(res.status).toBe(303)
+    expect(res.status).toBe(200)
     const updated = findKeyById(row.id)
     expect(updated?.debug_enabled).toBe(1)
     expect(updated?.debug_expires_at).not.toBeNull()
@@ -573,16 +587,17 @@ describe("POST /admin/keys/:id/debug", () => {
       row.id,
     ])
 
-    const res = await server.request(`/admin/keys/${row.id}/debug`, {
+    const res = await server.request(`/admin/api/keys/${row.id}/debug`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&action=renew`,
+      body: JSON.stringify({ action: "renew" }),
     })
-    expect(res.status).toBe(303)
+    expect(res.status).toBe(200)
     const updated = findKeyById(row.id)
     expect(updated?.debug_enabled).toBe(1)
     expect(updated?.debug_expires_at).toBeGreaterThan(oldExp + 60_000)
@@ -592,16 +607,17 @@ describe("POST /admin/keys/:id/debug", () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const { row } = createKey({ tier: "client", debugEnabled: true })
 
-    const res = await server.request(`/admin/keys/${row.id}/debug`, {
+    const res = await server.request(`/admin/api/keys/${row.id}/debug`, {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&debug_enabled=0`,
+      body: JSON.stringify({ enabled: false }),
     })
-    expect(res.status).toBe(303)
+    expect(res.status).toBe(200)
     const updated = findKeyById(row.id)
     expect(updated?.debug_enabled).toBe(0)
     expect(updated?.debug_expires_at).toBeNull()
@@ -627,7 +643,9 @@ describe("Active debug banner", () => {
     const { sidCookie } = await loginAsAdmin()
     createKey({ tier: "client", debugEnabled: true })
 
-    const res = await server.request("/admin", {
+    // /admin now serves the React SPA shell — the legacy SSR Overview
+    // (with the banner) is available at /admin/legacy during migration.
+    const res = await server.request("/admin/legacy", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
@@ -636,12 +654,12 @@ describe("Active debug banner", () => {
     expect(html).toContain("1 key")
   })
 
-  test("banner also shows on /admin/keys", async () => {
+  test("banner also shows on legacy /admin/legacy/keys", async () => {
     const { sidCookie } = await loginAsAdmin()
     createKey({ tier: "client", debugEnabled: true })
     createKey({ tier: "client", debugEnabled: true })
 
-    const res = await server.request("/admin/keys", {
+    const res = await server.request("/admin/legacy/keys", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
@@ -656,107 +674,126 @@ describe("Active debug banner", () => {
 // ---------------------------------------------------------------------------
 
 describe("Input validation and safety", () => {
-  test("GET /admin/keys/<non-uuid> returns 404 without touching DB", async () => {
+  test("GET /admin/api/keys/<non-uuid> returns 404 without touching DB", async () => {
     const { sidCookie } = await loginAsAdmin()
-    const res = await server.request("/admin/keys/not-a-uuid", {
+    const res = await server.request("/admin/api/keys/not-a-uuid", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(404)
   })
 
-  test("POST /admin/keys/<non-uuid>/revoke returns 404", async () => {
+  test("POST /admin/api/keys/<non-uuid>/revoke returns 404", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
-    const res = await server.request("/admin/keys/bogus/revoke", {
+    const res = await server.request("/admin/api/keys/bogus/revoke", {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}`,
+      body: JSON.stringify({}),
     })
     expect(res.status).toBe(404)
   })
 
-  test("POST /admin/keys/new rejects labels longer than 200 chars", async () => {
+  test("POST /admin/api/keys rejects labels longer than 200 chars", async () => {
     const { cookieHeader, csrfValue } = await loginAsAdmin()
     const longLabel = "x".repeat(201)
-    const res = await server.request("/admin/keys/new", {
+    const res = await server.request("/admin/api/keys", {
       method: "POST",
       headers: {
         Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
       },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=${longLabel}&tier=client&allowed_models=*&allowed_models_present=1`,
+      body: JSON.stringify({
+        label: longLabel,
+        tier: "client",
+        allowed_models: ["*"],
+      }),
     })
     expect(res.status).toBe(400)
-    const html = await res.text()
-    expect(html).toContain("Label too long")
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain("Label too long")
   })
 
-  test("Label with HTML tags is rendered as escaped text on list page", async () => {
+  test("Label with HTML tags is returned verbatim by JSON API (escaping happens in the SPA, not the server)", async () => {
     const { sidCookie } = await loginAsAdmin()
     createKey({ tier: "client", label: "<script>alert(1)</script>" })
 
-    const res = await server.request("/admin/keys", {
-      method: "GET",
-      headers: { Cookie: sidCookie },
-    })
-    const html = await res.text()
-    // Raw script tag must NOT appear; escaped form must
-    expect(html).not.toContain("<script>alert(1)</script>")
-    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;")
-  })
-
-  test("POST /admin/keys/new with empty allowed_models is rejected (no privilege widening)", async () => {
-    const { cookieHeader, csrfValue } = await loginAsAdmin()
-    // Send allowed_models_present=1 but no allowed_models entries
-    const res = await server.request("/admin/keys/new", {
-      method: "POST",
-      headers: {
-        Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Sec-Fetch-Site": "same-origin",
-      },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=test&tier=client&allowed_models_present=1`,
-    })
-    expect(res.status).toBe(400)
-    const html = await res.text()
-    expect(html).toContain("Select at least one allowed model")
-  })
-
-  test("POST /admin/keys/new with no allowed_models field at all defaults to ['*']", async () => {
-    const { cookieHeader, csrfValue } = await loginAsAdmin()
-    // No sentinel: simulates an AJAX caller or a form without the models block
-    const res = await server.request("/admin/keys/new", {
-      method: "POST",
-      headers: {
-        Cookie: cookieHeader,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Sec-Fetch-Site": "same-origin",
-      },
-      body: `csrf_token=${encodeURIComponent(csrfValue)}&label=default-test&tier=client`,
-    })
-    expect(res.status).toBe(303)
-  })
-
-  test("GET /admin/keys?page=abc falls back to page 1 (no NaN)", async () => {
-    const { sidCookie } = await loginAsAdmin()
-    const res = await server.request("/admin/keys?page=abc", {
+    const res = await server.request("/admin/api/keys", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
-    const html = await res.text()
-    expect(html).toContain("Page 1")
+    const body = (await res.json()) as {
+      items: Array<{ label: string | null }>
+    }
+    // Label is preserved as data; React renders it as text, so XSS is closed
+    // at the render layer rather than the API layer.
+    expect(
+      body.items.some((k) => k.label === "<script>alert(1)</script>"),
+    ).toBe(true)
   })
 
-  test("GET /admin/keys/created?flash=<unknown> renders explicit error (not silent redirect)", async () => {
+  test("POST /admin/api/keys with empty allowed_models is rejected (no privilege widening)", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const res = await server.request("/admin/api/keys", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/json",
+        "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
+      },
+      body: JSON.stringify({
+        label: "test",
+        tier: "client",
+        allowed_models: [],
+      }),
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain("Select at least one allowed model")
+  })
+
+  test("POST /admin/api/keys with no allowed_models field at all defaults to ['*']", async () => {
+    const { cookieHeader, csrfValue } = await loginAsAdmin()
+    const res = await server.request("/admin/api/keys", {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader,
+        "Content-Type": "application/json",
+        "Sec-Fetch-Site": "same-origin",
+        "X-CSRF-Token": csrfValue,
+      },
+      body: JSON.stringify({ label: "default-test", tier: "client" }),
+    })
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as {
+      key: { allowed_models: Array<string> }
+    }
+    expect(body.key.allowed_models).toEqual(["*"])
+  })
+
+  test("GET /admin/api/keys?page=abc falls back to page 1 (no NaN)", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    const res = await server.request("/admin/api/keys?page=abc", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { pagination: { page: number } }
+    expect(body.pagination.page).toBe(1)
+  })
+
+  test("Legacy GET /admin/legacy/keys/created?flash=<unknown> renders explicit error", async () => {
     const { sidCookie } = await loginAsAdmin()
     const res = await server.request(
-      "/admin/keys/created?flash=00000000-0000-0000-0000-000000000000",
+      "/admin/legacy/keys/created?flash=00000000-0000-0000-0000-000000000000",
       {
         method: "GET",
         headers: { Cookie: sidCookie },

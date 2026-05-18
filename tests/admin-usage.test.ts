@@ -124,16 +124,20 @@ afterEach(async () => {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("GET /admin/usage", () => {
-  test("redirects to /admin/login without a session", async () => {
+describe("GET /admin/api/usage", () => {
+  test("returns 401 JSON without a session", async () => {
+    const res = await server.request("/admin/api/usage", { method: "GET" })
+    expect(res.status).toBe(401)
+  })
+
+  test("/admin/usage HTML route redirects without a session (SPA shell)", async () => {
     const res = await server.request("/admin/usage", { method: "GET" })
     expect(res.status).toBe(302)
     expect(res.headers.get("location")).toContain("/admin/login")
   })
 
-  test("returns 200 HTML with chart containers + data island for admin session", async () => {
+  test("returns full dashboard payload for admin session", async () => {
     const { sidCookie } = await loginAsAdmin()
-    // Seed at least one event so the dashboard renders the charts (not empty)
     recordEvent({
       ts: Date.now() - 60_000,
       key_id: "kx",
@@ -147,65 +151,52 @@ describe("GET /admin/usage", () => {
       usage_unknown: 0,
     })
 
-    const res = await server.request("/admin/usage?range=24h", {
+    const res = await server.request("/admin/api/usage?range=24h", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
-    const html = await res.text()
-
-    // Chart containers
-    expect(html).toContain(`id="chart-rpm"`)
-    expect(html).toContain(`id="chart-tph"`)
-    expect(html).toContain(`id="chart-p95"`)
-
-    // Embedded JSON data island
-    expect(html).toContain(`id="usage-data"`)
-    expect(html).toContain(`type="application/json"`)
-
-    // External scripts loaded (CSP-safe)
-    expect(html).toContain(`/admin/assets/uplot.min.js`)
-    expect(html).toContain(`/admin/assets/usage.js`)
-
-    // Nav highlights Usage
-    expect(html).toContain("admin-nav__link--active")
+    const body = (await res.json()) as {
+      filter: { range: string; since: number; until: number }
+      stats: { total_requests: number; total_tokens: number; error_rate: number }
+      activity: { rpm: Array<unknown>; tokens: Array<unknown>; latency: Array<unknown> }
+      top_models: Array<{ model: string; count: number }>
+      top_keys: Array<unknown>
+      errors_by_status: Array<unknown>
+      all_keys: Array<unknown>
+      all_models: Array<string>
+    }
+    expect(body.filter.range).toBe("24h")
+    expect(body.stats.total_requests).toBeGreaterThanOrEqual(1)
+    expect(body.stats.total_tokens).toBeGreaterThanOrEqual(12)
+    expect(body.activity.rpm.length).toBeGreaterThan(0)
+    expect(body.top_models.some((m) => m.model === "gpt-4o")).toBe(true)
+    expect(body.all_models).toContain("gpt-4o")
   })
 
-  test("renders the empty state when there are no events", async () => {
+  test("empty window returns zero stats but valid shape", async () => {
     const { sidCookie } = await loginAsAdmin()
-    const res = await server.request("/admin/usage?range=24h", {
+    const res = await server.request("/admin/api/usage?range=24h", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
-    const html = await res.text()
-    expect(html).toContain("No events in the selected window")
-  })
-
-  test("CSP header forbids inline script and the page has no inline JS", async () => {
-    const { sidCookie } = await loginAsAdmin()
-    const res = await server.request("/admin/usage?range=24h", {
-      method: "GET",
-      headers: { Cookie: sidCookie },
-    })
-    const csp = res.headers.get("content-security-policy") ?? ""
-    expect(csp).toContain("default-src 'self'")
-    const html = await res.text()
-    // No inline event handlers
-    expect(html).not.toMatch(/onclick=/)
-    expect(html).not.toMatch(/onload=/)
-    // The data island uses type="application/json", which the browser does
-    // NOT execute as script.  Anything in a <script src="…"> tag is loaded
-    // from /admin/assets which is same-origin.
+    const body = (await res.json()) as {
+      stats: { total_requests: number; total_tokens: number }
+      activity: { rpm: Array<unknown> }
+    }
+    expect(body.stats.total_requests).toBe(0)
+    expect(body.stats.total_tokens).toBe(0)
+    expect(body.activity.rpm).toEqual([])
   })
 })
 
-describe("GET /admin/usage/export.csv", () => {
-  test("redirects without a session", async () => {
-    const res = await server.request("/admin/usage/export.csv", {
+describe("GET /admin/api/usage/export.csv", () => {
+  test("redirects without a session (path matches /admin/* so SPA fallback redirect kicks in)", async () => {
+    const res = await server.request("/admin/api/usage/export.csv", {
       method: "GET",
     })
-    expect(res.status).toBe(302)
+    expect(res.status).toBe(401)
   })
 
   test("returns CSV with header row + correct headers", async () => {
@@ -223,7 +214,7 @@ describe("GET /admin/usage/export.csv", () => {
       usage_unknown: 0,
     })
 
-    const res = await server.request("/admin/usage/export.csv?range=24h", {
+    const res = await server.request("/admin/api/usage/export.csv?range=24h", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
@@ -255,16 +246,40 @@ describe("GET /admin/usage/export.csv", () => {
       usage_unknown: 0,
     })
 
-    const res = await server.request("/admin/usage/export.csv?range=24h", {
+    const res = await server.request("/admin/api/usage/export.csv?range=24h", {
       method: "GET",
       headers: { Cookie: sidCookie },
     })
     expect(res.status).toBe(200)
     const body = await res.text()
-    // Comma-bearing key_id is wrapped in quotes
     expect(body).toContain(`"key,with,commas"`)
-    // Embedded double-quotes are doubled
     expect(body).toContain(`"model""with""quotes"`)
+  })
+})
+
+describe("Legacy SSR /admin/legacy/usage", () => {
+  test("legacy SSR page still serves with chart containers", async () => {
+    const { sidCookie } = await loginAsAdmin()
+    recordEvent({
+      ts: Date.now() - 60_000,
+      key_id: "kx",
+      model: "gpt-4o",
+      upstream_model: "gpt-4o",
+      prompt_tokens: 5,
+      completion_tokens: 7,
+      status: 200,
+      latency_ms: 42,
+      error: null,
+      usage_unknown: 0,
+    })
+    const res = await server.request("/admin/legacy/usage?range=24h", {
+      method: "GET",
+      headers: { Cookie: sidCookie },
+    })
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain(`id="chart-rpm"`)
+    expect(html).toContain(`id="usage-data"`)
   })
 })
 

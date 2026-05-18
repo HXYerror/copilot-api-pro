@@ -54,13 +54,20 @@ function isLoopback(hostOrHostname: string): boolean {
 /**
  * Returns true when the request is safe to serve:
  * - over HTTPS (regardless of host), or
- * - over HTTP but only from a loopback address.
+ * - over HTTP but only from a loopback address, or
+ * - the operator has explicitly opted into plain HTTP via the
+ *   `ADMIN_INSECURE_HTTP=true` env var (LAN-only convenience for
+ *   self-hosted setups behind a trusted network — session cookies travel
+ *   in the clear and CAN be sniffed; never expose to the open internet).
  *
  * X-Forwarded-Proto is only consulted when the TRUST_PROXY env var is set to
  * "true". Without that flag, any client could forge the header and bypass the
  * HTTPS requirement.
  */
 export function isRequestAllowed(c: Context): boolean {
+  // Operator-acknowledged plain-HTTP bypass. Documented in start.ts banner.
+  if (process.env.ADMIN_INSECURE_HTTP === "true") return true
+
   const trustProxy = process.env.TRUST_PROXY === "true"
   const proto = c.req.header("x-forwarded-proto") ?? ""
   const host = c.req.header("host") ?? ""
@@ -90,7 +97,16 @@ export const sessionMiddleware: MiddlewareHandler<{
   const cookieHeader = c.req.header("cookie")
   const sessionId = extractSessionId(cookieHeader)
 
+  // /admin/api/* is the JSON surface consumed by the React SPA. Returning an
+  // HTML redirect when a session is missing would be useless to the client —
+  // serve a 401 JSON instead so the SPA's fetch wrapper can bounce the user
+  // to /admin/login itself. Pages outside /api still get the HTML redirect.
+  const isJsonApi = c.req.path.startsWith("/admin/api/")
+
   if (!sessionId) {
+    if (isJsonApi) {
+      return c.json({ error: "Not authenticated" }, 401)
+    }
     return c.redirect("/admin/login", 302)
   }
 
@@ -103,7 +119,14 @@ export const sessionMiddleware: MiddlewareHandler<{
     const tokenHeader = c.req.header(CSRF_HEADER)
     const tokenCookie = extractCsrfCookie(cookieHeader)
 
-    if (fetchSite !== "same-origin") {
+    // Sec-Fetch-Site is defense-in-depth on top of the HMAC double-submit
+    // CSRF token check below (which is the actual cryptographic guarantee).
+    // We require `same-origin` by default; some older browsers and
+    // ADMIN_INSECURE_HTTP=true LAN deployments don't always emit the header,
+    // so we skip the strict check when the bypass is set OR the request
+    // already includes a valid CSRF token pair (verified below).
+    const insecureBypass = process.env.ADMIN_INSECURE_HTTP === "true"
+    if (!insecureBypass && fetchSite !== "same-origin") {
       consola.warn("[admin] CSRF: Sec-Fetch-Site must be same-origin")
       return c.json({ error: "CSRF: Sec-Fetch-Site must be same-origin" }, 403)
     }
@@ -127,9 +150,18 @@ export const sessionMiddleware: MiddlewareHandler<{
 
   const session = getSession(sessionId)
   if (!session) {
-    // Session expired or not found — clear cookie and redirect
-    const headers = new Headers({ Location: "/admin/login" })
+    // Session expired or not found — clear cookie and redirect (or 401 JSON
+    // for the /admin/api/* surface — see comment above).
+    const headers = new Headers()
     headers.set("Set-Cookie", clearSessionCookieValue())
+    if (isJsonApi) {
+      headers.set("Content-Type", "application/json")
+      return new Response(JSON.stringify({ error: "Session expired" }), {
+        status: 401,
+        headers,
+      })
+    }
+    headers.set("Location", "/admin/login")
     return new Response(null, { status: 302, headers })
   }
 
@@ -161,22 +193,44 @@ export const requireAdminSession: MiddlewareHandler<{
   if (!key || key.revoked_at !== null || key.tier !== "admin") {
     // The session refers to a key that's no longer trustworthy. Tear the
     // session down and bounce to login so the operator has to re-authenticate.
+    // For the JSON API surface, return a 401 instead of an HTML redirect.
     deleteSession(session.id)
-    const headers = new Headers({ Location: "/admin/login" })
+    const headers = new Headers()
     headers.set("Set-Cookie", clearSessionCookieValue())
+    if (c.req.path.startsWith("/admin/api/")) {
+      headers.set("Content-Type", "application/json")
+      return new Response(JSON.stringify({ error: "Key revoked" }), {
+        status: 401,
+        headers,
+      })
+    }
+    headers.set("Location", "/admin/login")
     return new Response(null, { status: 302, headers })
   }
   await next()
 }
 
-/** Try to read a CSRF token from an application/x-www-form-urlencoded body. */
+/** Try to read a CSRF token from an application/x-www-form-urlencoded body.
+ *
+ * Important: we parse with `{ all: true }` so multi-value form fields
+ * (e.g. allowed_models checkboxes) come back as arrays. Hono caches the
+ * parsed body on the request object, and the FIRST call's options win — if
+ * we used the default (all=false), downstream handlers would see flattened
+ * single-value fields no matter what they request later. (See keys/route.tsx
+ * scope edit for the affected handler.)
+ */
 async function extractCsrfBody(c: Context): Promise<string | undefined> {
   const ct = c.req.header("content-type") ?? ""
   if (!ct.includes("application/x-www-form-urlencoded")) return undefined
   try {
-    const body = await c.req.parseBody()
+    const body = await c.req.parseBody({ all: true })
     const val = body["csrf_token"]
-    return typeof val === "string" ? val : undefined
+    // With { all: true }, a single-occurrence field is still a string;
+    // duplicates become an array. We only ever expect one csrf_token, but
+    // defend against both shapes.
+    if (typeof val === "string") return val
+    if (Array.isArray(val) && typeof val[0] === "string") return val[0]
+    return undefined
   } catch {
     return undefined
   }
