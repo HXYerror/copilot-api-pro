@@ -17,7 +17,8 @@
   "author": "Erick Christian <erickchristian48@gmail.com> (upstream), HXYerror (fork)",
   "type": "module",
   "bin": {
-    "copilot-api-pro": "./dist/main.js"
+    "copilot-api-pro": "./dist/main.js",
+    "copilot-api": "./dist/main.js"
   },
   "files": [
     "dist",
@@ -26,14 +27,15 @@
   "scripts": {
     "build": "bun run build:server && bun run build:ui",
     "build:server": "tsdown",
-    "build:ui": "bun run --cwd ui build",
+    "build:ui": "bun --cwd ui install && bun run --cwd ui build",
     "dev": "bun run --watch ./src/main.ts",
     "dev:ui": "bun run --cwd ui dev",
     "knip": "knip-bun",
     "lint": "eslint --cache",
     "lint:all": "eslint --cache .",
     "prepack": "bun run build",
-    "prepare": "simple-git-hooks",
+    "prepare": "([ -d .git ] && bun run --silent prepare:dev) || bun run --silent build",
+    "prepare:dev": "simple-git-hooks",
     "release": "bumpp && bun publish --access public",
     "start": "NODE_ENV=production bun run ./src/main.ts",
     "typecheck": "tsc"
