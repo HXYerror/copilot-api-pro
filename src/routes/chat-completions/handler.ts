@@ -108,6 +108,19 @@ export async function handleCompletion(
   // (set by src/middleware/trace.ts). undefined when no debug → no overhead.
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
     .trace_capture_upstream
+
+  // Per-alias default effort: inject when client didn't supply reasoning_effort.
+  // OpenAI chat-completions only accepts low/medium/high — collapse "xhigh"
+  // down to "high" for this endpoint.
+  const aliasDefault = models[clientAlias]?.default_effort
+  if (!payload.reasoning_effort && aliasDefault && aliasDefault !== "") {
+    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    consola.debug(
+      `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias})`,
+    )
+    payload = { ...payload, reasoning_effort: e }
+  }
+
   const response = await createChatCompletions(payload, onUpstream)
 
   if (isNonStreaming(response)) {

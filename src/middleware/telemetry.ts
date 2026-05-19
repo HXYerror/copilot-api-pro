@@ -149,27 +149,21 @@ async function snapshotPostMeta(
         const m = MODEL_FIELD_RE.exec(buf)
         if (m && m[1]) modelMatch = m[1]
       }
-      // Early-exit once we've grabbed the model AND seen either a thinking
-      // / reasoning / output_config field (or scanned enough that they
-      // would have been near the top).
-      if (
-        modelMatch
-        && (buf.includes('"thinking"')
-          || buf.includes('"reasoning"')
-          || buf.includes('"output_config"')
-          || totalBytes >= 4096)
-      ) {
-        break
+    }
+    // IMPORTANT: drain the rest of the cloned stream silently. We've
+    // already scanned what we want (or hit the cap), but if we stop
+    // reading here while the original is also being read by the handler,
+    // Bun's request.clone() tee-buffer blocks the source — handler's
+    // c.req.json() then hangs forever waiting for body bytes that the
+    // tee is buffering. Reading to EOF on the clone releases backpressure.
+    if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) {
+      while (true) {
+        const r = (await reader.read()) as { done: boolean }
+        if (r.done) break
       }
     }
   } catch {
     // unreadable — fall through
-  } finally {
-    try {
-      await reader.cancel()
-    } catch {
-      // already closed
-    }
   }
   if (!modelMatch) {
     const final = MODEL_FIELD_RE.exec(buf)

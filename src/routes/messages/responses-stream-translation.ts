@@ -115,6 +115,8 @@ interface FunctionCallArgsDeltaData {
 
 interface ResponseCompletedData {
   response?: {
+    id?: string
+    model?: string
     status?: string
     usage?: { input_tokens?: number; output_tokens?: number }
   }
@@ -167,8 +169,14 @@ export function translateResponsesEventToAnthropic(
 
   state.eventCount++
 
-  // Emit a ping every PING_INTERVAL events
-  if (state.eventCount % PING_INTERVAL === 0) {
+  // Emit a ping every PING_INTERVAL events, BUT only after message_start has
+  // fired. Anthropic's protocol mandates `message_start` as the FIRST event of
+  // a stream; sending `ping` before it makes strict client SDKs (including the
+  // official Anthropic SDK and Claude Code's reader) reject the whole stream
+  // with an "unexpected event before message_start" assertion. This can happen
+  // when the upstream emits ≥20 ignored events (e.g. response.in_progress
+  // bursts) before the first response.created.
+  if (state.messageStartSent && state.eventCount % PING_INTERVAL === 0) {
     events.push({ type: "ping" })
   }
 
@@ -305,8 +313,14 @@ export function translateResponsesEventToAnthropic(
           })
         }
         events.push({ type: "content_block_stop", index: blockIndex })
+        // De-register this block — response.completed's orphan-block sweep
+        // walks `outputIndexToBlockIndex` and would re-emit stop otherwise.
+        state.outputIndexToBlockIndex.delete(outputIndex)
+        state.reasoningOutputIndexes.delete(outputIndex)
       } else if (state.functionCallOutputIndexes.has(outputIndex)) {
         events.push({ type: "content_block_stop", index: blockIndex })
+        state.outputIndexToBlockIndex.delete(outputIndex)
+        state.functionCallOutputIndexes.delete(outputIndex)
       }
       // message items: content_block_stop is emitted by response.content_part.done
       break
@@ -346,6 +360,9 @@ export function translateResponsesEventToAnthropic(
         && !state.functionCallOutputIndexes.has(outputIndex)
       ) {
         events.push({ type: "content_block_stop", index: blockIndex })
+        // De-register so the response.completed orphan sweep doesn't
+        // emit a second stop for this same block.
+        state.outputIndexToBlockIndex.delete(outputIndex)
       }
       break
     }
@@ -377,6 +394,39 @@ export function translateResponsesEventToAnthropic(
 
     case "response.completed": {
       const d = data as ResponseCompletedData | null | undefined
+      // Defensive: if the upstream cuts straight to response.completed (or
+      // response.failed) without firing response.created first, our state
+      // never set messageStartSent. Anthropic requires message_start as the
+      // first event — emit a minimal one so the rest of the trailer is
+      // protocol-valid. Same defence for response.failed below.
+      if (!state.messageStartSent) {
+        state.messageId = d?.response?.id ?? `msg_fallback_${Date.now()}`
+        state.messageModel = d?.response?.model ?? ""
+        events.push({
+          type: "message_start",
+          message: {
+            id: state.messageId,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model: state.messageModel,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        })
+        state.messageStartSent = true
+      }
+      // Close any content blocks the upstream forgot to terminate — without
+      // this the Anthropic protocol is invalid and clients reject the whole
+      // response. Iterate registered block indexes (not 0..N) so we only
+      // emit stop for blocks we actually opened.
+      for (const blockIndex of state.outputIndexToBlockIndex.values()) {
+        events.push({ type: "content_block_stop", index: blockIndex })
+      }
+      state.outputIndexToBlockIndex.clear()
+      state.reasoningOutputIndexes.clear()
+      state.functionCallOutputIndexes.clear()
       events.push(
         {
           type: "message_delta",
@@ -400,10 +450,46 @@ export function translateResponsesEventToAnthropic(
       const d = data as ResponseFailedData | null | undefined
       const message =
         d?.response?.error?.message ?? "Upstream model call failed"
-      events.push({
-        type: "error",
-        error: { type: "api_error", message },
-      })
+      // Same defence as response.completed: emit a synthetic message_start
+      // if none has fired, close any still-open blocks, then surface the
+      // error AND a terminating message_stop so the Anthropic stream
+      // protocol stays valid (otherwise Claude Code stalls until its
+      // keep-alive expires).
+      if (!state.messageStartSent) {
+        state.messageId = `msg_fallback_${Date.now()}`
+        events.push({
+          type: "message_start",
+          message: {
+            id: state.messageId,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model: "",
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        })
+        state.messageStartSent = true
+      }
+      for (const blockIndex of state.outputIndexToBlockIndex.values()) {
+        events.push({ type: "content_block_stop", index: blockIndex })
+      }
+      state.outputIndexToBlockIndex.clear()
+      state.reasoningOutputIndexes.clear()
+      state.functionCallOutputIndexes.clear()
+      events.push(
+        {
+          type: "error",
+          error: { type: "api_error", message },
+        },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+        { type: "message_stop" },
+      )
       break
     }
 

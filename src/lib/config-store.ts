@@ -29,6 +29,22 @@ const ModelEntrySchema = z.object({
     ),
   enabled: z.boolean().default(true),
   allowed_keys: z.array(z.string()).default(["*"]),
+  /**
+   * Optional thinking-effort default for this alias. When the client request
+   * does NOT include any thinking signal (no `thinking` field, no
+   * `output_config.effort`, no `reasoning_effort`, no `reasoning.effort`),
+   * the proxy injects this effort before forwarding upstream.
+   *
+   * Values:
+   *   - `"low"` / `"medium"` / `"high"` / `"xhigh"` — inject as-is (subject
+   *     to clampEffortForModel so a model variant with restricted effort
+   *     list still gets a valid value)
+   *   - `""` (default) — don't inject; respect client's absence
+   *
+   * Never overrides what the client explicitly sent — purely a fill-in.
+   * See HANDOFF.md §5.7 for the thinking protocol details.
+   */
+  default_effort: z.enum(["low", "medium", "high", "xhigh", ""]).default(""),
 })
 
 const RetentionSchema = z.object({

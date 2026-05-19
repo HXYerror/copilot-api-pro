@@ -6,8 +6,10 @@ import { streamSSE } from "hono/streaming"
 import type { TelemetryVar } from "~/middleware/telemetry"
 
 import { awaitApproval } from "~/lib/approval"
+import { getConfig } from "~/lib/config-store"
 import { readCopilotUsage } from "~/lib/copilot-usage"
 import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
+import { forwardError } from "~/lib/error"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -102,15 +104,15 @@ export async function handleCompletion(
   // Route to native Anthropic pass-through for Claude models to preserve
   // thinking blocks (with signature), top_k, cache_control, and richer usage.
   if (isNativeAnthropicModel(payload.model)) {
-    return handleNative(c, payload)
+    return handleNative(c, payload, clientAlias)
   }
 
   // Route Responses-only models (codex, o-pro variants) via the Responses API.
   if (getModelMode(payload.model) === "responses") {
-    return handleAnthropicViaResponses(c, payload)
+    return handleAnthropicViaResponses(c, payload, clientAlias)
   }
 
-  return handleTranslated(c, payload)
+  return handleTranslated(c, payload, clientAlias)
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,7 @@ export async function handleCompletion(
 async function handleNative(
   c: Context<{ Variables: TelemetryVar }>,
   payload: AnthropicMessagesPayload,
+  clientAlias: string,
 ): Promise<Response> {
   consola.debug("Using native Anthropic pass-through for", payload.model)
 
@@ -131,7 +134,16 @@ async function handleNative(
   // reach Copilot. Without this, Claude Code's effort:"xhigh" is silently
   // ignored and the model never thinks.
   const clientBeta = c.req.header("anthropic-beta")
-  const response = await createMessagesNative(payload, onUpstream, clientBeta)
+  // Per-alias default effort (Step 2 of D-014 follow-up): when config has
+  // `models[clientAlias].default_effort` set AND the client didn't ask for
+  // thinking, inject adaptive + effort. See `buildUpstreamPayload`.
+  const defaultEffort = getConfig().models[clientAlias]?.default_effort
+  const response = await createMessagesNative(
+    payload,
+    onUpstream,
+    clientBeta,
+    defaultEffort,
+  )
 
   if (!payload.stream) {
     // Non-streaming: upstream already returned a complete Anthropic response
@@ -148,40 +160,88 @@ async function handleNative(
 
   // Streaming: proxy the SSE events directly to the client
   consola.debug("Native streaming response — proxying SSE events")
-  return streamSSE(c, async (stream) => {
-    // Anthropic streaming telemetry state — input_tokens from message_start,
-    // latest output_tokens from message_delta. We update c.var.usage on every
-    // event so the middleware's finally sees the freshest values.
-    let inputTokens: number | undefined
-    let outputTokens: number | undefined
-
-    for await (const rawEvent of response as AsyncIterable<{
-      data?: string
-      event?: string
-    }>) {
-      if (!rawEvent.data) continue
-
-      // Forward verbatim — never block on parse failure
-      await stream.writeSSE({
-        event: rawEvent.event,
-        data: rawEvent.data,
-      })
+  return streamSSE(
+    c,
+    async (stream) => {
+      // Anthropic streaming telemetry state — input_tokens from message_start,
+      // latest output_tokens from message_delta. We update c.var.usage on every
+      // event so the middleware's finally sees the freshest values.
+      let inputTokens: number | undefined
+      let outputTokens: number | undefined
 
       try {
-        const parsed = JSON.parse(rawEvent.data) as AnthropicStreamEventData
-        consola.debug("Native SSE event:", parsed.type)
-        ;[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [
-          inputTokens,
-          outputTokens,
-        ])
-      } catch {
-        consola.warn(
-          "Could not parse native SSE chunk for logging:",
-          rawEvent.data.slice(0, 200),
-        )
+        for await (const rawEvent of response as AsyncIterable<{
+          data?: string
+          event?: string
+        }>) {
+          if (!rawEvent.data) continue
+
+          // Forward verbatim — never block on parse failure
+          await stream.writeSSE({
+            event: rawEvent.event,
+            data: rawEvent.data,
+          })
+
+          try {
+            const parsed = JSON.parse(
+              rawEvent.data,
+            ) as AnthropicStreamEventData
+            consola.debug("Native SSE event:", parsed.type)
+            ;[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [
+              inputTokens,
+              outputTokens,
+            ])
+          } catch {
+            consola.warn(
+              "Could not parse native SSE chunk for logging:",
+              rawEvent.data.slice(0, 200),
+            )
+          }
+        }
+      } catch (err) {
+        // Upstream stream died (TCP reset, 5xx after some events, parse
+        // failure inside events() helper). Anthropic clients expect an
+        // `error` event followed by `message_stop` — never a silent close —
+        // otherwise Claude Code stalls until its keep-alive timeout. Don't
+        // leak err.stack to the wire; the cause goes to consola.
+        consola.error("Native Anthropic SSE iteration failed:", err)
+        try {
+          await stream.writeSSE({
+            event: "error",
+            data: JSON.stringify({
+              type: "error",
+              error: {
+                type: "api_error",
+                message: "Upstream stream interrupted",
+              },
+            }),
+          })
+          await stream.writeSSE({
+            event: "message_stop",
+            data: JSON.stringify({ type: "message_stop" }),
+          })
+        } catch {
+          // Client connection is already gone — nothing more to do.
+        }
       }
-    }
-  })
+    },
+    async (err, stream) => {
+      // Outer onError: writeSSE itself failed (downstream disconnect). Log
+      // detail to consola, return a fixed message to the client.
+      consola.error("Native Anthropic SSE outer error:", err)
+      try {
+        await stream.writeSSE({
+          event: "error",
+          data: JSON.stringify({
+            type: "error",
+            error: { type: "api_error", message: "Stream write failed" },
+          }),
+        })
+      } catch {
+        // Connection already gone.
+      }
+    },
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -191,14 +251,16 @@ async function handleNative(
 async function handleAnthropicViaResponses(
   c: Context<{ Variables: TelemetryVar }>,
   payload: AnthropicMessagesPayload,
+  clientAlias: string,
 ): Promise<Response> {
   consola.debug("Routing /v1/messages via Responses API for", payload.model)
+  const defaultEffort = getConfig().models[clientAlias]?.default_effort
 
   if (payload.stream) {
-    return streamResponsesAsAnthropic(c, payload)
+    return streamResponsesAsAnthropic(c, payload, defaultEffort)
   }
 
-  const responsesPayload = translateAnthropicToResponses(payload)
+  const responsesPayload = translateAnthropicToResponses(payload, defaultEffort)
   const onUpstreamRes = (
     c.var as { trace_capture_upstream?: UpstreamCaptureFn }
   ).trace_capture_upstream
@@ -231,15 +293,34 @@ async function handleAnthropicViaResponses(
 
   const typedResponse = rawResponse
 
-  // Surface upstream terminal failures as errors instead of 200 OK
-  if (typedResponse.status === "failed") {
+  // Surface upstream terminal failures as errors instead of 200 OK.
+  // Anthropic clients (Claude Code in particular) hard-require a non-null
+  // `stop_reason` on the response — any status that isn't "completed" or
+  // "incomplete" cannot satisfy that. We treat the rest as upstream errors
+  // and surface 502 with the upstream's own message when available. Statuses
+  // we've seen in the wild that fall through:
+  //   - "failed"     — model errored, error.message describes why
+  //   - "cancelled"  — request aborted upstream (timeout / control plane)
+  //   - "in_progress" — upstream returned a "still working" snapshot,
+  //                     never legal for a non-stream call
+  if (
+    typedResponse.status !== "completed"
+    && typedResponse.status !== "incomplete"
+  ) {
     const errMsg =
       (typedResponse as unknown as { error?: { message?: string } }).error
-        ?.message ?? "Upstream model call failed"
-    consola.error("Responses API returned failed status:", errMsg)
+        ?.message ?? `Upstream returned status="${typedResponse.status}"`
+    consola.error(
+      `Responses API non-terminal status (status=${typedResponse.status}):`,
+      errMsg,
+    )
+    // 502 for transport-level non-terminal; 500 only when it's an explicit
+    // model failure (matches how the rest of the stack surfaces upstream
+    // errors).
+    const httpStatus = typedResponse.status === "failed" ? 500 : 502
     return c.json(
       { error: { message: errMsg, type: "api_error", code: "model_error" } },
-      500,
+      httpStatus,
     )
   }
 
@@ -264,6 +345,7 @@ async function handleAnthropicViaResponses(
 async function handleTranslated(
   c: Context<{ Variables: TelemetryVar }>,
   anthropicPayload: AnthropicMessagesPayload,
+  clientAlias: string,
 ): Promise<Response> {
   const openAIPayload = translateToOpenAI(anthropicPayload)
   consola.debug(
@@ -271,9 +353,26 @@ async function handleTranslated(
     JSON.stringify(openAIPayload),
   )
 
+  // Per-alias default effort: inject reasoning_effort onto the translated
+  // chat-completions payload when the client sent no thinking signal and
+  // the alias config provides a default. Chat-completions only accepts
+  // low/medium/high — collapse "xhigh" down to "high".
+  // (Mirrors the same logic in routes/chat-completions/handler.ts so a
+  // request that comes in via /v1/messages on a non-Claude alias still
+  // honours the configured default.)
+  const aliasDefault = getConfig().models[clientAlias]?.default_effort
+  let finalPayload = openAIPayload
+  if (!openAIPayload.reasoning_effort && aliasDefault && aliasDefault !== "") {
+    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    consola.debug(
+      `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias}, translated path)`,
+    )
+    finalPayload = { ...openAIPayload, reasoning_effort: e }
+  }
+
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
     .trace_capture_upstream
-  const response = await createChatCompletions(openAIPayload, onUpstream)
+  const response = await createChatCompletions(finalPayload, onUpstream)
 
   if (isNonStreaming(response)) {
     consola.debug(
@@ -294,43 +393,111 @@ async function handleTranslated(
   }
 
   consola.debug("Streaming response from Copilot")
-  return streamSSE(c, async (stream) => {
-    const streamState: AnthropicStreamState = {
-      messageStartSent: false,
-      contentBlockIndex: 0,
-      contentBlockOpen: false,
-      toolCalls: {},
-    }
-
-    for await (const rawEvent of response) {
-      consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
-      if (rawEvent.data === "[DONE]") {
-        break
+  return streamSSE(
+    c,
+    async (stream) => {
+      const streamState: AnthropicStreamState = {
+        messageStartSent: false,
+        contentBlockIndex: 0,
+        contentBlockOpen: false,
+        toolCalls: {},
       }
 
-      if (!rawEvent.data) {
-        continue
-      }
+      try {
+        for await (const rawEvent of response) {
+          consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
+          if (rawEvent.data === "[DONE]") {
+            break
+          }
 
-      const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
-      // Telemetry: read copilot_usage off the OpenAI chunk before we
-      // translate it into Anthropic events (which drops the field). The
-      // helper handles both copilot_usage and native usage shapes.
-      const u = readCopilotUsage(chunk)
-      if (u.prompt_tokens !== undefined || u.completion_tokens !== undefined) {
-        c.set("usage", u)
-      }
-      const events = translateChunkToAnthropicEvents(chunk, streamState)
+          if (!rawEvent.data) {
+            continue
+          }
 
-      for (const event of events) {
-        consola.debug("Translated Anthropic event:", JSON.stringify(event))
+          // Defensive JSON.parse: Copilot occasionally emits half-buffered or
+          // non-JSON chunks (HTML 5xx body during incidents). Throwing would
+          // break the whole stream + leave the client hanging, so we log and
+          // skip this chunk only.
+          let chunk: ChatCompletionChunk
+          try {
+            chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+          } catch (parseErr) {
+            consola.warn(
+              `[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`,
+              rawEvent.data.slice(0, 200),
+            )
+            continue
+          }
+
+          // Telemetry: read copilot_usage off the OpenAI chunk before we
+          // translate it into Anthropic events (which drops the field). The
+          // helper handles both copilot_usage and native usage shapes.
+          const u = readCopilotUsage(chunk)
+          if (
+            u.prompt_tokens !== undefined
+            || u.completion_tokens !== undefined
+          ) {
+            c.set("usage", u)
+          }
+          const events = translateChunkToAnthropicEvents(chunk, streamState)
+
+          for (const event of events) {
+            consola.debug("Translated Anthropic event:", JSON.stringify(event))
+            await stream.writeSSE({
+              event: event.type,
+              data: JSON.stringify(event),
+            })
+          }
+        }
+      } catch (err) {
+        // Upstream iterator threw (TCP reset, events() helper error, etc.).
+        // Anthropic clients hang on silent closes — emit error + message_stop
+        // and close any open content block first so the protocol stays valid.
+        consola.error("Translated /v1/messages SSE iteration failed:", err)
+        try {
+          if (streamState.contentBlockOpen) {
+            await stream.writeSSE({
+              event: "content_block_stop",
+              data: JSON.stringify({
+                type: "content_block_stop",
+                index: streamState.contentBlockIndex,
+              }),
+            })
+          }
+          await stream.writeSSE({
+            event: "error",
+            data: JSON.stringify({
+              type: "error",
+              error: {
+                type: "api_error",
+                message: "Upstream stream interrupted",
+              },
+            }),
+          })
+          await stream.writeSSE({
+            event: "message_stop",
+            data: JSON.stringify({ type: "message_stop" }),
+          })
+        } catch {
+          // Client already disconnected.
+        }
+      }
+    },
+    async (err, stream) => {
+      consola.error("Translated /v1/messages SSE outer error:", err)
+      try {
         await stream.writeSSE({
-          event: event.type,
-          data: JSON.stringify(event),
+          event: "error",
+          data: JSON.stringify({
+            type: "error",
+            error: { type: "api_error", message: "Stream write failed" },
+          }),
         })
+      } catch {
+        // Connection already gone.
       }
-    }
-  })
+    },
+  )
 }
 
 const isNonStreaming = (
@@ -346,75 +513,133 @@ const isNonStreaming = (
 function streamResponsesAsAnthropic(
   c: Context<{ Variables: TelemetryVar }>,
   payload: AnthropicMessagesPayload,
-): Response {
-  const responsesPayload = translateAnthropicToResponses(payload)
+  defaultEffort?: string,
+): Response | Promise<Response> {
+  const responsesPayload = translateAnthropicToResponses(payload, defaultEffort)
   const onUpstreamStream = (
     c.var as { trace_capture_upstream?: UpstreamCaptureFn }
   ).trace_capture_upstream
-  return streamSSE(c, async (stream) => {
-    const rawResponse = await createResponses(
-      {
-        ...responsesPayload,
-        stream: true,
-      },
-      onUpstreamStream,
-    )
-    const streamState = makeResponsesStreamState()
-    let inputTokens: number | undefined
-    let outputTokens: number | undefined
 
-    try {
-      for await (const rawEvent of rawResponse as AsyncIterable<{
-        data?: string
-        event?: string
-      }>) {
-        const eventType = rawEvent.event ?? ""
+  // Kick off the upstream call BEFORE we open the SSE response. If
+  // createResponses throws (auth failure, upstream 4xx/5xx, network down),
+  // we still hold a raw Response and can return a proper 4xx/5xx via
+  // forwardError — once streamSSE opens the response we've already flushed
+  // `200 OK + content-type: text/event-stream` and can only smuggle the
+  // error inside the SSE body, which most clients don't parse as a
+  // request-level failure. This mirrors the synchronous-first pattern
+  // used in handleAnthropicViaResponses non-stream branch.
+  const upstreamPromise = createResponses(
+    { ...responsesPayload, stream: true },
+    onUpstreamStream,
+  ).catch((err: unknown) => err)
 
-        let parsedData: unknown = undefined
-        if (rawEvent.data) {
-          try {
-            parsedData = JSON.parse(rawEvent.data)
-          } catch {
-            consola.warn(
-              "Could not parse Responses SSE chunk:",
-              rawEvent.data.slice(0, 200),
+  return (async (): Promise<Response> => {
+    const settled = await upstreamPromise
+    if (settled instanceof Error) {
+      // createResponses failed before producing any iterable — surface as a
+      // normal HTTP error rather than a fake 200 SSE.
+      consola.error("Responses upstream call failed pre-stream:", settled)
+      return forwardError(c, settled)
+    }
+    const rawResponse = settled
+
+    return streamSSE(
+      c,
+      async (stream) => {
+        const streamState = makeResponsesStreamState()
+        let inputTokens: number | undefined
+        let outputTokens: number | undefined
+
+        try {
+          for await (const rawEvent of rawResponse as AsyncIterable<{
+            data?: string
+            event?: string
+          }>) {
+            const eventType = rawEvent.event ?? ""
+
+            let parsedData: unknown = undefined
+            if (rawEvent.data) {
+              try {
+                parsedData = JSON.parse(rawEvent.data)
+              } catch {
+                consola.warn(
+                  "Could not parse Responses SSE chunk:",
+                  rawEvent.data.slice(0, 200),
+                )
+              }
+            }
+
+            consola.debug("Responses SSE event:", eventType)
+
+            const anthropicEvents = translateResponsesEventToAnthropic(
+              eventType,
+              parsedData,
+              streamState,
             )
+
+            for (const event of anthropicEvents) {
+              consola.debug(
+                "Translated Responses→Anthropic event:",
+                event.type,
+              )
+              ;[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [
+                inputTokens,
+                outputTokens,
+              ])
+              await stream.writeSSE({
+                event: event.type,
+                data: JSON.stringify(event),
+              })
+            }
+          }
+        } catch (err) {
+          consola.error("Error during Responses API streaming:", err)
+          try {
+            // Close any open blocks before the terminal error so the
+            // Anthropic protocol stays valid (clients reject a stream
+            // ending with an orphan content_block_start).
+            for (const blockIndex of streamState.outputIndexToBlockIndex.values()) {
+              await stream.writeSSE({
+                event: "content_block_stop",
+                data: JSON.stringify({
+                  type: "content_block_stop",
+                  index: blockIndex,
+                }),
+              })
+            }
+            await stream.writeSSE({
+              event: "error",
+              data: JSON.stringify({
+                type: "error",
+                error: {
+                  type: "api_error",
+                  message: "Upstream stream interrupted",
+                },
+              }),
+            })
+            await stream.writeSSE({
+              event: "message_stop",
+              data: JSON.stringify({ type: "message_stop" }),
+            })
+          } catch {
+            // Client already disconnected.
           }
         }
-
-        consola.debug("Responses SSE event:", eventType)
-
-        const anthropicEvents = translateResponsesEventToAnthropic(
-          eventType,
-          parsedData,
-          streamState,
-        )
-
-        for (const event of anthropicEvents) {
-          consola.debug("Translated Responses→Anthropic event:", event.type)
-          ;[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [
-            inputTokens,
-            outputTokens,
-          ])
+      },
+      async (err, stream) => {
+        consola.error("Responses→Anthropic SSE outer error:", err)
+        try {
           await stream.writeSSE({
-            event: event.type,
-            data: JSON.stringify(event),
+            event: "error",
+            data: JSON.stringify({
+              type: "error",
+              error: { type: "api_error", message: "Stream write failed" },
+            }),
           })
+        } catch {
+          // Connection already gone.
         }
-      }
-    } catch (err) {
-      consola.error("Error during Responses API streaming:", err)
-      const errorEvent: AnthropicStreamEventData = {
-        type: "error",
-        error: {
-          type: "api_error",
-          message: "An unexpected error occurred during streaming.",
-        },
-      }
-      await stream.writeSSE({
-        event: errorEvent.type,
-        data: JSON.stringify(errorEvent),
-      })
-    }
-  })
+      },
+    )
+  })()
 }

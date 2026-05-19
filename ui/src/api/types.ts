@@ -446,7 +446,17 @@ export interface AppConfig {
   version: number
   models: Record<
     string,
-    { upstream: string; enabled: boolean; allowed_keys: Array<string> }
+    {
+      upstream: string
+      enabled: boolean
+      allowed_keys: Array<string>
+      /**
+       * Default reasoning effort for this alias. When the client request
+       * doesn't carry any thinking/reasoning signal, the proxy injects this
+       * value before forwarding upstream. Empty string = no default.
+       */
+      default_effort?: "" | "low" | "medium" | "high" | "xhigh"
+    }
   >
   retention: {
     events_days: number

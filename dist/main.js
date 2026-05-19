@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { PATHS, closeDb, configPath, countActiveAdminKeys, countActiveDebugKeys, createKey, ensurePaths, findKeyByHash, findKeyById, getDb, initDb, isDebugActive, listKeys, revokeKey, setDebugEnabled, tracesDir, updateKeyScope } from "./keys-BhIa1qQ3.js";
+import { PATHS, closeDb, configPath, countActiveAdminKeys, countActiveDebugKeys, createKey, ensurePaths, findKeyByHash, findKeyById, getDb, initDb, isDebugActive, listKeys, revokeKey, setDebugEnabled, tracesDir, updateKeyScope } from "./keys-BntVlM1P.js";
 import { defineCommand, runMain } from "citty";
 import consola, { consola as consola$1 } from "consola";
 import fs from "node:fs/promises";
@@ -327,23 +327,38 @@ async function pollAccessToken(deviceCode) {
 //#region src/lib/token.ts
 const readGithubToken = () => fs.readFile(PATHS.GITHUB_TOKEN_PATH, "utf8");
 const writeGithubToken = (token) => fs.writeFile(PATHS.GITHUB_TOKEN_PATH, token);
+/**
+* Handle for the Copilot-token refresh timer. Stored module-level so the
+* shutdown hook in start.ts can stop it cleanly, AND so a re-entry into
+* setupCopilotToken (e.g. from tests) doesn't leak a previous interval.
+*/
+let copilotTokenRefreshTimer;
+/** Cancel handle for stopCopilotTokenRefresh(). */
+function stopCopilotTokenRefresh() {
+	if (copilotTokenRefreshTimer !== void 0) {
+		clearInterval(copilotTokenRefreshTimer);
+		copilotTokenRefreshTimer = void 0;
+	}
+}
 const setupCopilotToken = async () => {
 	const { token, refresh_in } = await getCopilotToken();
 	state.copilotToken = token;
 	consola.debug("GitHub Copilot Token fetched successfully!");
 	if (state.showToken) consola.info("Copilot token:", token);
+	stopCopilotTokenRefresh();
 	const refreshInterval = (refresh_in - 60) * 1e3;
-	setInterval(async () => {
+	copilotTokenRefreshTimer = setInterval(() => {
 		consola.debug("Refreshing Copilot token");
-		try {
-			const { token: token$1 } = await getCopilotToken();
-			state.copilotToken = token$1;
-			consola.debug("Copilot token refreshed");
-			if (state.showToken) consola.info("Refreshed Copilot token:", token$1);
-		} catch (error) {
-			consola.error("Failed to refresh Copilot token:", error);
-			throw error;
-		}
+		(async () => {
+			try {
+				const { token: refreshed } = await getCopilotToken();
+				state.copilotToken = refreshed;
+				consola.debug("Copilot token refreshed");
+				if (state.showToken) consola.info("Refreshed Copilot token:", refreshed);
+			} catch (error) {
+				consola.error("Failed to refresh Copilot token (continuing with existing token until next attempt):", error);
+			}
+		})();
 	}, refreshInterval);
 };
 async function setupGitHubToken(options) {
@@ -465,7 +480,14 @@ const checkUsage = defineCommand({
 const ModelEntrySchema = z.object({
 	upstream: z.string().regex(/^\w[\w.:-]*$/, "upstream must be a model ID (e.g. 'gpt-4o'), not a URL"),
 	enabled: z.boolean().default(true),
-	allowed_keys: z.array(z.string()).default(["*"])
+	allowed_keys: z.array(z.string()).default(["*"]),
+	default_effort: z.enum([
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		""
+	]).default("")
 });
 const RetentionSchema = z.object({
 	events_days: z.number().int().min(0).default(90),
@@ -4149,7 +4171,7 @@ const sessionMiddleware = async (c, next) => {
 */
 const requireAdminSession = async (c, next) => {
 	const session = c.get("session");
-	const { findKeyById: findKeyById$1 } = await import("./keys-DgrrfSvA.js");
+	const { findKeyById: findKeyById$1 } = await import("./keys-BipyZOMr.js");
 	const key = findKeyById$1(session.key_id);
 	if (!key || key.revoked_at !== null || key.tier !== "admin") {
 		deleteSession(session.id);
@@ -5524,13 +5546,11 @@ async function snapshotPostMeta(reqClone) {
 				const m = MODEL_FIELD_RE.exec(buf);
 				if (m && m[1]) modelMatch = m[1];
 			}
-			if (modelMatch && (buf.includes("\"thinking\"") || buf.includes("\"reasoning\"") || buf.includes("\"output_config\"") || totalBytes >= 4096)) break;
 		}
-	} catch {} finally {
-		try {
-			await reader.cancel();
-		} catch {}
-	}
+		if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) {
+			while (true) if ((await reader.read()).done) break;
+		}
+	} catch {}
 	if (!modelMatch) {
 		const final = MODEL_FIELD_RE.exec(buf);
 		if (final && final[1]) modelMatch = final[1];
@@ -5920,15 +5940,12 @@ async function readBodyCapped(body) {
 			buf += decoder.decode(value, { stream: true });
 			totalBytes += value.byteLength;
 		}
-		if (!truncated) {
-			if (!(await reader.read()).done) truncated = true;
+		if (totalBytes >= MAX_BODY_BYTES) {
+			truncated = true;
+			while (true) if ((await reader.read()).done) break;
 		}
 	} catch (err) {
 		consola.debug(`[trace] body read failed: ${String(err)}`);
-	} finally {
-		try {
-			await reader.cancel();
-		} catch {}
 	}
 	return truncated ? `${buf}[TRUNCATED]` : buf;
 }
@@ -6034,9 +6051,11 @@ const traceMiddleware = async (c, next) => {
 	const key = c.get("key");
 	let upstreamReq;
 	let upstreamRes;
+	let upstreamResPending;
 	const capture = (cap) => {
 		upstreamReq = cap.req;
 		if (cap.res) upstreamRes = cap.res;
+		if (cap.res_pending) upstreamResPending = cap.res_pending;
 	};
 	c.set("trace_capture_upstream", capture);
 	let threw = false;
@@ -6047,7 +6066,18 @@ const traceMiddleware = async (c, next) => {
 		threw = true;
 		thrown = err;
 	}
-	const finishTrace = (resState) => {
+	const finishTrace = async (resState) => {
+		if (upstreamResPending) {
+			let timer;
+			try {
+				const settled = await Promise.race([upstreamResPending, new Promise((resolve) => {
+					timer = setTimeout(() => resolve(void 0), 3e4);
+				})]);
+				if (settled) upstreamRes = settled;
+			} catch {} finally {
+				if (timer) clearTimeout(timer);
+			}
+		}
 		try {
 			const traceMeta = c.var.trace_meta;
 			writeTrace({
@@ -6078,7 +6108,9 @@ const traceMiddleware = async (c, next) => {
 		});
 		throw thrown;
 	}
-	wrapResponseForCapture(c, finishTrace);
+	wrapResponseForCapture(c, (state$1) => {
+		finishTrace(state$1);
+	});
 };
 
 //#endregion
@@ -6556,6 +6588,15 @@ async function handleCompletion$1(c) {
 		consola.debug("Set max_tokens to:", JSON.stringify(payload.max_tokens));
 	}
 	const onUpstream = c.var.trace_capture_upstream;
+	const aliasDefault = models[clientAlias]?.default_effort;
+	if (!payload.reasoning_effort && aliasDefault && aliasDefault !== "") {
+		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		consola.debug(`[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias})`);
+		payload = {
+			...payload,
+			reasoning_effort: e
+		};
+	}
 	const response = await createChatCompletions(payload, onUpstream);
 	if (isNonStreaming$1(response)) {
 		consola.debug("Non-streaming response:", JSON.stringify(response));
@@ -6910,8 +6951,8 @@ async function handleCountTokens(c) {
 		const upstreamId = resolveAlias(anthropicPayload.model, modelAliases);
 		const selectedModel = state.models?.data.find((m) => m.id === upstreamId || m.id === anthropicPayload.model);
 		if (!selectedModel) {
-			consola.warn(`count_tokens: model not found in upstream catalog (alias=${anthropicPayload.model} upstream=${upstreamId}); returning default`);
-			return c.json({ input_tokens: 1 });
+			consola.warn(`count_tokens: model not found in upstream catalog (alias=${anthropicPayload.model} upstream=${upstreamId}); falling back to character estimate`);
+			return c.json({ input_tokens: estimateTokensFromPayload(anthropicPayload) });
 		}
 		const tokenCount = await getTokenCount(openAIPayload, selectedModel);
 		if (anthropicPayload.tools && anthropicPayload.tools.length > 0) {
@@ -6929,8 +6970,38 @@ async function handleCountTokens(c) {
 		return c.json({ input_tokens: finalTokenCount });
 	} catch (error) {
 		consola.error("Error counting tokens:", error);
-		return c.json({ input_tokens: 1 });
+		try {
+			const body = await c.req.json().catch(() => ({ messages: [] }));
+			const estimated = estimateTokensFromPayload(body);
+			consola.warn(`count_tokens: tokeniser failed, returning char-based estimate=${estimated}`);
+			return c.json({ input_tokens: estimated });
+		} catch {
+			return c.json({ input_tokens: 1e5 });
+		}
 	}
+}
+/**
+* Character-based token estimate for fallback paths. Counts characters
+* across text / tool_use / tool_result blocks and divides by 2 (which
+* UNDER-estimates token compression — i.e. yields a high token count) so
+* Claude Code errs toward triggering auto-compression rather than
+* blasting an oversized prompt at upstream.
+*
+* Returns at least 1 so callers don't have to guard.
+*/
+function estimateTokensFromPayload(payload) {
+	let chars = 0;
+	for (const msg of payload.messages ?? []) {
+		if (typeof msg.content === "string") {
+			chars += msg.content.length;
+			continue;
+		}
+		if (!Array.isArray(msg.content)) continue;
+		for (const block of msg.content) if (block.type === "text") chars += block.text.length;
+		else if (block.type === "tool_use") chars += JSON.stringify(block.input ?? {}).length;
+		else if (block.type === "tool_result") chars += JSON.stringify(block.content ?? "").length;
+	}
+	return Math.max(1, Math.ceil(chars / 2));
 }
 
 //#endregion
@@ -6972,26 +7043,53 @@ function sanitiseOutputItem(item) {
 *  - For non-streaming: the raw Anthropic JSON response object
 *  - For streaming: an async iterable of SSE events (fetch-event-stream)
 */
-const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta) => {
+const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, defaultEffort) => {
 	if (!state.copilotToken) throw new Error("Copilot token not found");
 	const hasVision = messageHasImages(payload);
 	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta);
 	headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user";
 	const upstream = `${copilotBaseUrl(state)}/v1/messages`;
 	consola.debug("Native Anthropic upstream:", upstream);
-	const body = buildUpstreamPayload(payload);
-	const response = await fetch(upstream, {
+	const body = buildUpstreamPayload(payload, defaultEffort);
+	let sentHeaders = headers;
+	let response = await fetch(upstream, {
 		method: "POST",
-		headers,
+		headers: sentHeaders,
 		body: JSON.stringify(body)
 	});
-	if (onUpstream) try {
-		const responseBody = payload.stream ? void 0 : await response.clone().text();
+	if (response.status === 400) {
+		const errBody = await response.clone().text();
+		const newlyUnsupported = parseUnsupportedBetaFromError(errBody);
+		if (newlyUnsupported.length > 0) {
+			const denyList = ensureLearnedSet();
+			const newToProcess = [];
+			for (const f of newlyUnsupported) if (!denyList.has(f)) {
+				denyList.add(f);
+				newToProcess.push(f);
+			}
+			for (const f of newToProcess) if (!SEEDED_UNSUPPORTED_BETA.includes(f)) {
+				persistLearnedBetaFlag(f);
+				unseededFlagsFromFile.push(f);
+			}
+			consola.warn(`[anthropic-beta] upstream rejected ${JSON.stringify(newlyUnsupported)} — added to deny-list${newToProcess.length > 0 ? " (new, persisted)" : ""}, retrying`);
+			sentHeaders = { ...headers };
+			const rebuiltBeta = mergeAnthropicBeta(clientAnthropicBeta);
+			if (rebuiltBeta === "") delete sentHeaders["anthropic-beta"];
+			else sentHeaders["anthropic-beta"] = rebuiltBeta;
+			response = await fetch(upstream, {
+				method: "POST",
+				headers: sentHeaders,
+				body: JSON.stringify(body)
+			});
+		}
+	}
+	if (onUpstream && !payload.stream) try {
+		const responseBody = await response.clone().text();
 		onUpstream({
 			req: {
 				method: "POST",
 				url: upstream,
-				headers,
+				headers: sentHeaders,
 				body
 			},
 			res: {
@@ -7003,6 +7101,65 @@ const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta) =>
 	} catch (err) {
 		consola.warn(`[trace] upstream capture failed: ${String(err)}`);
 	}
+	else if (onUpstream && payload.stream && response.body) try {
+		const [forForwarder, forCapture] = response.body.tee();
+		const upstreamResHeaders = response.headers;
+		const upstreamResStatus = response.status;
+		response = new Response(forForwarder, {
+			status: upstreamResStatus,
+			statusText: response.statusText,
+			headers: upstreamResHeaders
+		});
+		const MAX_CAPTURE = 256 * 1024;
+		const resPending = (async () => {
+			const reader = forCapture.getReader();
+			const decoder = new TextDecoder();
+			let buf = "";
+			let bytes = 0;
+			let truncated = false;
+			let streamErr;
+			try {
+				while (true) {
+					const r = await reader.read();
+					if (r.done) break;
+					const v = r.value;
+					if (!v) break;
+					if (bytes < MAX_CAPTURE) {
+						const room = MAX_CAPTURE - bytes;
+						if (v.byteLength <= room) {
+							buf += decoder.decode(v, { stream: true });
+							bytes += v.byteLength;
+						} else {
+							buf += decoder.decode(v.slice(0, room), { stream: true });
+							bytes = MAX_CAPTURE;
+							truncated = true;
+						}
+					}
+				}
+			} catch (err) {
+				streamErr = err;
+			}
+			let resBody = buf;
+			if (truncated) resBody += "[TRUNCATED]";
+			if (streamErr !== void 0) resBody += `[STREAM_ERROR: ${String(streamErr)}]`;
+			return {
+				status: upstreamResStatus,
+				headers: upstreamResHeaders,
+				body: resBody
+			};
+		})();
+		onUpstream({
+			req: {
+				method: "POST",
+				url: upstream,
+				headers: sentHeaders,
+				body
+			},
+			res_pending: resPending
+		});
+	} catch (err) {
+		consola.warn(`[trace] upstream tee failed: ${String(err)}`);
+	}
 	if (!response.ok) {
 		consola.error("Native Anthropic upstream error", response.status);
 		throw new HTTPError("Native Anthropic upstream error", response);
@@ -7011,26 +7168,81 @@ const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta) =>
 	return response.json();
 };
 /**
-* Build the anthropic-beta header forwarded upstream.
+* Auto-learning deny-list of beta flags upstream rejects.
 *
-* We MUST forward whatever beta flags the client sent — Claude Code sends
-* the full set including `effort-2025-11-24` (which gates
-* `output_config.effort`) and `redact-thinking-2026-02-12` (which gates
-* thinking-encryption behaviour). Hard-coding our own list silently drops
-* them and the model behaves as if those features were off (we observed
-* 0 thinking blocks even with effort:"xhigh" until this was fixed).
+* Layered state:
+*   1. **Seed** — hard-coded values committed to the repo. Things we've
+*      already observed in production. Avoids the cold-start retry penalty
+*      on every brand-new install.
+*   2. **File** — `~/.local/share/copilot-api-pro/learned-unsupported-beta.txt`
+*      Per-line ASCII flag names. Read once on first use, appended to when a
+*      new flag is learned. Persists across restarts. Operators can edit it
+*      manually to revert / extend the deny-list.
+*   3. **Process** — the live `Set<string>` mutated when auto-learn fires.
 *
-* We additionally union in two flags we always want on so direct-API
-* callers without the right beta header still get them:
-*   - interleaved-thinking-2025-05-14  (mixed thinking + text blocks)
-*   - prompt-caching-2024-07-31        (cache_control support)
-*
-* Output is comma-separated, de-duplicated.
+* When a NEW flag (not in seed + not in file) is learned, we ALSO log a
+* loud warning at startup of subsequent processes so operators / devs
+* notice and can promote it into the seed via a code commit.
 */
+const SEEDED_UNSUPPORTED_BETA = ["context-1m-2025-08-07"];
+/** Lazily-initialised on first call. Stays empty until the file is read. */
+let learnedUnsupportedBeta;
+/** Flags present in the file but NOT in the seed — surface at startup. */
+const unseededFlagsFromFile = [];
+function ensureLearnedSet() {
+	if (learnedUnsupportedBeta) return learnedUnsupportedBeta;
+	const s = new Set(SEEDED_UNSUPPORTED_BETA);
+	try {
+		const raw = fs$1.readFileSync(PATHS.LEARNED_BETA_PATH, "utf8");
+		for (const line of raw.split("\n")) {
+			const flag = line.trim();
+			if (!flag || flag.startsWith("#")) continue;
+			if (!/^[\w.-]+$/.test(flag)) continue;
+			if (!SEEDED_UNSUPPORTED_BETA.includes(flag)) unseededFlagsFromFile.push(flag);
+			s.add(flag);
+		}
+	} catch {}
+	learnedUnsupportedBeta = s;
+	return s;
+}
+/**
+* Get the set of flags discovered at runtime that are NOT in the source
+* seed. Used by start.ts to surface them in the boot banner so the next
+* developer notices and bumps the seed.
+*/
+function unseededLearnedBetaFlags() {
+	ensureLearnedSet();
+	return [...unseededFlagsFromFile];
+}
+/**
+* Append a newly-learned flag to the persistent file with a timestamped
+* comment line. Best-effort: a write failure logs but doesn't propagate
+* (the in-memory Set still works for this process).
+*/
+function persistLearnedBetaFlag(flag) {
+	try {
+		const line = `# learned ${(/* @__PURE__ */ new Date()).toISOString()}\n${flag}\n`;
+		fs$1.appendFileSync(PATHS.LEARNED_BETA_PATH, line, { mode: 384 });
+	} catch (err) {
+		consola.warn(`[anthropic-beta] failed to persist learned flag "${flag}": ${String(err)}`);
+	}
+}
 function mergeAnthropicBeta(clientBeta) {
 	const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"];
 	const fromClient = (clientBeta ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
-	return [...new Set([...fromClient, ...ours])].join(",");
+	const merged = [...new Set([...fromClient, ...ours])];
+	const denyList = ensureLearnedSet();
+	return merged.filter((flag) => !denyList.has(flag)).join(",");
+}
+/**
+* Parse upstream 400 body for `unsupported beta header(s): X, Y` and
+* return the flag names. Returns empty array when the body isn't a
+* recognised "unsupported beta" error.
+*/
+function parseUnsupportedBetaFromError(body) {
+	const m = /unsupported beta header\(s\):\s*([^"\\}]+)/i.exec(body);
+	if (!m || !m[1]) return [];
+	return m[1].split(",").map((s) => s.trim()).filter((s) => s.length > 0 && /^[\w.-]+$/.test(s));
 }
 /**
 * Build headers for the Anthropic native endpoint.
@@ -7041,10 +7253,11 @@ function mergeAnthropicBeta(clientBeta) {
 */
 function buildNativeHeaders(vision, stream, clientBeta) {
 	const { "openai-intent": _dropped,...anthropicBase } = copilotHeaders(state, vision);
+	const beta = mergeAnthropicBeta(clientBeta);
 	return {
 		...anthropicBase,
 		"anthropic-version": "2023-06-01",
-		"anthropic-beta": mergeAnthropicBeta(clientBeta),
+		...beta === "" ? {} : { "anthropic-beta": beta },
 		...stream ? { accept: "text/event-stream" } : {}
 	};
 }
@@ -7115,8 +7328,17 @@ function clampEffortForModel(effort, modelId) {
 * budget size to a Copilot effort level** (low/medium/high/xhigh) so the
 * caller's intent isn't flattened to "medium" regardless of input.
 */
-function buildUpstreamPayload(payload) {
+function buildUpstreamPayload(payload, defaultEffort) {
 	const { thinking, output_config,...rest } = payload;
+	if (!thinking && defaultEffort && defaultEffort !== "") {
+		const clamped = clampEffortForModel(defaultEffort, payload.model) ?? defaultEffort;
+		consola.debug(`[alias-effort] injecting default effort=${defaultEffort} (clamped=${clamped}) for model=${payload.model}`);
+		return {
+			...rest,
+			thinking: { type: "adaptive" },
+			output_config: { effort: clamped }
+		};
+	}
 	if (!thinking) return rest;
 	if (isAdaptiveThinkingModel(payload.model)) {
 		if (thinking.type === "enabled") {
@@ -7434,8 +7656,14 @@ function translateToolChoice(toolChoice) {
 		default: return;
 	}
 }
-function translateReasoning(thinking, outputConfig) {
-	if (!thinking) return void 0;
+function translateReasoning(thinking, outputConfig, defaultEffort) {
+	if (!thinking) {
+		if (defaultEffort && defaultEffort !== "") {
+			const e = defaultEffort === "xhigh" ? "high" : VALID_EFFORT_VALUES.has(defaultEffort) ? defaultEffort : null;
+			if (e) return { effort: e };
+		}
+		return;
+	}
 	if (thinking.type === "adaptive") {
 		const rawEffort = outputConfig?.effort;
 		return { effort: rawEffort !== void 0 && VALID_EFFORT_VALUES.has(rawEffort) ? rawEffort : "medium" };
@@ -7443,7 +7671,7 @@ function translateReasoning(thinking, outputConfig) {
 	if (thinking.budget_tokens !== void 0) return { effort: budgetToEffort(thinking.budget_tokens) };
 	return { effort: "medium" };
 }
-function translateAnthropicToResponses(payload) {
+function translateAnthropicToResponses(payload, defaultEffort) {
 	const inputItems = [];
 	for (const message of payload.messages) if (message.role === "user") inputItems.push(...translateUserMessage(message));
 	else inputItems.push(...translateAssistantMessage(message));
@@ -7456,7 +7684,7 @@ function translateAnthropicToResponses(payload) {
 		temperature: payload.temperature,
 		top_p: payload.top_p,
 		max_output_tokens: payload.max_tokens,
-		reasoning: translateReasoning(payload.thinking, payload.output_config),
+		reasoning: translateReasoning(payload.thinking, payload.output_config, defaultEffort),
 		stream: payload.stream,
 		user: payload.metadata?.user_id
 	};
@@ -7494,7 +7722,7 @@ function mapResponsesStatusToStopReason(status) {
 function translateResponsesEventToAnthropic(eventType, data, state$1) {
 	const events$1 = [];
 	state$1.eventCount++;
-	if (state$1.eventCount % PING_INTERVAL === 0) events$1.push({ type: "ping" });
+	if (state$1.messageStartSent && state$1.eventCount % PING_INTERVAL === 0) events$1.push({ type: "ping" });
 	switch (eventType) {
 		case "response.created":
 		case "response.in_progress": {
@@ -7613,10 +7841,16 @@ function translateResponsesEventToAnthropic(eventType, data, state$1) {
 					type: "content_block_stop",
 					index: blockIndex
 				});
-			} else if (state$1.functionCallOutputIndexes.has(outputIndex)) events$1.push({
-				type: "content_block_stop",
-				index: blockIndex
-			});
+				state$1.outputIndexToBlockIndex.delete(outputIndex);
+				state$1.reasoningOutputIndexes.delete(outputIndex);
+			} else if (state$1.functionCallOutputIndexes.has(outputIndex)) {
+				events$1.push({
+					type: "content_block_stop",
+					index: blockIndex
+				});
+				state$1.outputIndexToBlockIndex.delete(outputIndex);
+				state$1.functionCallOutputIndexes.delete(outputIndex);
+			}
 			break;
 		}
 		case "response.output_text.delta": {
@@ -7642,10 +7876,13 @@ function translateResponsesEventToAnthropic(eventType, data, state$1) {
 			if (outputIndex === void 0) break;
 			const blockIndex = state$1.outputIndexToBlockIndex.get(outputIndex);
 			if (blockIndex === void 0) break;
-			if (!state$1.reasoningOutputIndexes.has(outputIndex) && !state$1.functionCallOutputIndexes.has(outputIndex)) events$1.push({
-				type: "content_block_stop",
-				index: blockIndex
-			});
+			if (!state$1.reasoningOutputIndexes.has(outputIndex) && !state$1.functionCallOutputIndexes.has(outputIndex)) {
+				events$1.push({
+					type: "content_block_stop",
+					index: blockIndex
+				});
+				state$1.outputIndexToBlockIndex.delete(outputIndex);
+			}
 			break;
 		}
 		case "response.content_part.added": break;
@@ -7669,6 +7906,34 @@ function translateResponsesEventToAnthropic(eventType, data, state$1) {
 		case "response.function_call_arguments.done": break;
 		case "response.completed": {
 			const d = data;
+			if (!state$1.messageStartSent) {
+				state$1.messageId = d?.response?.id ?? `msg_fallback_${Date.now()}`;
+				state$1.messageModel = d?.response?.model ?? "";
+				events$1.push({
+					type: "message_start",
+					message: {
+						id: state$1.messageId,
+						type: "message",
+						role: "assistant",
+						content: [],
+						model: state$1.messageModel,
+						stop_reason: null,
+						stop_sequence: null,
+						usage: {
+							input_tokens: 0,
+							output_tokens: 0
+						}
+					}
+				});
+				state$1.messageStartSent = true;
+			}
+			for (const blockIndex of state$1.outputIndexToBlockIndex.values()) events$1.push({
+				type: "content_block_stop",
+				index: blockIndex
+			});
+			state$1.outputIndexToBlockIndex.clear();
+			state$1.reasoningOutputIndexes.clear();
+			state$1.functionCallOutputIndexes.clear();
 			events$1.push({
 				type: "message_delta",
 				delta: {
@@ -7684,13 +7949,50 @@ function translateResponsesEventToAnthropic(eventType, data, state$1) {
 		}
 		case "response.failed": {
 			const message = data?.response?.error?.message ?? "Upstream model call failed";
+			if (!state$1.messageStartSent) {
+				state$1.messageId = `msg_fallback_${Date.now()}`;
+				events$1.push({
+					type: "message_start",
+					message: {
+						id: state$1.messageId,
+						type: "message",
+						role: "assistant",
+						content: [],
+						model: "",
+						stop_reason: null,
+						stop_sequence: null,
+						usage: {
+							input_tokens: 0,
+							output_tokens: 0
+						}
+					}
+				});
+				state$1.messageStartSent = true;
+			}
+			for (const blockIndex of state$1.outputIndexToBlockIndex.values()) events$1.push({
+				type: "content_block_stop",
+				index: blockIndex
+			});
+			state$1.outputIndexToBlockIndex.clear();
+			state$1.reasoningOutputIndexes.clear();
+			state$1.functionCallOutputIndexes.clear();
 			events$1.push({
 				type: "error",
 				error: {
 					type: "api_error",
 					message
 				}
-			});
+			}, {
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_sequence: null
+				},
+				usage: {
+					input_tokens: 0,
+					output_tokens: 0
+				}
+			}, { type: "message_stop" });
 			break;
 		}
 		default: break;
@@ -7727,10 +8029,11 @@ function translateReasoningItem(item) {
 }
 function translateMessageItem(item) {
 	const textParts = item.content.filter((p) => p.type === "output_text");
-	if (textParts.length === 0) return [];
+	const refusalParts = item.content.filter((p) => p.type === "refusal");
+	if (textParts.length === 0 && refusalParts.length === 0) return [];
 	return [{
 		type: "text",
-		text: textParts.map((p) => p.text).join("")
+		text: [...textParts.map((p) => p.text), ...refusalParts.map((p) => p.refusal)].join("")
 	}];
 }
 function translateFunctionCallItem(item) {
@@ -7810,9 +8113,9 @@ function stashAnthropicUsage(c, parsed, prev) {
 		return [input, output];
 	}
 	if (parsed.type === "message_start") {
-		const m = parsed.message;
-		if (typeof m.usage.input_tokens === "number") input = m.usage.input_tokens;
-		if (typeof m.usage.output_tokens === "number") output = m.usage.output_tokens;
+		const usage = parsed.message?.usage;
+		if (typeof usage?.input_tokens === "number") input = usage.input_tokens;
+		if (typeof usage?.output_tokens === "number") output = usage.output_tokens;
 	} else if (parsed.type === "message_delta") {
 		const u = parsed.usage;
 		if (u) {
@@ -7832,9 +8135,23 @@ function isToolBlockOpen(state$1) {
 }
 function translateChunkToAnthropicEvents(chunk, state$1) {
 	const events$1 = [];
-	if (chunk.choices.length === 0) return events$1;
+	if (chunk.choices.length === 0) {
+		if (state$1.messageStartSent && chunk.usage) events$1.push({
+			type: "message_delta",
+			delta: {
+				stop_reason: null,
+				stop_sequence: null
+			},
+			usage: {
+				input_tokens: (chunk.usage.prompt_tokens ?? 0) - (chunk.usage.prompt_tokens_details?.cached_tokens ?? 0),
+				output_tokens: chunk.usage.completion_tokens ?? 0,
+				...chunk.usage.prompt_tokens_details?.cached_tokens !== void 0 && { cache_read_input_tokens: chunk.usage.prompt_tokens_details.cached_tokens }
+			}
+		});
+		return events$1;
+	}
 	const choice = chunk.choices[0];
-	const { delta } = choice;
+	const delta = choice.delta ?? {};
 	if (!state$1.messageStartSent) {
 		events$1.push({
 			type: "message_start",
@@ -7971,15 +8288,16 @@ async function handleCompletion(c) {
 		code: "model_not_allowed"
 	} }, 403);
 	if (state.manualApprove) await awaitApproval();
-	if (isNativeAnthropicModel(payload.model)) return handleNative(c, payload);
-	if (getModelMode(payload.model) === "responses") return handleAnthropicViaResponses(c, payload);
-	return handleTranslated(c, payload);
+	if (isNativeAnthropicModel(payload.model)) return handleNative(c, payload, clientAlias);
+	if (getModelMode(payload.model) === "responses") return handleAnthropicViaResponses(c, payload, clientAlias);
+	return handleTranslated(c, payload, clientAlias);
 }
-async function handleNative(c, payload) {
+async function handleNative(c, payload, clientAlias) {
 	consola.debug("Using native Anthropic pass-through for", payload.model);
 	const onUpstream = c.var.trace_capture_upstream;
 	const clientBeta = c.req.header("anthropic-beta");
-	const response = await createMessagesNative(payload, onUpstream, clientBeta);
+	const defaultEffort = getConfig().models[clientAlias]?.default_effort;
+	const response = await createMessagesNative(payload, onUpstream, clientBeta, defaultEffort);
 	if (!payload.stream) {
 		consola.debug("Native non-streaming response:", JSON.stringify(response).slice(0, 400));
 		c.set("usage", readCopilotUsage(response));
@@ -7989,26 +8307,61 @@ async function handleNative(c, payload) {
 	return streamSSE(c, async (stream) => {
 		let inputTokens;
 		let outputTokens;
-		for await (const rawEvent of response) {
-			if (!rawEvent.data) continue;
-			await stream.writeSSE({
-				event: rawEvent.event,
-				data: rawEvent.data
-			});
-			try {
-				const parsed = JSON.parse(rawEvent.data);
-				consola.debug("Native SSE event:", parsed.type);
-				[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [inputTokens, outputTokens]);
-			} catch {
-				consola.warn("Could not parse native SSE chunk for logging:", rawEvent.data.slice(0, 200));
+		try {
+			for await (const rawEvent of response) {
+				if (!rawEvent.data) continue;
+				await stream.writeSSE({
+					event: rawEvent.event,
+					data: rawEvent.data
+				});
+				try {
+					const parsed = JSON.parse(rawEvent.data);
+					consola.debug("Native SSE event:", parsed.type);
+					[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [inputTokens, outputTokens]);
+				} catch {
+					consola.warn("Could not parse native SSE chunk for logging:", rawEvent.data.slice(0, 200));
+				}
 			}
+		} catch (err) {
+			consola.error("Native Anthropic SSE iteration failed:", err);
+			try {
+				await stream.writeSSE({
+					event: "error",
+					data: JSON.stringify({
+						type: "error",
+						error: {
+							type: "api_error",
+							message: "Upstream stream interrupted"
+						}
+					})
+				});
+				await stream.writeSSE({
+					event: "message_stop",
+					data: JSON.stringify({ type: "message_stop" })
+				});
+			} catch {}
 		}
+	}, async (err, stream) => {
+		consola.error("Native Anthropic SSE outer error:", err);
+		try {
+			await stream.writeSSE({
+				event: "error",
+				data: JSON.stringify({
+					type: "error",
+					error: {
+						type: "api_error",
+						message: "Stream write failed"
+					}
+				})
+			});
+		} catch {}
 	});
 }
-async function handleAnthropicViaResponses(c, payload) {
+async function handleAnthropicViaResponses(c, payload, clientAlias) {
 	consola.debug("Routing /v1/messages via Responses API for", payload.model);
-	if (payload.stream) return streamResponsesAsAnthropic(c, payload);
-	const responsesPayload = translateAnthropicToResponses(payload);
+	const defaultEffort = getConfig().models[clientAlias]?.default_effort;
+	if (payload.stream) return streamResponsesAsAnthropic(c, payload, defaultEffort);
+	const responsesPayload = translateAnthropicToResponses(payload, defaultEffort);
 	const onUpstreamRes = c.var.trace_capture_upstream;
 	const rawResponse = await createResponses({
 		...responsesPayload,
@@ -8023,14 +8376,15 @@ async function handleAnthropicViaResponses(c, payload) {
 		} }, 502);
 	}
 	const typedResponse = rawResponse;
-	if (typedResponse.status === "failed") {
-		const errMsg = typedResponse.error?.message ?? "Upstream model call failed";
-		consola.error("Responses API returned failed status:", errMsg);
+	if (typedResponse.status !== "completed" && typedResponse.status !== "incomplete") {
+		const errMsg = typedResponse.error?.message ?? `Upstream returned status="${typedResponse.status}"`;
+		consola.error(`Responses API non-terminal status (status=${typedResponse.status}):`, errMsg);
+		const httpStatus = typedResponse.status === "failed" ? 500 : 502;
 		return c.json({ error: {
 			message: errMsg,
 			type: "api_error",
 			code: "model_error"
-		} }, 500);
+		} }, httpStatus);
 	}
 	const sanitised = sanitiseResponsesOutput(typedResponse);
 	const anthropicResponse = translateResponsesToAnthropic(sanitised);
@@ -8038,11 +8392,21 @@ async function handleAnthropicViaResponses(c, payload) {
 	consola.debug("Responses→Anthropic translated response:", JSON.stringify(anthropicResponse).slice(0, 400));
 	return c.json(anthropicResponse);
 }
-async function handleTranslated(c, anthropicPayload) {
+async function handleTranslated(c, anthropicPayload, clientAlias) {
 	const openAIPayload = translateToOpenAI(anthropicPayload);
 	consola.debug("Translated OpenAI request payload:", JSON.stringify(openAIPayload));
+	const aliasDefault = getConfig().models[clientAlias]?.default_effort;
+	let finalPayload = openAIPayload;
+	if (!openAIPayload.reasoning_effort && aliasDefault && aliasDefault !== "") {
+		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		consola.debug(`[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias}, translated path)`);
+		finalPayload = {
+			...openAIPayload,
+			reasoning_effort: e
+		};
+	}
 	const onUpstream = c.var.trace_capture_upstream;
-	const response = await createChatCompletions(openAIPayload, onUpstream);
+	const response = await createChatCompletions(finalPayload, onUpstream);
 	if (isNonStreaming(response)) {
 		consola.debug("Non-streaming response from Copilot:", JSON.stringify(response).slice(-400));
 		c.set("usage", readCopilotUsage(response));
@@ -8058,50 +8422,23 @@ async function handleTranslated(c, anthropicPayload) {
 			contentBlockOpen: false,
 			toolCalls: {}
 		};
-		for await (const rawEvent of response) {
-			consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent));
-			if (rawEvent.data === "[DONE]") break;
-			if (!rawEvent.data) continue;
-			const chunk = JSON.parse(rawEvent.data);
-			const u = readCopilotUsage(chunk);
-			if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0) c.set("usage", u);
-			const events$1 = translateChunkToAnthropicEvents(chunk, streamState);
-			for (const event of events$1) {
-				consola.debug("Translated Anthropic event:", JSON.stringify(event));
-				await stream.writeSSE({
-					event: event.type,
-					data: JSON.stringify(event)
-				});
-			}
-		}
-	});
-}
-const isNonStreaming = (response) => Object.hasOwn(response, "choices");
-function streamResponsesAsAnthropic(c, payload) {
-	const responsesPayload = translateAnthropicToResponses(payload);
-	const onUpstreamStream = c.var.trace_capture_upstream;
-	return streamSSE(c, async (stream) => {
-		const rawResponse = await createResponses({
-			...responsesPayload,
-			stream: true
-		}, onUpstreamStream);
-		const streamState = makeResponsesStreamState();
-		let inputTokens;
-		let outputTokens;
 		try {
-			for await (const rawEvent of rawResponse) {
-				const eventType = rawEvent.event ?? "";
-				let parsedData = void 0;
-				if (rawEvent.data) try {
-					parsedData = JSON.parse(rawEvent.data);
-				} catch {
-					consola.warn("Could not parse Responses SSE chunk:", rawEvent.data.slice(0, 200));
+			for await (const rawEvent of response) {
+				consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent));
+				if (rawEvent.data === "[DONE]") break;
+				if (!rawEvent.data) continue;
+				let chunk;
+				try {
+					chunk = JSON.parse(rawEvent.data);
+				} catch (parseErr) {
+					consola.warn(`[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`, rawEvent.data.slice(0, 200));
+					continue;
 				}
-				consola.debug("Responses SSE event:", eventType);
-				const anthropicEvents = translateResponsesEventToAnthropic(eventType, parsedData, streamState);
-				for (const event of anthropicEvents) {
-					consola.debug("Translated Responses→Anthropic event:", event.type);
-					[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [inputTokens, outputTokens]);
+				const u = readCopilotUsage(chunk);
+				if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0) c.set("usage", u);
+				const events$1 = translateChunkToAnthropicEvents(chunk, streamState);
+				for (const event of events$1) {
+					consola.debug("Translated Anthropic event:", JSON.stringify(event));
 					await stream.writeSSE({
 						event: event.type,
 						data: JSON.stringify(event)
@@ -8109,20 +8446,128 @@ function streamResponsesAsAnthropic(c, payload) {
 				}
 			}
 		} catch (err) {
-			consola.error("Error during Responses API streaming:", err);
-			const errorEvent = {
-				type: "error",
-				error: {
-					type: "api_error",
-					message: "An unexpected error occurred during streaming."
-				}
-			};
-			await stream.writeSSE({
-				event: errorEvent.type,
-				data: JSON.stringify(errorEvent)
-			});
+			consola.error("Translated /v1/messages SSE iteration failed:", err);
+			try {
+				if (streamState.contentBlockOpen) await stream.writeSSE({
+					event: "content_block_stop",
+					data: JSON.stringify({
+						type: "content_block_stop",
+						index: streamState.contentBlockIndex
+					})
+				});
+				await stream.writeSSE({
+					event: "error",
+					data: JSON.stringify({
+						type: "error",
+						error: {
+							type: "api_error",
+							message: "Upstream stream interrupted"
+						}
+					})
+				});
+				await stream.writeSSE({
+					event: "message_stop",
+					data: JSON.stringify({ type: "message_stop" })
+				});
+			} catch {}
 		}
+	}, async (err, stream) => {
+		consola.error("Translated /v1/messages SSE outer error:", err);
+		try {
+			await stream.writeSSE({
+				event: "error",
+				data: JSON.stringify({
+					type: "error",
+					error: {
+						type: "api_error",
+						message: "Stream write failed"
+					}
+				})
+			});
+		} catch {}
 	});
+}
+const isNonStreaming = (response) => Object.hasOwn(response, "choices");
+function streamResponsesAsAnthropic(c, payload, defaultEffort) {
+	const responsesPayload = translateAnthropicToResponses(payload, defaultEffort);
+	const onUpstreamStream = c.var.trace_capture_upstream;
+	const upstreamPromise = createResponses({
+		...responsesPayload,
+		stream: true
+	}, onUpstreamStream).catch((err) => err);
+	return (async () => {
+		const settled = await upstreamPromise;
+		if (settled instanceof Error) {
+			consola.error("Responses upstream call failed pre-stream:", settled);
+			return forwardError(c, settled);
+		}
+		const rawResponse = settled;
+		return streamSSE(c, async (stream) => {
+			const streamState = makeResponsesStreamState();
+			let inputTokens;
+			let outputTokens;
+			try {
+				for await (const rawEvent of rawResponse) {
+					const eventType = rawEvent.event ?? "";
+					let parsedData = void 0;
+					if (rawEvent.data) try {
+						parsedData = JSON.parse(rawEvent.data);
+					} catch {
+						consola.warn("Could not parse Responses SSE chunk:", rawEvent.data.slice(0, 200));
+					}
+					consola.debug("Responses SSE event:", eventType);
+					const anthropicEvents = translateResponsesEventToAnthropic(eventType, parsedData, streamState);
+					for (const event of anthropicEvents) {
+						consola.debug("Translated Responses→Anthropic event:", event.type);
+						[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [inputTokens, outputTokens]);
+						await stream.writeSSE({
+							event: event.type,
+							data: JSON.stringify(event)
+						});
+					}
+				}
+			} catch (err) {
+				consola.error("Error during Responses API streaming:", err);
+				try {
+					for (const blockIndex of streamState.outputIndexToBlockIndex.values()) await stream.writeSSE({
+						event: "content_block_stop",
+						data: JSON.stringify({
+							type: "content_block_stop",
+							index: blockIndex
+						})
+					});
+					await stream.writeSSE({
+						event: "error",
+						data: JSON.stringify({
+							type: "error",
+							error: {
+								type: "api_error",
+								message: "Upstream stream interrupted"
+							}
+						})
+					});
+					await stream.writeSSE({
+						event: "message_stop",
+						data: JSON.stringify({ type: "message_stop" })
+					});
+				} catch {}
+			}
+		}, async (err, stream) => {
+			consola.error("Responses→Anthropic SSE outer error:", err);
+			try {
+				await stream.writeSSE({
+					event: "error",
+					data: JSON.stringify({
+						type: "error",
+						error: {
+							type: "api_error",
+							message: "Stream write failed"
+						}
+					})
+				});
+			} catch {}
+		});
+	})();
 }
 
 //#endregion
@@ -8215,6 +8660,19 @@ async function handleResponses(c) {
 		code: "model_not_allowed"
 	} }, 403);
 	if (state.manualApprove) await awaitApproval();
+	await checkRateLimit(state);
+	const aliasDefault = getConfig().models[clientAlias]?.default_effort;
+	if (!payload.reasoning?.effort && aliasDefault && aliasDefault !== "") {
+		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		consola.debug(`[alias-effort] injecting reasoning.effort=${e} (alias=${clientAlias})`);
+		payload = {
+			...payload,
+			reasoning: {
+				...payload.reasoning,
+				effort: e
+			}
+		};
+	}
 	const onUpstream = c.var.trace_capture_upstream;
 	const response = await createResponses(payload, onUpstream);
 	if (!payload.stream) {
@@ -8228,20 +8686,36 @@ async function handleResponses(c) {
 function streamResponsesEvents(c, response) {
 	consola.debug("Responses streaming response — proxying SSE events");
 	return streamSSE(c, async (stream) => {
-		for await (const rawEvent of response) {
-			if (!rawEvent.data) continue;
-			const forwardData = sanitiseSseDataIfPossible(rawEvent.data);
+		try {
+			for await (const rawEvent of response) {
+				if (!rawEvent.data) continue;
+				const forwardData = sanitiseSseDataIfPossible(rawEvent.data);
+				await stream.writeSSE({
+					event: rawEvent.event,
+					data: forwardData
+				});
+			}
+		} catch (err) {
+			consola.error("Responses SSE iteration failed:", err);
 			await stream.writeSSE({
-				event: rawEvent.event,
-				data: forwardData
+				event: "error",
+				data: JSON.stringify({
+					type: "api_error",
+					message: "Upstream stream interrupted"
+				})
 			});
 		}
 	}, async (err, stream) => {
-		consola.error("Responses SSE stream error:", err);
-		await stream.writeSSE({
-			event: "error",
-			data: JSON.stringify({ message: String(err) })
-		});
+		consola.error("Responses SSE outer error:", err);
+		try {
+			await stream.writeSSE({
+				event: "error",
+				data: JSON.stringify({
+					type: "api_error",
+					message: "Stream write failed"
+				})
+			});
+		} catch {}
 	});
 }
 /**
@@ -8723,7 +9197,8 @@ async function runServer(options) {
 	installShutdownHandlers([
 		stopEventRetention,
 		stopTraceRetention,
-		stopConfigWatcher
+		stopConfigWatcher,
+		stopCopilotTokenRefresh
 	]);
 	logAuthModeBanner(authMode);
 	runBootstrap();
@@ -8768,6 +9243,8 @@ async function runServer(options) {
 		}
 	}
 	consola.box(`🖥  Admin Web UI: ${serverUrl}/admin/`);
+	const unseeded = unseededLearnedBetaFlags();
+	if (unseeded.length > 0) consola.warn(`[anthropic-beta] auto-learned ${unseeded.length} unsupported beta flag(s)\n  not yet in source seed: ${unseeded.join(", ")}\n  → see ${PATHS.LEARNED_BETA_PATH}\n  → add to SEEDED_UNSUPPORTED_BETA in src/services/copilot/create-messages-native.ts`);
 	serve({
 		fetch: server.fetch,
 		port: options.port,

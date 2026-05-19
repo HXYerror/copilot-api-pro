@@ -52,13 +52,16 @@ export function stashAnthropicUsage(
   }
 
   // Fallback: native anthropic usage on message_start / message_delta.
+  // Both fields are defensively optional-chained — a malformed upstream
+  // event (or a future shape change) must not crash the stream.
   if (parsed.type === "message_start") {
     const m = parsed.message
-    if (typeof m.usage.input_tokens === "number") {
-      input = m.usage.input_tokens
+    const usage = m?.usage
+    if (typeof usage?.input_tokens === "number") {
+      input = usage.input_tokens
     }
-    if (typeof m.usage.output_tokens === "number") {
-      output = m.usage.output_tokens
+    if (typeof usage?.output_tokens === "number") {
+      output = usage.output_tokens
     }
   } else if (parsed.type === "message_delta") {
     const u = parsed.usage
@@ -93,12 +96,50 @@ export function translateChunkToAnthropicEvents(
 ): Array<AnthropicStreamEventData> {
   const events: Array<AnthropicStreamEventData> = []
 
+  // OpenAI's `stream_options.include_usage: true` (which we set in
+  // create-chat-completions for all streaming requests) makes Copilot emit a
+  // FINAL chunk after the finish-reason chunk with `choices: []` and a
+  // top-level `usage` block. If we early-return here, that usage is lost
+  // and the client sees `output_tokens: 0` on message_delta — breaking
+  // every downstream billing / quota integration.
+  //
+  // When we have usage AND message_start has fired AND there were no
+  // choices, emit a message_delta carrying ONLY the usage (no stop_reason
+  // — the finish_reason chunk already set that). Anthropic accepts
+  // multiple message_delta events; the last-write-wins semantics on
+  // output_tokens are what we want here.
   if (chunk.choices.length === 0) {
+    if (state.messageStartSent && chunk.usage) {
+      events.push({
+        type: "message_delta",
+        delta: {
+          // No stop_reason / stop_sequence — leaves whatever the
+          // finish-reason chunk set in place.
+          stop_reason: null,
+          stop_sequence: null,
+        },
+        usage: {
+          input_tokens:
+            (chunk.usage.prompt_tokens ?? 0)
+            - (chunk.usage.prompt_tokens_details?.cached_tokens ?? 0),
+          output_tokens: chunk.usage.completion_tokens ?? 0,
+          ...(chunk.usage.prompt_tokens_details?.cached_tokens
+            !== undefined && {
+            cache_read_input_tokens:
+              chunk.usage.prompt_tokens_details.cached_tokens,
+          }),
+        },
+      })
+    }
     return events
   }
 
   const choice = chunk.choices[0]
-  const { delta } = choice
+  // Defensive: Copilot occasionally emits choices with no `delta`
+  // (observed on gpt-4o when only finish_reason changes mid-stream). The
+  // destructure would yield `delta = undefined`, then `delta.content`
+  // would throw and tear down the whole stream. Treat as empty.
+  const delta = choice.delta ?? {}
 
   if (!state.messageStartSent) {
     events.push({

@@ -295,8 +295,22 @@ function translateToolChoice(
 function translateReasoning(
   thinking: AnthropicMessagesPayload["thinking"],
   outputConfig?: AnthropicMessagesPayload["output_config"],
+  defaultEffort?: string,
 ): ResponsesPayload["reasoning"] {
-  if (!thinking) return undefined
+  // Per-alias default effort: when the client didn't ask for thinking at
+  // all AND the alias provides a default, surface it as reasoning.effort.
+  // Responses API only accepts low/medium/high, so we collapse "xhigh"
+  // down to "high" (the highest valid value for this endpoint).
+  if (!thinking) {
+    if (defaultEffort && defaultEffort !== "") {
+      const e =
+        defaultEffort === "xhigh" ? "high"
+        : VALID_EFFORT_VALUES.has(defaultEffort) ? defaultEffort
+        : null
+      if (e) return { effort: e as "low" | "medium" | "high" }
+    }
+    return undefined
+  }
 
   if (thinking.type === "adaptive") {
     const rawEffort = outputConfig?.effort
@@ -322,6 +336,7 @@ function translateReasoning(
 
 export function translateAnthropicToResponses(
   payload: AnthropicMessagesPayload,
+  defaultEffort?: string,
 ): ResponsesPayload {
   // Build input items from all messages
   const inputItems: Array<ResponsesInputItem> = []
@@ -342,7 +357,11 @@ export function translateAnthropicToResponses(
     temperature: payload.temperature,
     top_p: payload.top_p,
     max_output_tokens: payload.max_tokens,
-    reasoning: translateReasoning(payload.thinking, payload.output_config),
+    reasoning: translateReasoning(
+      payload.thinking,
+      payload.output_config,
+      defaultEffort,
+    ),
     stream: payload.stream,
     user: payload.metadata?.user_id,
     // NOTE: stop_sequences is not forwarded — the Responses API has no

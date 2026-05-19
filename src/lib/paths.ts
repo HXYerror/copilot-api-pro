@@ -27,12 +27,23 @@ const DB_PATH = path.join(APP_DIR, "copilot-api.db")
 
 const TRACES_DIR = path.join(APP_DIR, "traces")
 
+// Persistent log of beta flags upstream rejected at runtime. One flag per
+// line, ASCII-only. The Anthropic-passthrough service appends to this file
+// when it auto-learns a new unsupported flag; subsequent process restarts
+// read it to skip flagging-from-cold-start.
+//
+// Why a separate file (not config.json): operators don't *configure* this;
+// it's an observability artefact. Living next to `traces/` keeps the
+// "ops byproduct" semantics clear.
+const LEARNED_BETA_PATH = path.join(APP_DIR, "learned-unsupported-beta.txt")
+
 export const PATHS = {
   APP_DIR,
   GITHUB_TOKEN_PATH,
   CONFIG_PATH,
   DB_PATH,
   TRACES_DIR,
+  LEARNED_BETA_PATH,
 }
 
 export function configPath(): string {

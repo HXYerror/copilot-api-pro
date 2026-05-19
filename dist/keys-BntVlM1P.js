@@ -18,12 +18,14 @@ const GITHUB_TOKEN_PATH = path.join(APP_DIR, "github_token");
 const CONFIG_PATH = path.join(APP_DIR, "config.json");
 const DB_PATH = path.join(APP_DIR, "copilot-api.db");
 const TRACES_DIR = path.join(APP_DIR, "traces");
+const LEARNED_BETA_PATH = path.join(APP_DIR, "learned-unsupported-beta.txt");
 const PATHS = {
 	APP_DIR,
 	GITHUB_TOKEN_PATH,
 	CONFIG_PATH,
 	DB_PATH,
-	TRACES_DIR
+	TRACES_DIR,
+	LEARNED_BETA_PATH
 };
 function configPath() {
 	return CONFIG_PATH;

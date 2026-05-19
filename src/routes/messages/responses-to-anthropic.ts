@@ -81,10 +81,26 @@ function translateMessageItem(
     } => p.type === "output_text",
   )
 
-  if (textParts.length === 0) return []
+  // Refusals are first-class content from the model — silently dropping
+  // them leaves the client with an empty assistant message that looks like
+  // the model "went mute". Surface refusal text inline as a normal text
+  // block so users at least see why their request was declined. The
+  // Anthropic protocol has no native refusal block, so flattening is the
+  // least-bad option (matches how the OpenAI client does it).
+  const refusalParts = item.content.filter(
+    (p): p is { type: "refusal"; refusal: string } =>
+      (p as { type?: string }).type === "refusal",
+  )
 
-  // Merge all text parts into a single text block (Anthropic expects one text block per message)
-  const combined = textParts.map((p) => p.text).join("")
+  if (textParts.length === 0 && refusalParts.length === 0) return []
+
+  // Merge text parts into a single text block (Anthropic expects one text
+  // block per message); append refusal text afterwards so the order
+  // matches the original Responses output.
+  const combined = [
+    ...textParts.map((p) => p.text),
+    ...refusalParts.map((p) => p.refusal),
+  ].join("")
   return [{ type: "text", text: combined }]
 }
 

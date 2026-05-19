@@ -15,14 +15,15 @@ import {
   setRuntimeAuthOverride,
 } from "./lib/config-store"
 import { closeDb, getDb, initDb } from "./lib/db"
-import { ensurePaths } from "./lib/paths"
+import { ensurePaths, PATHS } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
-import { setupCopilotToken, setupGitHubToken } from "./lib/token"
+import { setupCopilotToken, setupGitHubToken, stopCopilotTokenRefresh } from "./lib/token"
 import { cacheModels } from "./lib/utils"
 import { server } from "./server"
 import { audit, initAudit } from "./services/audit"
+import { unseededLearnedBetaFlags } from "./services/copilot/create-messages-native"
 import { sweepExpiredDebugKeys } from "./services/debug-ttl-sweeper"
 import { getCopilotChatVersion } from "./services/get-copilot-chat-version"
 import { getVSCodeVersion } from "./services/get-vscode-version"
@@ -189,6 +190,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     stopEventRetention,
     stopTraceRetention,
     stopConfigWatcher,
+    stopCopilotTokenRefresh,
   ])
 
   logAuthModeBanner(authMode)
@@ -262,6 +264,20 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   }
 
   consola.box(`🖥  Admin Web UI: ${serverUrl}/admin/`)
+
+  // If the auto-learn deny-list file contains flags NOT yet in the source
+  // seed, surface them loudly so a future dev knows to promote them via a
+  // code commit. File lives at
+  // ~/.local/share/copilot-api-pro/learned-unsupported-beta.txt
+  const unseeded = unseededLearnedBetaFlags()
+  if (unseeded.length > 0) {
+    consola.warn(
+      `[anthropic-beta] auto-learned ${unseeded.length} unsupported beta flag(s)\n`
+        + `  not yet in source seed: ${unseeded.join(", ")}\n`
+        + `  → see ${PATHS.LEARNED_BETA_PATH}\n`
+        + `  → add to SEEDED_UNSUPPORTED_BETA in src/services/copilot/create-messages-native.ts`,
+    )
+  }
 
   serve({
     fetch: server.fetch as ServerHandler,

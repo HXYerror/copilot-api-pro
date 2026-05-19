@@ -6,8 +6,10 @@ import { streamSSE } from "hono/streaming"
 import type { TelemetryVar } from "~/middleware/telemetry"
 
 import { awaitApproval } from "~/lib/approval"
+import { getConfig } from "~/lib/config-store"
 import { readCopilotUsage } from "~/lib/copilot-usage"
 import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
+import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import { isModelAllowed } from "~/middleware/auth"
 import {
@@ -70,6 +72,27 @@ export async function handleResponses(
     await awaitApproval()
   }
 
+  // Apply the operator-configured request rate limit (--rate-limit). The
+  // other two endpoints (/v1/chat/completions and /v1/messages) already gate
+  // here; without this check, callers can bypass the throttle by routing
+  // traffic through /v1/responses and burn Copilot quota → GitHub abuse
+  // detection / account suspension.
+  await checkRateLimit(state)
+
+  // Per-alias default effort: inject when client didn't supply reasoning.effort.
+  // Responses API has effort: low|medium|high (no xhigh); xhigh → high.
+  const aliasDefault = getConfig().models[clientAlias]?.default_effort
+  if (!payload.reasoning?.effort && aliasDefault && aliasDefault !== "") {
+    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    consola.debug(
+      `[alias-effort] injecting reasoning.effort=${e} (alias=${clientAlias})`,
+    )
+    payload = {
+      ...payload,
+      reasoning: { ...payload.reasoning, effort: e },
+    }
+  }
+
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
     .trace_capture_upstream
   const response = await createResponses(payload, onUpstream)
@@ -103,24 +126,50 @@ function streamResponsesEvents(
   return streamSSE(
     c,
     async (stream) => {
-      for await (const rawEvent of response as AsyncIterable<{
-        data?: string
-        event?: string
-      }>) {
-        if (!rawEvent.data) continue
-        const forwardData = sanitiseSseDataIfPossible(rawEvent.data)
+      try {
+        for await (const rawEvent of response as AsyncIterable<{
+          data?: string
+          event?: string
+        }>) {
+          if (!rawEvent.data) continue
+          const forwardData = sanitiseSseDataIfPossible(rawEvent.data)
+          await stream.writeSSE({
+            event: rawEvent.event,
+            data: forwardData,
+          })
+        }
+      } catch (err) {
+        // Upstream iterator threw mid-stream (TCP reset, 5xx after some events,
+        // events() helper internal error). Forward a generic error event so
+        // clients see the failure rather than an abruptly-closed stream.
+        consola.error("Responses SSE iteration failed:", err)
         await stream.writeSSE({
-          event: rawEvent.event,
-          data: forwardData,
+          event: "error",
+          data: JSON.stringify({
+            type: "api_error",
+            message: "Upstream stream interrupted",
+          }),
         })
       }
     },
     async (err, stream) => {
-      consola.error("Responses SSE stream error:", err)
-      await stream.writeSSE({
-        event: "error",
-        data: JSON.stringify({ message: String(err) }),
-      })
+      // streamSSE's outer onError fires when writeSSE itself rejects (e.g.,
+      // client disconnected, downstream socket gone). NEVER surface `err.stack`
+      // or `String(err)` here — on Bun those include absolute file paths and
+      // node_modules internals that leak server topology to the client. The
+      // detailed cause goes to consola; the wire only sees a fixed string.
+      consola.error("Responses SSE outer error:", err)
+      try {
+        await stream.writeSSE({
+          event: "error",
+          data: JSON.stringify({
+            type: "api_error",
+            message: "Stream write failed",
+          }),
+        })
+      } catch {
+        // Write also failed — connection is gone. Nothing more to do.
+      }
     },
   )
 }

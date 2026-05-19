@@ -28,6 +28,7 @@ interface ModelRow {
   upstream: string
   enabled: boolean
   allowed_keys: Array<string>
+  default_effort: "" | "low" | "medium" | "high" | "xhigh"
 }
 
 function configToRows(cfg: AppConfig): Array<ModelRow> {
@@ -36,6 +37,7 @@ function configToRows(cfg: AppConfig): Array<ModelRow> {
     upstream: e.upstream,
     enabled: e.enabled,
     allowed_keys: e.allowed_keys,
+    default_effort: (e.default_effort ?? "") as ModelRow["default_effort"],
   }))
 }
 
@@ -47,6 +49,7 @@ function rowsToConfig(rows: Array<ModelRow>, base: AppConfig): AppConfig {
       upstream: r.upstream.trim(),
       enabled: r.enabled,
       allowed_keys: r.allowed_keys.length === 0 ? ["*"] : r.allowed_keys,
+      default_effort: r.default_effort,
     }
   }
   return { ...base, models }
@@ -175,7 +178,13 @@ export function Settings() {
   function addRow() {
     setRows((prev) => [
       ...prev,
-      { alias: "", upstream: "", enabled: true, allowed_keys: ["*"] },
+      {
+        alias: "",
+        upstream: "",
+        enabled: true,
+        allowed_keys: ["*"],
+        default_effort: "",
+      },
     ])
   }
 
@@ -365,6 +374,7 @@ export function Settings() {
                         <th className="px-2 py-2">Alias</th>
                         <th className="px-2 py-2">Upstream model</th>
                         <th className="px-2 py-2">Capabilities</th>
+                        <th className="px-2 py-2">Thinking</th>
                         <th className="px-2 py-2">Enabled</th>
                         <th className="px-2 py-2"></th>
                       </tr>
@@ -444,6 +454,29 @@ export function Settings() {
                             <td className="px-2 py-2 text-xs text-tremor-content">
                               <CapsCell model={upstream} />
                             </td>
+                            <td className="px-2 py-2 text-xs">
+                              {/* Per-alias default effort. Injected when the
+                                  client sends no thinking signal. Models
+                                  whose catalog doesn't list reasoning_effort
+                                  ignore the setting silently (the runtime
+                                  clamps to supported levels). */}
+                              <select
+                                value={r.default_effort}
+                                onChange={(e) =>
+                                  updateRow(i, {
+                                    default_effort:
+                                      e.target.value as ModelRow["default_effort"],
+                                  })
+                                }
+                                className="w-full rounded-tremor-small border border-tremor-border bg-tremor-background px-2 py-1 text-xs"
+                              >
+                                <option value="">— off —</option>
+                                <option value="low">low</option>
+                                <option value="medium">medium</option>
+                                <option value="high">high</option>
+                                <option value="xhigh">xhigh</option>
+                              </select>
+                            </td>
                             <td className="px-2 py-2 text-center">
                               <input
                                 type="checkbox"
@@ -485,6 +518,7 @@ export function Settings() {
                       upstream,
                       enabled: true,
                       allowed_keys: ["*"],
+                      default_effort: "",
                     }
                     if (idx !== -1) {
                       const copy = [...prev]

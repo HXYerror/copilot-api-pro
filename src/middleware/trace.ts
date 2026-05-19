@@ -55,6 +55,13 @@ const MAX_BODY_BYTES = 256 * 1024 // 256 KB per leg
 export interface UpstreamCapture {
   req: TraceLeg
   res?: TraceLeg
+  /**
+   * Streaming callers can return a Promise that resolves to the response
+   * leg once the upstream stream has drained. The trace middleware awaits
+   * this (with a 30s safety timeout) before writing the JSONL line so the
+   * `upstream_res.body` field is populated for streaming responses.
+   */
+  res_pending?: Promise<TraceLeg | undefined>
 }
 
 export type TraceCaptureUpstream = (capture: UpstreamCapture) => void
@@ -133,22 +140,22 @@ async function readBodyCapped(
       buf += decoder.decode(value, { stream: true })
       totalBytes += value.byteLength
     }
-    // Detect if there's still more data
-    if (!truncated) {
-      const tail = (await reader.read()) as {
-        value?: Uint8Array
-        done: boolean
+    // IMPORTANT: drain the rest silently rather than cancel(). The body
+    // here is a CLONED request body (req.clone().body) and Bun's tee
+    // implementation back-pressures the source when one side stops
+    // consuming — calling cancel() can propagate cancellation to the
+    // source, which makes the handler's c.req.json() hang. Same bug
+    // class as the snapshotPostMeta hang. Drain to EOF instead; we
+    // discard the bytes but release the tee.
+    if (totalBytes >= MAX_BODY_BYTES) {
+      truncated = true
+      while (true) {
+        const r = (await reader.read()) as { done: boolean }
+        if (r.done) break
       }
-      if (!tail.done) truncated = true
     }
   } catch (err) {
     consola.debug(`[trace] body read failed: ${String(err)}`)
-  } finally {
-    try {
-      await reader.cancel()
-    } catch {
-      // already done
-    }
   }
   return truncated ? `${buf}[TRUNCATED]` : buf
 }
@@ -308,11 +315,20 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   // can record the proxy→Copilot leg of the request.
   // v1 supports a SINGLE upstream pair (most routes make exactly one
   // upstream call); subsequent captures within the same request overwrite.
+  //
+  // For STREAMING upstreams the capture happens asynchronously as the
+  // upstream stream drains in the background — at the time `onUpstream`
+  // returns, the body hasn't been accumulated yet. Callers signal this by
+  // setting `cap.res_pending` to a Promise that resolves when the body is
+  // ready. finishTrace awaits this promise (with a 30s safety timeout)
+  // before writing the JSONL line so the upstream_res field is populated.
   let upstreamReq: TraceLeg | undefined
   let upstreamRes: TraceLeg | undefined
+  let upstreamResPending: Promise<TraceLeg | undefined> | undefined
   const capture: TraceCaptureUpstream = (cap) => {
     upstreamReq = cap.req
     if (cap.res) upstreamRes = cap.res
+    if (cap.res_pending) upstreamResPending = cap.res_pending
   }
   // Type-safe set; helpers retrieve via c.var.trace_capture_upstream.
   ;(c as Context<{ Variables: TraceVar }>).set(
@@ -329,7 +345,29 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
     thrown = err
   }
 
-  const finishTrace = (resState: ResponseCaptureState): void => {
+  const finishTrace = async (resState: ResponseCaptureState): Promise<void> => {
+    // Wait for any pending streaming-upstream capture to finish so the
+    // JSONL line has a populated upstream_res.body. 30s ceiling so a
+    // wedged upstream stream can never block the writer indefinitely.
+    if (upstreamResPending) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const settled = await Promise.race([
+          upstreamResPending,
+          new Promise<undefined>((resolve) => {
+            timer = setTimeout(() => resolve(undefined), 30_000)
+          }),
+        ])
+        if (settled) upstreamRes = settled
+      } catch {
+        // Pending capture rejected — keep whatever upstreamRes was set
+        // synchronously (probably nothing). Don't block the trace write.
+      } finally {
+        // Clear the safety timer so the event loop can exit cleanly when
+        // the upstream actually resolved before the timeout.
+        if (timer) clearTimeout(timer)
+      }
+    }
     try {
       const traceMeta = (c.var as { trace_meta?: Record<string, unknown> })
         .trace_meta
@@ -355,11 +393,13 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   }
 
   if (threw) {
-    finishTrace({ buf: "", totalBytes: 0, truncated: false })
+    void finishTrace({ buf: "", totalBytes: 0, truncated: false })
     throw thrown
   }
 
-  wrapResponseForCapture(c, finishTrace)
+  wrapResponseForCapture(c, (state) => {
+    void finishTrace(state)
+  })
 }
 
 // Note on upstream capture: the trace middleware exports a

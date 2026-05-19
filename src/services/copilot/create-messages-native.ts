@@ -16,11 +16,13 @@
 
 import consola from "consola"
 import { events } from "fetch-event-stream"
+import fs from "node:fs"
 
 import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
 
 import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
+import { PATHS } from "~/lib/paths"
 import { state } from "~/lib/state"
 
 import type { UpstreamCaptureFn } from "./create-chat-completions"
@@ -37,6 +39,7 @@ export const createMessagesNative = async (
   payload: AnthropicMessagesPayload,
   onUpstream?: UpstreamCaptureFn,
   clientAnthropicBeta?: string,
+  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "",
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -55,22 +58,103 @@ export const createMessagesNative = async (
   consola.debug("Native Anthropic upstream:", upstream)
 
   // Strip fields that are Copilot-API–specific or unsupported by upstream
-  const body = buildUpstreamPayload(payload)
+  const body = buildUpstreamPayload(payload, defaultEffort)
 
-  const response = await fetch(upstream, {
+  // `sentHeaders` is the header map that ACTUALLY went out on the wire for
+  // the response we'll forward. It diverges from the initially-built
+  // `headers` only when the auto-learn retry path below rewrites
+  // `anthropic-beta`. The trace upstream-leg capture downstream must use
+  // this — recording the pre-retry header set on a retried request would
+  // make traces lie about what we sent.
+  let sentHeaders: Record<string, string> = headers
+  let response = await fetch(upstream, {
     method: "POST",
-    headers,
+    headers: sentHeaders,
     body: JSON.stringify(body),
   })
 
+  // ──────────────────────────────────────────────────────────────────────
+  // Auto-learn unsupported beta flags.
+  //
+  // Copilot's Anthropic endpoint returns 400 with body
+  // `{"error":{"message":"unsupported beta header(s): X, Y, ..."}}`
+  // when we forward a flag it hasn't implemented. We don't want to
+  // maintain that deny-list by hand for every new flag Claude Code
+  // adopts — so on this specific 400 shape we:
+  //   1. parse the flag names out of the error body
+  //   2. add them to `learnedUnsupportedBeta` (process-lifetime)
+  //   3. rebuild the header WITHOUT those flags
+  //   4. retry the request ONCE
+  //
+  // Only retry once: if it still 400s, real upstream failure — surface it.
+  // Stream responses are retried the same way (the failure happens before
+  // any body is consumed since 400 short-circuits).
+  // ──────────────────────────────────────────────────────────────────────
+  if (response.status === 400) {
+    // Use clone() so the original body stays readable for forwardError()
+    // downstream when this turns out not to be an unsupported-beta shape.
+    // The 400 body is small (~hundreds of bytes of JSON) so the tee cost
+    // is negligible and there's no risk of back-pressuring a streaming
+    // source — error responses never stream.
+    const errBody = await response.clone().text()
+    const newlyUnsupported = parseUnsupportedBetaFromError(errBody)
+    if (newlyUnsupported.length > 0) {
+      const denyList = ensureLearnedSet()
+      // Determine which flags are TRULY new (not in deny-list yet) BEFORE
+      // mutating the set. Concurrent requests that hit the same unknown
+      // flag won't both persist it — the second one sees it already in
+      // the Set after the first one added it.
+      const newToProcess: Array<string> = []
+      for (const f of newlyUnsupported) {
+        if (!denyList.has(f)) {
+          denyList.add(f)
+          newToProcess.push(f)
+        }
+      }
+      // Persist NEW flags (not seed, not already in file) so future
+      // process restarts skip them from the start AND devs can see what
+      // accumulated by reading the file.
+      for (const f of newToProcess) {
+        if (!SEEDED_UNSUPPORTED_BETA.includes(f)) {
+          persistLearnedBetaFlag(f)
+          unseededFlagsFromFile.push(f)
+        }
+      }
+      consola.warn(
+        `[anthropic-beta] upstream rejected ${JSON.stringify(newlyUnsupported)}`
+          + ` — added to deny-list${newToProcess.length > 0 ? " (new, persisted)" : ""}, retrying`,
+      )
+      // Rebuild the anthropic-beta header against the now-updated deny-list.
+      // If the rebuild yields an empty value, drop the header entirely:
+      // forwarding `anthropic-beta: ""` would either be a no-op or get
+      // rejected as a malformed value depending on upstream's parser.
+      sentHeaders = { ...headers }
+      const rebuiltBeta = mergeAnthropicBeta(clientAnthropicBeta)
+      if (rebuiltBeta === "") {
+        delete sentHeaders["anthropic-beta"]
+      } else {
+        sentHeaders["anthropic-beta"] = rebuiltBeta
+      }
+      response = await fetch(upstream, {
+        method: "POST",
+        headers: sentHeaders,
+        body: JSON.stringify(body),
+      })
+    }
+  }
+
   // Trace upstream-leg capture (task #25). Error bodies are captured too —
   // they're small and tell us why upstream rejected the request.
-  if (onUpstream) {
+  //
+  // Streaming responses: we tee the body so we can both forward the live
+  // SSE to the client AND accumulate the bytes for the trace. The trace
+  // fires only after the upstream stream closes (or aborts), so the body
+  // we record matches exactly what the client received.
+  if (onUpstream && !payload.stream) {
     try {
-      const responseBody =
-        payload.stream ? undefined : await response.clone().text()
+      const responseBody = await response.clone().text()
       onUpstream({
-        req: { method: "POST", url: upstream, headers, body },
+        req: { method: "POST", url: upstream, headers: sentHeaders, body },
         res: {
           status: response.status,
           headers: response.headers,
@@ -79,6 +163,90 @@ export const createMessagesNative = async (
       })
     } catch (err) {
       consola.warn(`[trace] upstream capture failed: ${String(err)}`)
+    }
+  } else if (onUpstream && payload.stream && response.body) {
+    // Streaming path. Replace `response` with a synthetic Response whose
+    // body is a tee'd ReadableStream — the SSE forwarder reads one half,
+    // we accumulate the other into a buffer. The trace middleware awaits
+    // `res_pending` (with a 30s safety timeout) before writing the JSONL
+    // so the upstream_res.body field is populated.
+    try {
+      const [forForwarder, forCapture] = response.body.tee()
+      // Snapshot upstream metadata BEFORE replacing `response`. The new
+      // Response copies headers/status either way, but reading the
+      // originals removes any doubt about which fields we're recording.
+      const upstreamResHeaders = response.headers
+      const upstreamResStatus = response.status
+      response = new Response(forForwarder, {
+        status: upstreamResStatus,
+        statusText: response.statusText,
+        headers: upstreamResHeaders,
+      })
+      const MAX_CAPTURE = 256 * 1024
+      const resPending = (async () => {
+        const reader = forCapture.getReader()
+        const decoder = new TextDecoder()
+        let buf = ""
+        let bytes = 0
+        let truncated = false
+        let streamErr: unknown
+        try {
+          while (true) {
+            const r = (await reader.read()) as {
+              value?: Uint8Array
+              done: boolean
+            }
+            if (r.done) break
+            const v = r.value
+            if (!v) break
+            if (bytes < MAX_CAPTURE) {
+              // Still capturing into the buffer.
+              const room = MAX_CAPTURE - bytes
+              if (v.byteLength <= room) {
+                buf += decoder.decode(v, { stream: true })
+                bytes += v.byteLength
+              } else {
+                buf += decoder.decode(v.slice(0, room), { stream: true })
+                bytes = MAX_CAPTURE
+                truncated = true
+              }
+            }
+            // After hitting MAX_CAPTURE we KEEP READING but discard the
+            // bytes. Stopping here would back-pressure the tee — the
+            // forwarder half (going to the client) would stall waiting
+            // for us to consume. Same bug class as the telemetry-clone
+            // hang fixed earlier; don't reintroduce it.
+          }
+        } catch (err) {
+          // Stash the failure so it surfaces on the trace leg rather
+          // than being silently swallowed. The forwarder half sees the
+          // same error and propagates to the client; we mirror it here
+          // so operators reading the trace can see WHY the body is
+          // truncated.
+          streamErr = err
+        }
+        // Suffix the body so the trace makes the failure obvious.
+        // Format-compatible with the existing [TRUNCATED] marker so
+        // downstream tooling that splits on `[` keeps working.
+        let resBody = buf
+        if (truncated) resBody += "[TRUNCATED]"
+        if (streamErr !== undefined) {
+          const msg =
+            streamErr instanceof Error ? streamErr.message : String(streamErr)
+          resBody += `[STREAM_ERROR: ${msg}]`
+        }
+        return {
+          status: upstreamResStatus,
+          headers: upstreamResHeaders,
+          body: resBody,
+        } as const
+      })()
+      onUpstream({
+        req: { method: "POST", url: upstream, headers: sentHeaders, body },
+        res_pending: resPending,
+      })
+    } catch (err) {
+      consola.warn(`[trace] upstream tee failed: ${String(err)}`)
     }
   }
 
@@ -99,29 +267,107 @@ export const createMessagesNative = async (
 // ---------------------------------------------------------------------------
 
 /**
- * Build the anthropic-beta header forwarded upstream.
+ * Auto-learning deny-list of beta flags upstream rejects.
  *
- * We MUST forward whatever beta flags the client sent — Claude Code sends
- * the full set including `effort-2025-11-24` (which gates
- * `output_config.effort`) and `redact-thinking-2026-02-12` (which gates
- * thinking-encryption behaviour). Hard-coding our own list silently drops
- * them and the model behaves as if those features were off (we observed
- * 0 thinking blocks even with effort:"xhigh" until this was fixed).
+ * Layered state:
+ *   1. **Seed** — hard-coded values committed to the repo. Things we've
+ *      already observed in production. Avoids the cold-start retry penalty
+ *      on every brand-new install.
+ *   2. **File** — `~/.local/share/copilot-api-pro/learned-unsupported-beta.txt`
+ *      Per-line ASCII flag names. Read once on first use, appended to when a
+ *      new flag is learned. Persists across restarts. Operators can edit it
+ *      manually to revert / extend the deny-list.
+ *   3. **Process** — the live `Set<string>` mutated when auto-learn fires.
  *
- * We additionally union in two flags we always want on so direct-API
- * callers without the right beta header still get them:
- *   - interleaved-thinking-2025-05-14  (mixed thinking + text blocks)
- *   - prompt-caching-2024-07-31        (cache_control support)
- *
- * Output is comma-separated, de-duplicated.
+ * When a NEW flag (not in seed + not in file) is learned, we ALSO log a
+ * loud warning at startup of subsequent processes so operators / devs
+ * notice and can promote it into the seed via a code commit.
  */
+const SEEDED_UNSUPPORTED_BETA: ReadonlyArray<string> = [
+  "context-1m-2025-08-07", // observed 2026-05-19
+]
+
+/** Lazily-initialised on first call. Stays empty until the file is read. */
+let learnedUnsupportedBeta: Set<string> | undefined
+
+/** Flags present in the file but NOT in the seed — surface at startup. */
+const unseededFlagsFromFile: Array<string> = []
+
+function ensureLearnedSet(): Set<string> {
+  if (learnedUnsupportedBeta) return learnedUnsupportedBeta
+  const s = new Set<string>(SEEDED_UNSUPPORTED_BETA)
+  try {
+    const raw = fs.readFileSync(PATHS.LEARNED_BETA_PATH, "utf8")
+    for (const line of raw.split("\n")) {
+      const flag = line.trim()
+      if (!flag || flag.startsWith("#")) continue
+      if (!/^[\w.-]+$/.test(flag)) continue
+      if (!SEEDED_UNSUPPORTED_BETA.includes(flag)) {
+        unseededFlagsFromFile.push(flag)
+      }
+      s.add(flag)
+    }
+  } catch {
+    // File doesn't exist yet — that's fine, just use the seed.
+  }
+  learnedUnsupportedBeta = s
+  return s
+}
+
+/**
+ * Get the set of flags discovered at runtime that are NOT in the source
+ * seed. Used by start.ts to surface them in the boot banner so the next
+ * developer notices and bumps the seed.
+ */
+export function unseededLearnedBetaFlags(): Array<string> {
+  ensureLearnedSet()
+  return [...unseededFlagsFromFile]
+}
+
+/**
+ * Append a newly-learned flag to the persistent file with a timestamped
+ * comment line. Best-effort: a write failure logs but doesn't propagate
+ * (the in-memory Set still works for this process).
+ */
+function persistLearnedBetaFlag(flag: string): void {
+  try {
+    const ts = new Date().toISOString()
+    const line = `# learned ${ts}\n${flag}\n`
+    fs.appendFileSync(PATHS.LEARNED_BETA_PATH, line, { mode: 0o600 })
+  } catch (err) {
+    consola.warn(
+      `[anthropic-beta] failed to persist learned flag "${flag}": ${String(err)}`,
+    )
+  }
+}
+
 function mergeAnthropicBeta(clientBeta: string | undefined): string {
   const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"]
   const fromClient = (clientBeta ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
-  return [...new Set([...fromClient, ...ours])].join(",")
+  const merged = [...new Set([...fromClient, ...ours])]
+  // Strip flags we've previously learned upstream rejects.
+  const denyList = ensureLearnedSet()
+  return merged.filter((flag) => !denyList.has(flag)).join(",")
+}
+
+/**
+ * Parse upstream 400 body for `unsupported beta header(s): X, Y` and
+ * return the flag names. Returns empty array when the body isn't a
+ * recognised "unsupported beta" error.
+ */
+function parseUnsupportedBetaFromError(body: string): Array<string> {
+  // Body may be raw upstream error OR doubly-encoded by our forward layer.
+  // We just regex-extract from the raw string — either way the substring
+  // we want is in there.
+  const m = /unsupported beta header\(s\):\s*([^"\\}]+)/i.exec(body)
+  if (!m || !m[1]) return []
+  return m[1]
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && /^[\w.-]+$/.test(s))
 }
 
 /**
@@ -141,12 +387,19 @@ function buildNativeHeaders(
   // Remove headers that are OpenAI-specific and not expected by Anthropic endpoint
   const { "openai-intent": _dropped, ...anthropicBase } = base
 
+  // Build the beta-flag value. When the merged list is empty (the deny-list
+  // could legitimately strip every flag we'd otherwise send — interleaved
+  // -thinking + prompt-caching are seeded as defaults today, but a future
+  // version of upstream could reject both), DROP the header entirely
+  // rather than forwarding `anthropic-beta: ""` which is a malformed value
+  // some HTTP parsers reject.
+  const beta = mergeAnthropicBeta(clientBeta)
   return {
     ...anthropicBase,
     "anthropic-version": "2023-06-01",
     // Forward client beta flags + our defaults. Crucial for Claude Code's
     // `effort-2025-11-24` flag which enables `output_config.effort`.
-    "anthropic-beta": mergeAnthropicBeta(clientBeta),
+    ...(beta === "" ? {} : { "anthropic-beta": beta }),
     // Only request SSE streaming format when the caller is streaming
     ...(stream ? { accept: "text/event-stream" } : {}),
   }
@@ -209,8 +462,9 @@ export function clampEffortForModel(
 ): "low" | "medium" | "high" | "xhigh" | undefined {
   const entry = state.models?.data.find((m) => m.id === modelId)
   const supported = (
-    entry?.capabilities?.supports as { reasoning_effort?: Array<string> }
-    | undefined
+    entry?.capabilities?.supports as
+      | { reasoning_effort?: Array<string> }
+      | undefined
   )?.reasoning_effort
   if (!Array.isArray(supported) || supported.length === 0) {
     // Model didn't advertise reasoning_effort — pass through whatever the
@@ -226,8 +480,8 @@ export function clampEffortForModel(
     .sort((a, b) => (EFFORT_RANK[b] ?? 0) - (EFFORT_RANK[a] ?? 0))[0]
   if (best && effort && best !== effort) {
     consola.debug(
-      `[effort-clamp] model ${modelId} supports ${JSON.stringify(supported)}, ` +
-        `caller asked for "${effort}" → forwarded as "${best}"`,
+      `[effort-clamp] model ${modelId} supports ${JSON.stringify(supported)}, `
+        + `caller asked for "${effort}" → forwarded as "${best}"`,
     )
   }
   return best
@@ -247,8 +501,27 @@ export function clampEffortForModel(
  */
 export function buildUpstreamPayload(
   payload: AnthropicMessagesPayload,
+  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "",
 ): AnthropicMessagesPayload {
   const { thinking, output_config, ...rest } = payload
+
+  // Per-alias default effort: when the client didn't ask for thinking at
+  // all AND the alias config provides a default, synthesise an adaptive
+  // thinking request with that effort. Never overrides what the client
+  // explicitly sent — purely a fill-in. Empty string ("" or undefined)
+  // means no default for this alias.
+  if (!thinking && defaultEffort && defaultEffort !== "") {
+    const clamped =
+      clampEffortForModel(defaultEffort, payload.model) ?? defaultEffort
+    consola.debug(
+      `[alias-effort] injecting default effort=${defaultEffort} (clamped=${clamped}) for model=${payload.model}`,
+    )
+    return {
+      ...rest,
+      thinking: { type: "adaptive" },
+      output_config: { effort: clamped },
+    }
+  }
 
   if (!thinking) {
     return rest // safe: output_config only valid alongside thinking

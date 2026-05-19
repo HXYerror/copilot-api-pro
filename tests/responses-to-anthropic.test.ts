@@ -159,7 +159,12 @@ describe("translateResponsesToAnthropic — message items", () => {
     }
   })
 
-  test("message with no output_text parts → no text block emitted", () => {
+  test("message containing only refusal → surfaces refusal as text block", () => {
+    // Previous behaviour was to drop the message entirely (content: []),
+    // which made the assistant look like it went silent. We now flatten
+    // refusal text into a normal text block so the client at least sees
+    // why their request was declined — Anthropic has no native refusal
+    // block, this is the least-bad faithful translation.
     const response = makeResponse({
       output: [
         {
@@ -172,7 +177,12 @@ describe("translateResponsesToAnthropic — message items", () => {
       ],
     })
     const result = translateResponsesToAnthropic(response)
-    expect(result.content).toHaveLength(0)
+    expect(result.content).toHaveLength(1)
+    const block = result.content[0]
+    expect(block.type).toBe("text")
+    if (block.type === "text") {
+      expect(block.text).toBe("I cannot do that.")
+    }
   })
 })
 
