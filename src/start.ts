@@ -261,9 +261,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     }
   }
 
-  consola.box(
-    `🌐 Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`,
-  )
+  consola.box(`🖥  Admin Web UI: ${serverUrl}/admin/`)
 
   serve({
     fetch: server.fetch as ServerHandler,

@@ -2,7 +2,16 @@ import consola from "consola"
 
 import { VERSION_CACHE_TTL_MS, type VersionCache } from "./version-cache"
 
-export const FALLBACK = "1.104.3"
+/**
+ * Hard-coded fallback used when both the official VSCode update API and the
+ * AUR PKGBUILD mirror are unreachable (offline / firewall / DNS issue).
+ *
+ * Bump this periodically — Copilot's upstream is lenient about
+ * `editor-version` header values but a wildly stale string could in theory
+ * trip future anti-abuse heuristics. Last bumped 2026-05-19 based on
+ * `update.code.visualstudio.com/api/releases/stable` returning 1.120.0.
+ */
+export const FALLBACK = "1.120.0"
 
 let cache: VersionCache | undefined
 

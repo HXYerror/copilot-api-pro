@@ -36,7 +36,14 @@ const VERSION_CACHE_TTL_MS = 1440 * 60 * 1e3;
 
 //#endregion
 //#region src/services/get-copilot-chat-version.ts
-const FALLBACK = "0.26.7";
+/**
+* Hard-coded fallback used when both the Marketplace API and the
+* vscode-copilot-release GitHub releases are unreachable.
+*
+* Bump this periodically. Last bumped 2026-05-19 based on Marketplace
+* extension query returning 0.48.1 for GitHub.copilot-chat.
+*/
+const FALLBACK = "0.48.1";
 let cache$1;
 async function fetchFromMarketplace() {
 	const controller = new AbortController();
@@ -87,7 +94,16 @@ async function getCopilotChatVersion() {
 
 //#endregion
 //#region src/services/get-vscode-version.ts
-const FALLBACK$1 = "1.104.3";
+/**
+* Hard-coded fallback used when both the official VSCode update API and the
+* AUR PKGBUILD mirror are unreachable (offline / firewall / DNS issue).
+*
+* Bump this periodically — Copilot's upstream is lenient about
+* `editor-version` header values but a wildly stale string could in theory
+* trip future anti-abuse heuristics. Last bumped 2026-05-19 based on
+* `update.code.visualstudio.com/api/releases/stable` returning 1.120.0.
+*/
+const FALLBACK$1 = "1.120.0";
 let cache;
 async function fetchFromOfficialApi() {
 	const controller = new AbortController();
@@ -7054,6 +7070,40 @@ function budgetToEffort$1(budget) {
 	return "low";
 }
 /**
+* Some Copilot models restrict `reasoning_effort` to a single value
+* (e.g. claude-opus-4.7-high → ["high"], claude-opus-4.7 → ["medium"]).
+* Sending a value outside that allow-list 400s upstream.
+*
+* Strategy when the caller's effort isn't in the supported list: **take
+* the highest supported level** (xhigh > high > medium > low). Rationale:
+*
+*   - Single-value models like `claude-opus-4.7-high` carry their level
+*     in the name; the user contract is "this model thinks at that level".
+*     Falling back to the only allowed value matches the model's purpose.
+*   - When the list has multiple values, picking the highest matches the
+*     caller's likely intent ("they asked for thinking — give them more
+*     not less"). If they wanted "minimal thinking" they wouldn't have
+*     picked the high model variant.
+*
+* Returns the original effort if it's supported, the highest supported
+* level otherwise, or undefined when the model has no reasoning_effort
+* declared (effort field will be dropped by caller).
+*/
+const EFFORT_RANK = {
+	low: 1,
+	medium: 2,
+	high: 3,
+	xhigh: 4
+};
+function clampEffortForModel(effort, modelId) {
+	const supported = ((state.models?.data.find((m) => m.id === modelId))?.capabilities?.supports)?.reasoning_effort;
+	if (!Array.isArray(supported) || supported.length === 0) return effort;
+	if (effort && supported.includes(effort)) return effort;
+	const best = supported.filter((s) => s in EFFORT_RANK).sort((a, b) => (EFFORT_RANK[b] ?? 0) - (EFFORT_RANK[a] ?? 0))[0];
+	if (best && effort && best !== effort) consola.debug(`[effort-clamp] model ${modelId} supports ${JSON.stringify(supported)}, caller asked for "${effort}" → forwarded as "${best}"`);
+	return best;
+}
+/**
 * Produce the payload forwarded to upstream.
 *
 * We pass through almost everything verbatim.  The only transformation is that
@@ -7070,7 +7120,8 @@ function buildUpstreamPayload(payload) {
 	if (!thinking) return rest;
 	if (isAdaptiveThinkingModel(payload.model)) {
 		if (thinking.type === "enabled") {
-			const effort = output_config?.effort ?? budgetToEffort$1(thinking.budget_tokens);
+			const rawEffort = output_config?.effort ?? budgetToEffort$1(thinking.budget_tokens);
+			const effort = clampEffortForModel(rawEffort, payload.model) ?? rawEffort;
 			consola.debug(`Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`);
 			return {
 				...rest,
@@ -7078,10 +7129,12 @@ function buildUpstreamPayload(payload) {
 				output_config: { effort }
 			};
 		}
+		const callerEffort = output_config?.effort;
+		const clamped = clampEffortForModel(callerEffort, payload.model);
 		return {
 			...rest,
 			thinking,
-			output_config
+			output_config: clamped ? { effort: clamped } : output_config
 		};
 	}
 	return {
@@ -8714,7 +8767,7 @@ async function runServer(options) {
 			consola.log(command);
 		}
 	}
-	consola.box(`🌐 Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`);
+	consola.box(`🖥  Admin Web UI: ${serverUrl}/admin/`);
 	serve({
 		fetch: server.fetch,
 		port: options.port,

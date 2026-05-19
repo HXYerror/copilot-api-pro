@@ -4,6 +4,8 @@ import { setSystemTime } from "bun:test"
 import type { state as StateType } from "../src/lib/state"
 import type { getCopilotChatVersion as GetCopilotChatVersion } from "../src/services/get-copilot-chat-version"
 import type { getVSCodeVersion as GetVSCodeVersion } from "../src/services/get-vscode-version"
+import { FALLBACK as VSCODE_FALLBACK } from "../src/services/get-vscode-version"
+import { FALLBACK as COPILOT_CHAT_FALLBACK } from "../src/services/get-copilot-chat-version"
 
 // ---------------------------------------------------------------------------
 // We test the modules by mocking global `fetch` before importing them.
@@ -91,7 +93,7 @@ describe("getVSCodeVersion", () => {
       `../src/services/get-vscode-version.ts?t=${Date.now() + 2}`
     )) as VSCodeVersionModule
     const version = await mod.getVSCodeVersion()
-    expect(version).toBe("1.104.3")
+    expect(version).toBe(VSCODE_FALLBACK)
   })
 
   test("cache prevents second fetch within TTL", async () => {
@@ -146,7 +148,7 @@ describe("getVSCodeVersion", () => {
       `../src/services/get-vscode-version.ts?t=${Date.now() + 11}`
     )) as VSCodeVersionModule
     const version = await mod.getVSCodeVersion()
-    expect(version).toBe("1.104.3")
+    expect(version).toBe(VSCODE_FALLBACK)
   })
 
   // T5 — TTL expiry triggers refetch
@@ -222,7 +224,7 @@ describe("getCopilotChatVersion", () => {
       `../src/services/get-copilot-chat-version.ts?t=${Date.now() + 1}`
     )) as CopilotChatVersionModule
     const version = await mod.getCopilotChatVersion()
-    expect(version).toBe("0.26.7")
+    expect(version).toBe(COPILOT_CHAT_FALLBACK)
   })
 
   test("returns hardcoded fallback when API response has unexpected shape", async () => {
@@ -234,7 +236,7 @@ describe("getCopilotChatVersion", () => {
       `../src/services/get-copilot-chat-version.ts?t=${Date.now() + 2}`
     )) as CopilotChatVersionModule
     const version = await mod.getCopilotChatVersion()
-    expect(version).toBe("0.26.7")
+    expect(version).toBe(COPILOT_CHAT_FALLBACK)
   })
 
   test("cache prevents second fetch within TTL", async () => {
@@ -266,7 +268,7 @@ describe("getCopilotChatVersion", () => {
       `../src/services/get-copilot-chat-version.ts?t=${Date.now() + 10}`
     )) as CopilotChatVersionModule
     const version = await mod.getCopilotChatVersion()
-    expect(version).toBe("0.26.7")
+    expect(version).toBe(COPILOT_CHAT_FALLBACK)
   })
 
   // T4 — Marketplace returns version: "" (empty string)
@@ -281,7 +283,7 @@ describe("getCopilotChatVersion", () => {
       `../src/services/get-copilot-chat-version.ts?t=${Date.now() + 11}`
     )) as CopilotChatVersionModule
     const version = await mod.getCopilotChatVersion()
-    expect(version).toBe("0.26.7")
+    expect(version).toBe(COPILOT_CHAT_FALLBACK)
   })
 
   // T7 — Format validation rejects CRLF-injected version
@@ -300,7 +302,7 @@ describe("getCopilotChatVersion", () => {
       `../src/services/get-copilot-chat-version.ts?t=${Date.now() + 12}`
     )) as CopilotChatVersionModule
     const version = await mod.getCopilotChatVersion()
-    expect(version).toBe("0.26.7")
+    expect(version).toBe(COPILOT_CHAT_FALLBACK)
   })
 })
 
@@ -317,8 +319,8 @@ describe("State type includes copilotChatVersion", () => {
     expect(state.copilotChatVersion).toBeUndefined()
 
     // Should be assignable without TS errors (runtime check)
-    state.copilotChatVersion = "0.26.7"
-    expect(state.copilotChatVersion).toBe("0.26.7")
+    state.copilotChatVersion = COPILOT_CHAT_FALLBACK
+    expect(state.copilotChatVersion).toBe(COPILOT_CHAT_FALLBACK)
   })
 })
 
@@ -344,6 +346,6 @@ describe("copilotHeaders fallback", () => {
       false,
     )
     expect(headers["editor-plugin-version"]).not.toBe("copilot-chat/undefined")
-    expect(headers["editor-plugin-version"]).toBe("copilot-chat/0.26.7")
+    expect(headers["editor-plugin-version"]).toBe(`copilot-chat/${COPILOT_CHAT_FALLBACK}`)
   })
 })

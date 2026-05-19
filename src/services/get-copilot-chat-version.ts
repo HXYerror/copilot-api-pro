@@ -2,7 +2,14 @@ import consola from "consola"
 
 import { VERSION_CACHE_TTL_MS, type VersionCache } from "./version-cache"
 
-export const FALLBACK = "0.26.7"
+/**
+ * Hard-coded fallback used when both the Marketplace API and the
+ * vscode-copilot-release GitHub releases are unreachable.
+ *
+ * Bump this periodically. Last bumped 2026-05-19 based on Marketplace
+ * extension query returning 0.48.1 for GitHub.copilot-chat.
+ */
+export const FALLBACK = "0.48.1"
 
 let cache: VersionCache | undefined
 

@@ -177,6 +177,63 @@ function budgetToEffort(
 }
 
 /**
+ * Some Copilot models restrict `reasoning_effort` to a single value
+ * (e.g. claude-opus-4.7-high → ["high"], claude-opus-4.7 → ["medium"]).
+ * Sending a value outside that allow-list 400s upstream.
+ *
+ * Strategy when the caller's effort isn't in the supported list: **take
+ * the highest supported level** (xhigh > high > medium > low). Rationale:
+ *
+ *   - Single-value models like `claude-opus-4.7-high` carry their level
+ *     in the name; the user contract is "this model thinks at that level".
+ *     Falling back to the only allowed value matches the model's purpose.
+ *   - When the list has multiple values, picking the highest matches the
+ *     caller's likely intent ("they asked for thinking — give them more
+ *     not less"). If they wanted "minimal thinking" they wouldn't have
+ *     picked the high model variant.
+ *
+ * Returns the original effort if it's supported, the highest supported
+ * level otherwise, or undefined when the model has no reasoning_effort
+ * declared (effort field will be dropped by caller).
+ */
+const EFFORT_RANK: Record<string, number> = {
+  low: 1,
+  medium: 2,
+  high: 3,
+  xhigh: 4,
+}
+
+export function clampEffortForModel(
+  effort: string | undefined,
+  modelId: string,
+): "low" | "medium" | "high" | "xhigh" | undefined {
+  const entry = state.models?.data.find((m) => m.id === modelId)
+  const supported = (
+    entry?.capabilities?.supports as { reasoning_effort?: Array<string> }
+    | undefined
+  )?.reasoning_effort
+  if (!Array.isArray(supported) || supported.length === 0) {
+    // Model didn't advertise reasoning_effort — pass through whatever the
+    // caller had. Caller will decide whether to include the field.
+    return effort as "low" | "medium" | "high" | "xhigh" | undefined
+  }
+  if (effort && supported.includes(effort)) {
+    return effort as "low" | "medium" | "high" | "xhigh"
+  }
+  // Pick the highest-ranked supported level.
+  const best = supported
+    .filter((s): s is "low" | "medium" | "high" | "xhigh" => s in EFFORT_RANK)
+    .sort((a, b) => (EFFORT_RANK[b] ?? 0) - (EFFORT_RANK[a] ?? 0))[0]
+  if (best && effort && best !== effort) {
+    consola.debug(
+      `[effort-clamp] model ${modelId} supports ${JSON.stringify(supported)}, ` +
+        `caller asked for "${effort}" → forwarded as "${best}"`,
+    )
+  }
+  return best
+}
+
+/**
  * Produce the payload forwarded to upstream.
  *
  * We pass through almost everything verbatim.  The only transformation is that
@@ -199,9 +256,14 @@ export function buildUpstreamPayload(
 
   if (isAdaptiveThinkingModel(payload.model)) {
     // Upgrade legacy enabled → adaptive if needed.  Map budget_tokens to a
-    // Copilot effort level when the caller didn't already supply one.
+    // Copilot effort level when the caller didn't already supply one. Then
+    // clamp to whatever this specific model variant supports — e.g.
+    // claude-opus-4.7-high only accepts effort:"high", so caller's "xhigh"
+    // or "low" gets quietly rewritten instead of letting upstream 400.
     if (thinking.type === "enabled") {
-      const effort = output_config?.effort ?? budgetToEffort(thinking.budget_tokens)
+      const rawEffort =
+        output_config?.effort ?? budgetToEffort(thinking.budget_tokens)
+      const effort = clampEffortForModel(rawEffort, payload.model) ?? rawEffort
       consola.debug(
         `Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`,
       )
@@ -211,8 +273,14 @@ export function buildUpstreamPayload(
         output_config: { effort },
       }
     }
-    // Already adaptive — forward as-is
-    return { ...rest, thinking, output_config }
+    // Already adaptive — clamp effort to model-supported level too.
+    const callerEffort = output_config?.effort
+    const clamped = clampEffortForModel(callerEffort, payload.model)
+    return {
+      ...rest,
+      thinking,
+      output_config: clamped ? { effort: clamped } : output_config,
+    }
   }
 
   // Non-adaptive model — forward legacy format, drop output_config
