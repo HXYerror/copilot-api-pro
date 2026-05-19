@@ -211,6 +211,10 @@ export interface UsageResponse {
     rpm: Array<UsageRpmPoint>
     tokens: Array<UsageTokensPoint>
     latency: Array<UsageLatencyPoint>
+    /** Bucket size in ms — server-chosen based on filter span. */
+    bucket_ms?: number
+    /** Human-readable label, e.g. "per minute" / "per hour" / "per 6 hours". */
+    bucket_label?: string
   }
   top_models: Array<UsageTopModel>
   top_keys: Array<UsageTopKey>
@@ -236,6 +240,22 @@ export interface LogEntry {
   latency_ms: number
   error: string | null
   usage_unknown: number
+  /**
+   * Anthropic thinking level extracted from the request body. Short enum-
+   * like string: "auto" / "think-hard" / "think-harder" / "ultrathink" /
+   * "custom:NNN". null when the request didn't include a `thinking` field.
+   */
+  thinking_level: string | null
+  /** Copilot cache_read tokens (prompt-cache hits), from copilot_usage. */
+  cache_read_tokens: number | null
+  /** Copilot cache_write tokens (prompt-cache creations). */
+  cache_creation_tokens: number | null
+  /**
+   * Reasoning/thinking tokens. ONLY exposed on OpenAI /responses replies
+   * via `usage.output_tokens_details.reasoning_tokens`. Anthropic
+   * /v1/messages doesn't break this out — those rows stay null.
+   */
+  reasoning_tokens: number | null
 }
 
 export interface LogsListResponse {
@@ -439,6 +459,12 @@ export interface AppConfig {
     telemetry: boolean
     debug: boolean
   }
+  /**
+   * Alias to use when a client requests a model that is not in `models`.
+   * Empty string = no default; unconfigured requests return 400.
+   * See D-013 / lib/default-model.ts.
+   */
+  default_model_alias: string
 }
 
 export interface SettingsResponse {

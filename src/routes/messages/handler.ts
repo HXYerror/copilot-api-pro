@@ -5,9 +5,9 @@ import { streamSSE } from "hono/streaming"
 
 import type { TelemetryVar } from "~/middleware/telemetry"
 
-import { resolveAlias } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
-import { getConfig } from "~/lib/config-store"
+import { readCopilotUsage } from "~/lib/copilot-usage"
+import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -48,30 +48,45 @@ export async function handleCompletion(
 ) {
   await checkRateLimit(state)
 
-  // Single config snapshot for this request (consistent ingress + future egress).
-  const { models } = getConfig()
-
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
-  // Ingress: rewrite client-facing alias → upstream model name
-  const clientAlias = anthropicPayload.model
+  // Strip Anthropic-only fields that Copilot upstream doesn't recognise.
+  // Claude Code v2.x ships `context_management` / `context_mgmt` in the
+  // request body to control its own context-window heuristics; upstream
+  // Bedrock/Vertex routes reject the request with HTTP 400
+  // "Extra inputs are not permitted". The fields have no analogue server-
+  // side, so dropping them is the right behaviour.
+  const stripped = anthropicPayload as AnthropicMessagesPayload & {
+    context_management?: unknown
+    context_mgmt?: unknown
+  }
+  delete stripped.context_management
+  delete stripped.context_mgmt
+
+  // D-013: rewrite unconfigured aliases to default_model_alias before any
+  // scope check or upstream call.
+  const resolved = applyDefaultModelRewrite(
+    c,
+    anthropicPayload.model,
+    "/v1/messages",
+  )
+  if (isAppliedError(resolved)) return resolved
+  const { clientRequestedModel, clientAlias, upstreamModel } = resolved
+
+  // Ingress: payload uses upstream model id; egress translation maps back.
   const payload: AnthropicMessagesPayload = {
     ...anthropicPayload,
-    model: resolveAlias(anthropicPayload.model, models),
+    model: upstreamModel,
   }
 
-  // Telemetry (issue #34): expose the post-alias upstream model.
-  c.set("upstream_model", payload.model)
-
-  // Scope check: verify the user-facing alias is in the key's allowed_models.
-  // Uses clientAlias (before upstream resolution) per the comment in models/route.ts:28.
+  // Scope check: verify the EFFECTIVE alias is in the key's allowed_models.
   const key = c.get("key")
   if (!isModelAllowed(key.allowed_models, clientAlias)) {
     return c.json(
       {
         error: {
-          message: `Model "${clientAlias}" is not in your key's allowed models`,
+          message: `Model "${clientRequestedModel}" is not in your key's allowed models`,
           type: "permission_denied",
           code: "model_not_allowed",
         },
@@ -110,7 +125,13 @@ async function handleNative(
 
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
     .trace_capture_upstream
-  const response = await createMessagesNative(payload, onUpstream)
+  // Forward the client's `anthropic-beta` header so feature flags like
+  // `effort-2025-11-24` (gates `output_config.effort`) and
+  // `redact-thinking-2026-02-12` (controls thinking encryption) actually
+  // reach Copilot. Without this, Claude Code's effort:"xhigh" is silently
+  // ignored and the model never thinks.
+  const clientBeta = c.req.header("anthropic-beta")
+  const response = await createMessagesNative(payload, onUpstream, clientBeta)
 
   if (!payload.stream) {
     // Non-streaming: upstream already returned a complete Anthropic response
@@ -118,16 +139,10 @@ async function handleNative(
       "Native non-streaming response:",
       JSON.stringify(response).slice(0, 400),
     )
-    // Telemetry (issue #34): native Anthropic returns Anthropic-shaped usage
-    const usage = (
-      response as { usage?: { input_tokens?: number; output_tokens?: number } }
-    ).usage
-    if (usage) {
-      c.set("usage", {
-        prompt_tokens: usage.input_tokens,
-        completion_tokens: usage.output_tokens,
-      })
-    }
+    // Telemetry: read from copilot_usage.token_details when present so we
+    // capture Copilot's own token counts (input / output / cache_read /
+    // cache_write), falling back to native Anthropic usage when not.
+    c.set("usage", readCopilotUsage(response))
     return c.json(response)
   }
 
@@ -230,11 +245,10 @@ async function handleAnthropicViaResponses(
 
   const sanitised = sanitiseResponsesOutput(typedResponse)
   const anthropicResponse = translateResponsesToAnthropic(sanitised)
-  // Telemetry (issue #34): Anthropic-shaped usage on non-streaming path.
-  c.set("usage", {
-    prompt_tokens: anthropicResponse.usage.input_tokens,
-    completion_tokens: anthropicResponse.usage.output_tokens,
-  })
+  // Telemetry: read from copilot_usage on the original upstream response so
+  // we capture Copilot's own token counts (the translated anthropic shape
+  // doesn't include copilot_usage).
+  c.set("usage", readCopilotUsage(typedResponse))
 
   consola.debug(
     "Responses→Anthropic translated response:",
@@ -267,13 +281,10 @@ async function handleTranslated(
       JSON.stringify(response).slice(-400),
     )
     // Telemetry (issue #34): stash usage from the OpenAI-shaped response.
-    if (response.usage) {
-      c.set("usage", {
-        prompt_tokens: response.usage.prompt_tokens,
-        completion_tokens: response.usage.completion_tokens,
-        total_tokens: response.usage.total_tokens,
-      })
-    }
+    // Telemetry: prefer copilot_usage from the original chat-completion
+    // response over the translated-to-Anthropic shape (the latter strips
+    // copilot_usage during translation).
+    c.set("usage", readCopilotUsage(response))
     const anthropicResponse = translateToAnthropic(response)
     consola.debug(
       "Translated Anthropic response:",
@@ -302,14 +313,12 @@ async function handleTranslated(
       }
 
       const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
-      // Telemetry (issue #34): grab usage off the OpenAI chunk before we
-      // translate it into Anthropic events (which drops the field).
-      if (chunk.usage) {
-        c.set("usage", {
-          prompt_tokens: chunk.usage.prompt_tokens,
-          completion_tokens: chunk.usage.completion_tokens,
-          total_tokens: chunk.usage.total_tokens,
-        })
+      // Telemetry: read copilot_usage off the OpenAI chunk before we
+      // translate it into Anthropic events (which drops the field). The
+      // helper handles both copilot_usage and native usage shapes.
+      const u = readCopilotUsage(chunk)
+      if (u.prompt_tokens !== undefined || u.completion_tokens !== undefined) {
+        c.set("usage", u)
       }
       const events = translateChunkToAnthropicEvents(chunk, streamState)
 

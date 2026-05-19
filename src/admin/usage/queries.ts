@@ -71,6 +71,39 @@ export interface ErrorRateRow {
 
 const MINUTE_MS = 60_000
 const HOUR_MS = 3_600_000
+const DAY_MS = 86_400_000
+
+/**
+ * Pick the bucket size for time-series queries, mapping range → granularity
+ * exactly as the user wants them displayed on the Usage page:
+ *
+ *   1h  → per minute   (60 bars)
+ *   24h → per hour     (24 bars)
+ *   7d  → per day      (7 bars)
+ *   30d → per week     (~4 bars)
+ *
+ * Picked by SPAN, not by the range enum string, so a "custom" range with a
+ * comparable span gets the same granularity. The cut-offs sit at the
+ * midpoint between two adjacent presets so a span slightly under 24h still
+ * falls into "per hour", not "per minute".
+ */
+export interface BucketChoice {
+  bucketMs: number
+  /** Short label suitable for axis / title, e.g. "per minute" / "per day". */
+  label: string
+}
+
+export function chooseBucket(filter: UsageFilter): BucketChoice {
+  const span = Math.max(0, filter.until - filter.since)
+  // 1h or less → minute buckets
+  if (span <= 12 * HOUR_MS) return { bucketMs: MINUTE_MS, label: "per minute" }
+  // up to ~3.5 days → hour buckets (covers 24h cleanly)
+  if (span <= 3.5 * DAY_MS) return { bucketMs: HOUR_MS, label: "per hour" }
+  // up to ~18 days → day buckets (covers 7d cleanly)
+  if (span <= 18 * DAY_MS) return { bucketMs: DAY_MS, label: "per day" }
+  // anything beyond → week buckets (covers 30d cleanly)
+  return { bucketMs: 7 * DAY_MS, label: "per week" }
+}
 
 /**
  * Build a `(?,?,...)` placeholder string for a SQL IN clause.  Returns
@@ -107,12 +140,17 @@ function buildWhere(filter: UsageFilter): WhereFragment {
 }
 
 // ---------------------------------------------------------------------------
-// requestsPerMinute — bucketed by minute, grouped by model
+// requestsPerBucket — grouped by model and a caller-chosen bucket size.
+// Replaces the old hard-coded `requestsPerMinute` so 7d/30d don't render as
+// a chart with thousands of minute-wide bars.
 // ---------------------------------------------------------------------------
 
-export function requestsPerMinute(filter: UsageFilter): Array<RpmPoint> {
+export function requestsPerBucket(
+  filter: UsageFilter,
+  bucketMs: number,
+): Array<RpmPoint> {
   const where = buildWhere(filter)
-  const sql = `SELECT (ts / ${MINUTE_MS}) * ${MINUTE_MS} AS bucket,
+  const sql = `SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket,
             model AS model,
             COUNT(*) AS count
        FROM events
@@ -127,13 +165,24 @@ export function requestsPerMinute(filter: UsageFilter): Array<RpmPoint> {
   return rows.map((r) => ({ ts: r.bucket, model: r.model, count: r.count }))
 }
 
+/**
+ * Legacy alias kept for backwards-compat with any external caller that
+ * still imports `requestsPerMinute`.  Always returns minute buckets.
+ */
+export function requestsPerMinute(filter: UsageFilter): Array<RpmPoint> {
+  return requestsPerBucket(filter, MINUTE_MS)
+}
+
 // ---------------------------------------------------------------------------
-// tokensPerHour — hour buckets, summed prompt/completion
+// tokensPerBucket — bucketed prompt/completion sums
 // ---------------------------------------------------------------------------
 
-export function tokensPerHour(filter: UsageFilter): Array<TokensPoint> {
+export function tokensPerBucket(
+  filter: UsageFilter,
+  bucketMs: number,
+): Array<TokensPoint> {
   const where = buildWhere(filter)
-  const sql = `SELECT (ts / ${HOUR_MS}) * ${HOUR_MS} AS bucket,
+  const sql = `SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket,
             COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
             COALESCE(SUM(completion_tokens), 0) AS completion_tokens
        FROM events
@@ -151,6 +200,10 @@ export function tokensPerHour(filter: UsageFilter): Array<TokensPoint> {
     prompt_tokens: r.prompt_tokens,
     completion_tokens: r.completion_tokens,
   }))
+}
+
+export function tokensPerHour(filter: UsageFilter): Array<TokensPoint> {
+  return tokensPerBucket(filter, HOUR_MS)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,11 +502,12 @@ export interface LatencyPercentilesPoint {
 
 export function latencyPercentiles(
   filter: UsageFilter,
+  bucketMs: number = HOUR_MS,
 ): Array<LatencyPercentilesPoint> {
   const where = buildWhere(filter)
   const buckets = getDb()
     .query<{ bucket: number; count: number }, Array<unknown>>(
-      `SELECT (ts / ${HOUR_MS}) * ${HOUR_MS} AS bucket, COUNT(*) AS count
+      `SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket, COUNT(*) AS count
          FROM events
         WHERE ${where.sql}
         GROUP BY bucket
@@ -471,7 +525,7 @@ export function latencyPercentiles(
   const out: Array<LatencyPercentilesPoint> = []
   for (const b of buckets) {
     if (b.count === 0) continue
-    const bucketEnd = b.bucket + HOUR_MS
+    const bucketEnd = b.bucket + bucketMs
     const pick = (frac: number): number => {
       const offset = Math.floor(frac * (b.count - 1))
       const innerSql = `SELECT latency_ms FROM events

@@ -5,9 +5,11 @@ import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import type { TelemetryVar } from "~/middleware/telemetry"
 
-import { resolveAlias, resolveUpstream } from "~/lib/alias"
+import { resolveUpstream } from "~/lib/alias"
 import { awaitApproval } from "~/lib/approval"
 import { getConfig } from "~/lib/config-store"
+import { readCopilotUsage } from "~/lib/copilot-usage"
+import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -28,28 +30,30 @@ export async function handleCompletion(
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
   // Take a single config snapshot for the lifetime of this request.
-  // Using one snapshot ensures ingress + egress rewrites are consistent even
-  // if the config hot-reloads between the two calls.
   const { models } = getConfig()
 
-  // Ingress: rewrite client-facing alias → upstream model name.
-  // Preserve the original alias so egress can return it verbatim (avoids the
-  // O(n) reverse-scan and multi-alias ambiguity problems).
-  const clientAlias = payload.model
-  payload = { ...payload, model: resolveAlias(payload.model, models) }
+  // D-013: rewrite unconfigured aliases to default_model_alias, stash
+  // upstream_model + trace_meta. Returns a 400 Response when the alias is
+  // unknown and no default is set.
+  const resolved = applyDefaultModelRewrite(
+    c,
+    payload.model,
+    "/v1/chat/completions",
+  )
+  if (isAppliedError(resolved)) return resolved
+  const { clientRequestedModel, clientAlias, upstreamModel } = resolved
+  payload = { ...payload, model: upstreamModel }
 
-  // Telemetry (issue #34): make the resolved upstream model visible to the
-  // middleware's finally hook so it can record `upstream_model` accurately.
-  c.set("upstream_model", payload.model)
-
-  // Scope check: verify the user-facing alias is in the key's allowed_models.
-  // Uses clientAlias (before upstream resolution) per the comment in models/route.ts:28.
+  // Scope check: verify the EFFECTIVE alias is in the key's allowed_models.
+  // We use clientAlias (post-fallback) so scope can't be bypassed by sending
+  // an unknown name; we also prefer rejecting against the alias the user
+  // actually sees in the API response.
   const key = c.get("key")
   if (!isModelAllowed(key.allowed_models, clientAlias)) {
     return c.json(
       {
         error: {
-          message: `Model "${clientAlias}" is not in your key's allowed models`,
+          message: `Model "${clientRequestedModel}" is not in your key's allowed models`,
           type: "permission_denied",
           code: "model_not_allowed",
         },
@@ -108,15 +112,9 @@ export async function handleCompletion(
 
   if (isNonStreaming(response)) {
     consola.debug("Non-streaming response:", JSON.stringify(response))
-    // Telemetry (issue #34): stash usage so the middleware records real
-    // token counts on non-streaming responses.
-    if (response.usage) {
-      c.set("usage", {
-        prompt_tokens: response.usage.prompt_tokens,
-        completion_tokens: response.usage.completion_tokens,
-        total_tokens: response.usage.total_tokens,
-      })
-    }
+    // Telemetry: prefer copilot_usage.token_details over the native OpenAI
+    // usage shape so events table reflects Copilot's own token counts.
+    c.set("usage", readCopilotUsage(response))
     // Egress: return the original client alias rather than the upstream name.
     // Use clientAlias directly (exact round-trip) if an alias was configured;
     // fall back to resolveUpstream for un-aliased models.
@@ -168,26 +166,18 @@ function maybeStashUsageFromChunk(
   } catch {
     return
   }
+  if (typeof parsed !== "object" || parsed === null) return
+  // Prefer copilot_usage on the chunk (Copilot stamps it on the terminal
+  // chat-completion chunk), fall back to the native OpenAI usage block.
+  const u = readCopilotUsage(parsed)
   if (
-    typeof parsed !== "object"
-    || parsed === null
-    || !Object.hasOwn(parsed, "usage")
+    u.prompt_tokens !== undefined
+    || u.completion_tokens !== undefined
+    || u.cache_read_tokens !== undefined
+    || u.cache_creation_tokens !== undefined
   ) {
-    return
+    c.set("usage", u)
   }
-  const usage = (parsed as { usage?: unknown }).usage
-  if (typeof usage !== "object" || usage === null) return
-  const u = usage as Record<string, unknown>
-  c.set("usage", {
-    prompt_tokens:
-      typeof u["prompt_tokens"] === "number" ? u["prompt_tokens"] : undefined,
-    completion_tokens:
-      typeof u["completion_tokens"] === "number" ?
-        u["completion_tokens"]
-      : undefined,
-    total_tokens:
-      typeof u["total_tokens"] === "number" ? u["total_tokens"] : undefined,
-  })
 }
 
 type ModelMap = ReturnType<typeof getConfig>["models"]

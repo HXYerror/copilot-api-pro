@@ -178,7 +178,21 @@ function makeTmpConfig(
   const cfgPath = path.join(dir, "config.json")
   const cfg: Config = {
     version: 1,
-    models: {},
+    // Pre-register the model names used across this test file so the
+    // D-013 default-model interceptor passes them through unchanged.
+    models: {
+      "gpt-4o": { upstream: "gpt-4o", enabled: true, allowed_keys: ["*"] },
+      "claude-sonnet-4-5": {
+        upstream: "claude-sonnet-4-5",
+        enabled: true,
+        allowed_keys: ["*"],
+      },
+      "claude-sonnet-4.5": {
+        upstream: "claude-sonnet-4.5",
+        enabled: true,
+        allowed_keys: ["*"],
+      },
+    },
     retention: {
       events_days: 90,
       traces_days: 7,
@@ -187,6 +201,7 @@ function makeTmpConfig(
       ...retention,
     },
     features: { auth: true, telemetry: false, debug: false, ...features },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return cfgPath
@@ -258,6 +273,7 @@ afterEach(async () => {
       audit_days: 365,
     },
     features: { auth: false, telemetry: false, debug: false },
+    default_model_alias: "",
   }
   saveConfig(resetCfg, resetPath)
   await loadConfig(resetPath).catch(() => {})
@@ -309,6 +325,10 @@ describe("events service", () => {
       latency_ms: 42,
       error: null,
       usage_unknown: 0,
+    thinking_level: null,
+    cache_read_tokens: null,
+    cache_creation_tokens: null,
+    reasoning_tokens: null,
     })
     expect(countEvents()).toBe(1)
   })
@@ -328,6 +348,10 @@ describe("events service", () => {
         latency_ms: 0,
         error: "upstream_error",
         usage_unknown: 1,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
       }),
     ).not.toThrow()
   })
@@ -346,6 +370,10 @@ describe("events service", () => {
         latency_ms: 1,
         error: null,
         usage_unknown: 1,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
       })
     }
     // Keep last 2 (cutoff at now - 3000), delete first 3
@@ -406,6 +434,10 @@ describe("retention sweep", () => {
         latency_ms: 0,
         error: null,
         usage_unknown: 1,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
       })
     }
     for (let i = 0; i < 2; i++) {
@@ -420,6 +452,10 @@ describe("retention sweep", () => {
         latency_ms: 0,
         error: null,
         usage_unknown: 1,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
       })
     }
     expect(countEvents()).toBe(5)
@@ -442,6 +478,10 @@ describe("retention sweep", () => {
       latency_ms: 0,
       error: null,
       usage_unknown: 1,
+    thinking_level: null,
+    cache_read_tokens: null,
+    cache_creation_tokens: null,
+    reasoning_tokens: null,
     })
     const deleted = await sweepEventsOnce()
     expect(deleted).toBe(0)

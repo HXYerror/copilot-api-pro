@@ -78,7 +78,16 @@ function makeTmpConfig(override: Partial<Config["features"]> = {}): {
   const cfgPath = path.join(tmpDir, "config.json")
   const cfg: Config = {
     version: 1,
-    models: {},
+    // Pre-register names used by scope-check tests so the D-013 default-
+    // model interceptor passes them through to the scope check.
+    models: {
+      "gpt-4o": { upstream: "gpt-4o", enabled: true, allowed_keys: ["*"] },
+      "claude-sonnet-4-5": {
+        upstream: "claude-sonnet-4-5",
+        enabled: true,
+        allowed_keys: ["*"],
+      },
+    },
     retention: {
       events_days: 90,
       traces_days: 7,
@@ -86,6 +95,7 @@ function makeTmpConfig(override: Partial<Config["features"]> = {}): {
       audit_days: 365,
     },
     features: { auth: true, telemetry: false, debug: false, ...override },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return { tmpDir, cfgPath }

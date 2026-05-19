@@ -52,12 +52,33 @@ const FeaturesSchema = z.object({
   debug: z.boolean().default(false),
 })
 
-export const ConfigSchema = z.object({
-  version: z.literal(1),
-  models: z.preprocess((v) => v ?? {}, z.record(z.string(), ModelEntrySchema)),
-  retention: z.preprocess((v) => v ?? {}, RetentionSchema),
-  features: z.preprocess((v) => v ?? {}, FeaturesSchema),
-})
+export const ConfigSchema = z
+  .object({
+    version: z.literal(1),
+    models: z.preprocess(
+      (v) => v ?? {},
+      z.record(z.string(), ModelEntrySchema),
+    ),
+    retention: z.preprocess((v) => v ?? {}, RetentionSchema),
+    features: z.preprocess((v) => v ?? {}, FeaturesSchema),
+    // Fallback alias used when a client requests a model that is not in
+    // `models`. When set, unconfigured aliases are rewritten to this alias
+    // before scope-check and upstream routing. When unset (empty string),
+    // unconfigured requests return 400 (see lib/default-model.ts).
+    default_model_alias: z.string().default(""),
+  })
+  .superRefine((cfg, ctx) => {
+    if (
+      cfg.default_model_alias
+      && !Object.hasOwn(cfg.models, cfg.default_model_alias)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["default_model_alias"],
+        message: `default_model_alias "${cfg.default_model_alias}" is not defined in models. Add the alias to models first, or clear this field.`,
+      })
+    }
+  })
 
 export type Config = z.infer<typeof ConfigSchema>
 

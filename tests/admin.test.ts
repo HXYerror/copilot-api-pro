@@ -97,6 +97,7 @@ function makeTmpConfig(
       audit_days: 365,
     },
     features: { auth: true, telemetry: false, debug: false, ...override },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return cfgPath

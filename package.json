@@ -43,7 +43,7 @@
     "pre-commit": "bunx lint-staged"
   },
   "lint-staged": {
-    "*": "bun run lint --fix"
+    "{src,ui,tests,scripts}/**/*.{js,jsx,ts,tsx}": "bun run lint --fix"
   },
   "dependencies": {
     "citty": "^0.1.6",

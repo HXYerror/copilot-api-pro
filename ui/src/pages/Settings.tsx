@@ -1,3 +1,4 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   Badge,
   Button,
@@ -11,16 +12,16 @@ import {
   TextInput,
   Title,
 } from "@tremor/react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useEffect, useState } from "react"
 
-import { api } from "~/api/client"
 import type {
   AppConfig,
   SettingsResponse,
   UpstreamCatalogResponse,
   UpstreamModel,
 } from "~/api/types"
+
+import { api } from "~/api/client"
 
 interface ModelRow {
   alias: string
@@ -89,7 +90,7 @@ export function Settings() {
       setToast("Settings saved")
       void qc.invalidateQueries({ queryKey: ["settings"] })
       void qc.invalidateQueries({ queryKey: ["models"] })
-      window.setTimeout(() => setToast(null), 2500)
+      globalThis.setTimeout(() => setToast(null), 2500)
     },
   })
 
@@ -105,7 +106,7 @@ export function Settings() {
     const issues: Array<string> = []
     if (alias && !upstream) issues.push("upstream required")
     if (!alias && upstream) issues.push("alias required")
-    if (alias && rows.findIndex((o, j) => j !== i && o.alias.trim() === alias) >= 0) {
+    if (alias && rows.some((o, j) => j !== i && o.alias.trim() === alias)) {
       issues.push("duplicate alias")
     }
     return { complete: alias.length > 0 && upstream.length > 0, issues }
@@ -113,9 +114,22 @@ export function Settings() {
   // Only duplicate aliases block save — incomplete rows get silently dropped
   // (with a visual warning), so the operator can save partially and finish
   // the half-filled row later if they choose.
-  const blockingIssues = rowDiagnostics.some((d) =>
+  const duplicateAlias = rowDiagnostics.some((d) =>
     d.issues.includes("duplicate alias"),
   )
+  // Block save if default_model_alias points at an alias that is NOT going
+  // to exist after save (rowsToConfig drops incomplete rows + duplicates).
+  // We compare against the staged rows, not draft.models, so unsaved edits
+  // are honoured.
+  const defaultAliasMissing =
+    draft !== null
+    && draft.default_model_alias !== ""
+    && !rows.some(
+      (r) =>
+        r.alias.trim() === draft.default_model_alias
+        && r.upstream.trim() !== "",
+    )
+  const blockingIssues = duplicateAlias || defaultAliasMissing
   const droppedRows = rowDiagnostics.filter(
     (d) =>
       d.issues.includes("upstream required")
@@ -128,15 +142,13 @@ export function Settings() {
   if (error) {
     return (
       <div className="rounded-tremor-small border border-rose-300 bg-rose-50 p-4 text-rose-700">
-        Failed to load settings: {(error as Error).message}
+        Failed to load settings: {error.message}
       </div>
     )
   }
 
   const saveError =
-    saveMutation.error instanceof Error ?
-      saveMutation.error.message
-    : null
+    saveMutation.error instanceof Error ? saveMutation.error.message : null
 
   function updateRetention<K extends keyof AppConfig["retention"]>(
     key: K,
@@ -202,6 +214,62 @@ export function Settings() {
             <TabPanel>
               <div className="space-y-6 p-4">
                 <section>
+                  <Title>Default model fallback</Title>
+                  <Text>
+                    When a client requests an alias that is not configured
+                    below, the proxy rewrites the request to use this default
+                    alias instead. Leave blank to reject unknown aliases with
+                    HTTP 400.
+                  </Text>
+                  <div className="mt-3">
+                    <label className="block">
+                      <span className="text-xs font-medium text-tremor-content-subtle">
+                        Default alias
+                      </span>
+                      <select
+                        value={draft.default_model_alias}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            default_model_alias: e.target.value,
+                          })
+                        }
+                        className="mt-1 w-full max-w-xs rounded-tremor-small border border-tremor-border bg-tremor-background px-3 py-2 text-sm"
+                      >
+                        <option value="">— none (reject unknown) —</option>
+                        {/* Use the live `rows` list rather than persisted
+                            `draft.models` so the dropdown reflects edits
+                            that haven't been saved yet. */}
+                        {rows
+                          .map((r) => r.alias.trim())
+                          .filter((a, i, arr) => a && arr.indexOf(a) === i)
+                          .map((a) => (
+                            <option key={a} value={a}>
+                              {a}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                    {draft.default_model_alias
+                      && !rows.some(
+                        (r) => r.alias.trim() === draft.default_model_alias,
+                      ) && (
+                        <p className="mt-2 text-xs text-rose-600">
+                          Default alias “{draft.default_model_alias}” is not in
+                          the Models tab. Add it as an alias first, or change
+                          the default.
+                        </p>
+                      )}
+                    {!draft.default_model_alias && (
+                      <p className="mt-2 text-xs text-amber-600">
+                        No default set — clients sending unconfigured aliases
+                        will receive HTTP 400.
+                      </p>
+                    )}
+                  </div>
+                </section>
+
+                <section>
                   <Title>Features</Title>
                   <Text>
                     Auth is locked out of the UI to prevent operator lock-out.
@@ -210,7 +278,11 @@ export function Settings() {
                   </Text>
                   <div className="mt-3 space-y-2 text-sm">
                     <label className="flex items-center gap-2">
-                      <input type="checkbox" checked={draft.features.auth} disabled />
+                      <input
+                        type="checkbox"
+                        checked={draft.features.auth}
+                        disabled
+                      />
                       <span className="text-tremor-content-subtle">
                         Auth (locked: edit config.json)
                       </span>
@@ -240,7 +312,9 @@ export function Settings() {
 
                 <section>
                   <Title>Retention</Title>
-                  <Text>Cleanup horizons for telemetry, traces, and audit.</Text>
+                  <Text>
+                    Cleanup horizons for telemetry, traces, and audit.
+                  </Text>
                   <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
                     <RetentionInput
                       label="Events (days)"
@@ -255,9 +329,7 @@ export function Settings() {
                     <RetentionInput
                       label="Traces max bytes"
                       value={draft.retention.traces_max_bytes}
-                      onChange={(v) =>
-                        updateRetention("traces_max_bytes", v)
-                      }
+                      onChange={(v) => updateRetention("traces_max_bytes", v)}
                     />
                     <RetentionInput
                       label="Audit (days)"
@@ -308,9 +380,7 @@ export function Settings() {
                             key={i}
                             className={
                               "border-b border-tremor-border last:border-b-0 align-top "
-                              + (diag.issues.length > 0
-                                ? "bg-rose-50/50"
-                                : "")
+                              + (diag.issues.length > 0 ? "bg-rose-50/50" : "")
                             }
                           >
                             <td className="px-2 py-2">
@@ -320,8 +390,10 @@ export function Settings() {
                                 onValueChange={(v) =>
                                   updateRow(i, { alias: v })
                                 }
-                                error={diag.issues.includes("alias required")
-                                  || diag.issues.includes("duplicate alias")}
+                                error={
+                                  diag.issues.includes("alias required")
+                                  || diag.issues.includes("duplicate alias")
+                                }
                                 errorMessage={
                                   diag.issues.includes("duplicate alias") ?
                                     "duplicate alias"
@@ -339,9 +411,9 @@ export function Settings() {
                                 }
                                 className={
                                   "w-full rounded-tremor-small border bg-tremor-background px-3 py-2 text-sm "
-                                  + (diag.issues.includes("upstream required")
-                                    ? "border-rose-400"
-                                    : "border-tremor-border")
+                                  + (diag.issues.includes("upstream required") ?
+                                    "border-rose-400"
+                                  : "border-tremor-border")
                                 }
                               >
                                 <option value="">— select —</option>
@@ -352,10 +424,10 @@ export function Settings() {
                                   && !catalog?.items.some(
                                     (m) => m.id === r.upstream,
                                   ) && (
-                                  <option value={r.upstream}>
-                                    {r.upstream} (not in catalog)
-                                  </option>
-                                )}
+                                    <option value={r.upstream}>
+                                      {r.upstream} (not in catalog)
+                                    </option>
+                                  )}
                                 {catalog?.items.map((m) => (
                                   <option key={m.id} value={m.id}>
                                     {m.id}
@@ -414,7 +486,7 @@ export function Settings() {
                       enabled: true,
                       allowed_keys: ["*"],
                     }
-                    if (idx >= 0) {
+                    if (idx !== -1) {
                       const copy = [...prev]
                       copy[idx] = next
                       return copy
@@ -442,9 +514,15 @@ export function Settings() {
       </Card>
 
       <div className="flex items-center justify-end gap-3">
-        {blockingIssues && (
+        {duplicateAlias && (
           <span className="text-xs text-rose-600">
             Duplicate alias — rename or remove the conflicting row.
+          </span>
+        )}
+        {!duplicateAlias && defaultAliasMissing && (
+          <span className="text-xs text-rose-600">
+            Default model alias not configured — choose a valid alias or clear
+            it.
           </span>
         )}
         {!blockingIssues && droppedRows > 0 && (
@@ -513,10 +591,9 @@ function CapsCell({ model }: { model: UpstreamModel | undefined }) {
   const ctx = limits.max_context_window_tokens
   const out = limits.max_output_tokens
   const fmt = (n: number | undefined) =>
-    n === undefined || n === null
-      ? "—"
-      : n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`
-      : String(n)
+    n === undefined || n === null ? "—"
+    : n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`
+    : String(n)
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap gap-1">
@@ -591,9 +668,9 @@ function CatalogPanel({ catalog, draft, onUseAlias }: CatalogPanelProps) {
       <div>
         <Title>Copilot upstream catalog</Title>
         <Text>
-          Live model list reported by GitHub Copilot at startup. Read-only.
-          Use the "Use as alias" button to start a new alias row in the
-          Models tab; the alias defaults to the upstream id but is editable.
+          Live model list reported by GitHub Copilot at startup. Read-only. Use
+          the "Use as alias" button to start a new alias row in the Models tab;
+          the alias defaults to the upstream id but is editable.
         </Text>
       </div>
 
@@ -662,7 +739,7 @@ function CatalogPanel({ catalog, draft, onUseAlias }: CatalogPanelProps) {
                   key={m.id}
                   model={m}
                   aliases={aliasesByUpstream.get(m.id) ?? []}
-                  isOpen={!!expandedCatalog[m.id]}
+                  isOpen={Boolean(expandedCatalog[m.id])}
                   onToggle={() =>
                     setExpandedCatalog((p) => ({ ...p, [m.id]: !p[m.id] }))
                   }
@@ -706,14 +783,13 @@ function CatalogRow({
   const minThink = supports.min_thinking_budget as number | undefined
   const maxThink = supports.max_thinking_budget as number | undefined
   const adaptiveThink = supports.adaptive_thinking === true
-  const reasoning = Array.isArray(supports.reasoning_effort)
-    ? (supports.reasoning_effort as Array<string>)
+  const reasoning =
+    Array.isArray(supports.reasoning_effort) ?
+      (supports.reasoning_effort as Array<string>)
     : null
   return (
     <>
-      <tr
-        className="border-b border-tremor-border last:border-b-0 align-top hover:bg-tremor-background-muted/60"
-      >
+      <tr className="border-b border-tremor-border last:border-b-0 align-top hover:bg-tremor-background-muted/60">
         <td
           className="px-3 py-2 cursor-pointer text-tremor-content-subtle"
           onClick={onToggle}
@@ -733,27 +809,25 @@ function CatalogRow({
           <div>
             <Badge color="blue">{m.vendor}</Badge>
           </div>
-          <div className="mt-1 text-tremor-content">
-            {caps.family as string}
-          </div>
+          <div className="mt-1 text-tremor-content">{caps.family}</div>
         </td>
         <td className="px-3 py-2 text-xs">
-          <Badge color="violet">{(caps.type as string) || "—"}</Badge>
+          <Badge color="violet">{caps.type || "—"}</Badge>
           {Array.isArray(m.supported_endpoints)
             && m.supported_endpoints.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
-              {m.supported_endpoints
-                .filter((p) => !p.startsWith("ws:"))
-                .map((p) => (
-                  <Badge
-                    key={p}
-                    color={p === "/responses" ? "violet" : "blue"}
-                  >
-                    {p}
-                  </Badge>
-                ))}
-            </div>
-          )}
+              <div className="mt-1 flex flex-wrap gap-1">
+                {m.supported_endpoints
+                  .filter((p) => !p.startsWith("ws:"))
+                  .map((p) => (
+                    <Badge
+                      key={p}
+                      color={p === "/responses" ? "violet" : "blue"}
+                    >
+                      {p}
+                    </Badge>
+                  ))}
+              </div>
+            )}
         </td>
         <td className="px-3 py-2 text-xs text-tremor-content">
           <div>
@@ -775,8 +849,7 @@ function CatalogRow({
                 <div className="mt-1 text-tremor-content-subtle">adaptive</div>
               )}
             </>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-3 py-2 text-xs">
           {reasoning ?
@@ -787,8 +860,7 @@ function CatalogRow({
                 </Badge>
               ))}
             </div>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-3 py-2 text-xs">
           <div className="flex flex-wrap gap-1">
@@ -798,26 +870,19 @@ function CatalogRow({
             {supports.parallel_tool_calls === true && (
               <Badge color="emerald">parallel</Badge>
             )}
-            {supports.streaming === true && (
-              <Badge color="cyan">stream</Badge>
-            )}
-            {supports.vision === true && (
-              <Badge color="indigo">vision</Badge>
-            )}
+            {supports.streaming === true && <Badge color="cyan">stream</Badge>}
+            {supports.vision === true && <Badge color="indigo">vision</Badge>}
             {supports.structured_outputs === true && (
               <Badge color="violet">structured</Badge>
             )}
-            {supports.dimensions === true && (
-              <Badge color="slate">embed</Badge>
-            )}
+            {supports.dimensions === true && <Badge color="slate">embed</Badge>}
           </div>
         </td>
         <td className="px-3 py-2 text-xs">
           <div className="flex flex-wrap gap-1">
             {m.preview ?
               <Badge color="amber">preview</Badge>
-            : <Badge color="slate">ga</Badge>
-            }
+            : <Badge color="slate">ga</Badge>}
             {m.model_picker_enabled ?
               <Badge color="emerald">picker on</Badge>
             : null}

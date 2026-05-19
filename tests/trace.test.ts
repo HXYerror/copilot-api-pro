@@ -65,7 +65,16 @@ function makeTmpConfig(
   const cfgPath = path.join(dir, "config.json")
   const cfg: Config = {
     version: 1,
-    models: {},
+    // Pre-register model names used by this test file so the D-013
+    // default-model interceptor passes them through unchanged.
+    models: {
+      "gpt-4o": { upstream: "gpt-4o", enabled: true, allowed_keys: ["*"] },
+      "claude-sonnet-4-5": {
+        upstream: "claude-sonnet-4-5",
+        enabled: true,
+        allowed_keys: ["*"],
+      },
+    },
     retention: {
       events_days: 90,
       traces_days: 7,
@@ -74,6 +83,7 @@ function makeTmpConfig(
       ...retention,
     },
     features: { auth: true, telemetry: false, debug: false, ...features },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return cfgPath
@@ -143,6 +153,7 @@ afterEach(async () => {
       audit_days: 365,
     },
     features: { auth: false, telemetry: false, debug: false },
+    default_model_alias: "",
   }
   saveConfig(resetCfg, resetPath)
   await loadConfig(resetPath).catch(() => {})

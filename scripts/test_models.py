@@ -228,19 +228,45 @@ def build_chat_body(model: str, scenario: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def build_anthropic_body(model: str, scenario: dict[str, str]) -> dict[str, Any]:
-    # Anthropic /v1/messages requires `max_tokens` — pick a generous cap so we
-    # don't artificially throttle the response. The actual reply may be much
-    # shorter; this is the upper bound the model can produce.
-    return {
+def build_anthropic_body(
+    model: str,
+    scenario: dict[str, str],
+    thinking: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Anthropic /v1/messages requires `max_tokens` AND enforces
+    # `max_tokens > thinking.budget_tokens` when thinking is enabled. We size
+    # max_tokens so it always exceeds the budget (budget + 4K reply headroom),
+    # falling back to 4096 when thinking is off / unbudgeted (adaptive mode).
+    max_tokens = 4096
+    if thinking is not None:
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int) and budget > 0:
+            max_tokens = budget + 4096
+    body: dict[str, Any] = {
         "model": model,
         "system": scenario["system"],
         "messages": [
             {"role": "user", "content": scenario["user"]},
         ],
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "stream": False,
     }
+    if thinking is not None:
+        body["thinking"] = thinking
+    return body
+
+
+# Claude Code's user-visible thinking levels, mapped to the wire shapes the
+# Anthropic API expects. Used by --with-thinking to verify all four levels
+# round-trip through the proxy and reach upstream correctly. Budget tokens
+# match Claude Code's preset values (see ui formatThinkingLevel).
+THINKING_PRESETS: list[tuple[str, dict[str, Any] | None]] = [
+    ("none",         None),
+    ("auto",         {"type": "adaptive"}),
+    ("think-hard",   {"type": "enabled", "budget_tokens": 10_000}),
+    ("think-harder", {"type": "enabled", "budget_tokens": 31_999}),
+    ("ultrathink",   {"type": "enabled", "budget_tokens": 63_999}),
+]
 
 
 def build_responses_body(model: str, scenario: dict[str, str]) -> dict[str, Any]:
@@ -347,6 +373,7 @@ def probe_model(
     model: str,
     scenario_idx: int,
     timeout: float,
+    thinking_preset: tuple[str, dict[str, Any] | None] | None = None,
 ) -> ProbeOutcome:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -382,7 +409,17 @@ def probe_model(
             **headers,
             "anthropic-version": "2023-06-01",
         }
-        body = build_anthropic_body(model, scenario)
+        # When --with-thinking is on, thinking_preset is set and we tag the
+        # scenario column so each level shows up as its own row in the
+        # summary table.  Passing None keeps the default (no thinking field)
+        # to verify the baseline path still works.
+        wire_thinking = thinking_preset[1] if thinking_preset else None
+        scenario_tag = (
+            f"{scenario['name']}+{thinking_preset[0]}"
+            if thinking_preset and thinking_preset[0] != "none"
+            else scenario["name"]
+        )
+        body = build_anthropic_body(model, scenario, wire_thinking)
         r = http_post(url, headers_anthropic, body, timeout)
         text = extract_anthropic_text(r.body) if r.status == 200 else None
         ok = bool(text)
@@ -390,7 +427,7 @@ def probe_model(
         return ProbeOutcome(
             model=model,
             endpoint="messages",
-            scenario=scenario["name"],
+            scenario=scenario_tag,
             status=r.status,
             ok=ok,
             elapsed_ms=r.elapsed_ms,
@@ -577,6 +614,15 @@ def main() -> int:
         action="store_true",
         help="Include accounts/*/routers/* dispatcher entries (skipped by default).",
     )
+    parser.add_argument(
+        "--with-thinking",
+        action="store_true",
+        help=(
+            "For each Claude model, also fire requests with the 4 Claude Code "
+            "thinking levels (Auto / Think hard / Think harder / Ultrathink) "
+            "so each appears as its own row in the summary."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.key:
@@ -617,19 +663,29 @@ def main() -> int:
 
     outcomes: list[ProbeOutcome] = []
     for i, model in enumerate(probe_list):
-        out = probe_model(
-            base_url=base_url,
-            api_key=args.key,
-            model=model,
-            scenario_idx=i,
-            timeout=args.timeout,
-        )
-        outcomes.append(out)
-        flag = "✓" if out.ok else "✗"
-        print(
-            f"{flag} {out.model:<38}  {out.endpoint:<18}  {out.scenario:<14}  "
-            f"{out.elapsed_ms:>5}  {out.status:>6}  {out.note}"
-        )
+        # For Claude models, when --with-thinking is on, fan out across the
+        # 4 thinking presets (plus the "none" baseline). For everything else
+        # we keep one probe per model.
+        if args.with_thinking and is_claude(model):
+            presets = THINKING_PRESETS
+        else:
+            presets = [("none", None)]
+
+        for preset in presets:
+            out = probe_model(
+                base_url=base_url,
+                api_key=args.key,
+                model=model,
+                scenario_idx=i,
+                timeout=args.timeout,
+                thinking_preset=preset if args.with_thinking else None,
+            )
+            outcomes.append(out)
+            flag = "✓" if out.ok else "✗"
+            print(
+                f"{flag} {out.model:<38}  {out.endpoint:<18}  {out.scenario:<14}  "
+                f"{out.elapsed_ms:>5}  {out.status:>6}  {out.note}"
+            )
 
     # Summary
     print()

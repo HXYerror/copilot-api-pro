@@ -13,6 +13,7 @@ import type { Context, MiddlewareHandler } from "hono"
 
 import consola from "consola"
 import { Hono } from "hono"
+import crypto from "node:crypto"
 
 import { CSRF_HEADER, extractCsrfCookie, verifyCsrfToken } from "./csrf"
 import {
@@ -35,6 +36,21 @@ export type SessionVar = { session: SessionRow }
 // ---------------------------------------------------------------------------
 
 const LOOPBACK_RE = /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/
+
+/**
+ * Constant-time string equality. Used to compare CSRF tokens against the
+ * canonical value stored in the sessions table so a server restart doesn't
+ * force users to re-login (the HMAC secret changes across processes but
+ * the DB token does not).
+ */
+function constantTimeEq(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
+  } catch {
+    return false
+  }
+}
 
 function stripBracketsAndPort(host: string): string {
   // IPv6 addresses in Host headers arrive as [::1] or [::1]:port
@@ -139,10 +155,23 @@ export const sessionMiddleware: MiddlewareHandler<{
       consola.warn("[admin] CSRF: missing token")
       return c.json({ error: "CSRF: missing token" }, 403)
     }
-    if (
-      !verifyCsrfToken(sessionId, effectiveToken)
-      || !verifyCsrfToken(sessionId, tokenCookie)
-    ) {
+    // Verify against the HMAC of the session id with our in-process secret.
+    // This works as long as the server hasn't restarted since the session
+    // was created. After a restart, the secret regenerates and HMAC fails —
+    // so we ALSO accept the canonical csrf_token stored in the sessions
+    // table (which was written at login with the secret of THAT process
+    // and survives restarts). This way restarts no longer force users to
+    // re-login: the sessions row is the source of truth.
+    const sessionRow = getSession(sessionId)
+    const dbToken = sessionRow?.csrf_token
+    const matchesHmac =
+      verifyCsrfToken(sessionId, effectiveToken)
+      && verifyCsrfToken(sessionId, tokenCookie)
+    const matchesDb =
+      dbToken !== undefined
+      && constantTimeEq(effectiveToken, dbToken)
+      && constantTimeEq(tokenCookie, dbToken)
+    if (!matchesHmac && !matchesDb) {
       consola.warn("[admin] CSRF: token mismatch")
       return c.json({ error: "CSRF: token mismatch" }, 403)
     }

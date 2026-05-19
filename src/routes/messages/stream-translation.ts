@@ -1,3 +1,4 @@
+import { readCopilotUsage, type NormalisedUsage } from "~/lib/copilot-usage"
 import { type ChatCompletionChunk } from "~/services/copilot/create-chat-completions"
 
 import {
@@ -11,24 +12,46 @@ import { mapOpenAIStopReasonToAnthropic } from "./utils"
  * stash any usage figures it carries on the Hono context for the telemetry
  * middleware.
  *
- * - `message_start.message.usage.input_tokens` is captured ONCE.
- * - `message_delta.usage.output_tokens` is captured on every delta (the
- *   final delta carries the cumulative output token count).
+ * Preference order:
+ *   1. Copilot's `copilot_usage.token_details` if the event carries it
+ *      (Copilot embeds this on `message_delta` events alongside the native
+ *      anthropic `usage` block). This gives us the canonical input /
+ *      output / cache_read / cache_write counts.
+ *   2. Native Anthropic `usage.input_tokens` / `usage.output_tokens` as
+ *      captured by previous versions.
  *
- * Returns the updated `(input, output)` pair so the caller can keep its own
- * running state without re-reading the event.
+ * Returns the updated `(input, output)` pair so the caller can keep its
+ * own running state without re-reading the event.
  */
 export function stashAnthropicUsage(
   c: {
-    set: (
-      k: "usage",
-      v: { prompt_tokens?: number; completion_tokens?: number },
-    ) => void
+    set: (k: "usage", v: NormalisedUsage) => void
   },
   parsed: AnthropicStreamEventData,
   prev: [number | undefined, number | undefined],
 ): [number | undefined, number | undefined] {
   let [input, output] = prev
+
+  // First try copilot_usage (preferred — same shape across all 3 routes).
+  // We rebuild a tiny envelope so readCopilotUsage can do its thing.
+  const fromCopilot = readCopilotUsage(parsed as unknown)
+  if (
+    fromCopilot.prompt_tokens !== undefined
+    || fromCopilot.completion_tokens !== undefined
+    || fromCopilot.cache_read_tokens !== undefined
+    || fromCopilot.cache_creation_tokens !== undefined
+  ) {
+    if (fromCopilot.prompt_tokens !== undefined) {
+      input = fromCopilot.prompt_tokens
+    }
+    if (fromCopilot.completion_tokens !== undefined) {
+      output = fromCopilot.completion_tokens
+    }
+    c.set("usage", fromCopilot)
+    return [input, output]
+  }
+
+  // Fallback: native anthropic usage on message_start / message_delta.
   if (parsed.type === "message_start") {
     const m = parsed.message
     if (typeof m.usage.input_tokens === "number") {

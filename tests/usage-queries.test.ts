@@ -42,6 +42,7 @@ function makeTmpConfig(dir: string): string {
       audit_days: 365,
     },
     features: { auth: false, telemetry: false, debug: false },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return cfgPath
@@ -438,6 +439,10 @@ describe("CSV round-trip via the export route's CSV output", () => {
       latency_ms: 5,
       error: null,
       usage_unknown: 0,
+    thinking_level: null,
+    cache_read_tokens: null,
+    cache_creation_tokens: null,
+    reasoning_tokens: null,
     })
     // Build the CSV the same way the route does
     const headers = [

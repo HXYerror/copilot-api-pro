@@ -5,6 +5,83 @@
 
 ---
 
+## D-013 · 2026-05-18 · 未配置 alias 一律拦截并回退到 default_model_alias
+
+### 背景
+
+旧逻辑：客户端在 `model` 字段里塞什么，proxy 就老老实实把那个字符串透传给
+upstream。后果是新接的客户端（Cline、Continue、Claude Code）经常用一些项目
+里**没注册**为 alias 的 model 名（`claude-sonnet-4-7`、`gpt-5.1-codex`、各
+种实验性名字），proxy 不拦不报，直接送到 GitHub Copilot 那边，结果有的被
+当作合法名字消耗配额、有的返回 400，本地 admin Logs 看到的 `model` 字段
+五花八门，运维很被动。
+
+### 决策
+
+`src/lib/default-model.ts:resolveModelWithDefault()` 在所有三个 POST 路由
+（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）的入口统一拦截：
+
+1. 客户端 `model` 在 `config.models` 里 → **直通**，`rewritten: false`
+2. 不在 → 看 `config.default_model_alias`
+   - 已设置且存在 → **rewrite 到默认 alias**，`rewritten: true`，info 日志记原始名
+   - 未设置 → **HTTP 400 `unknown_model_no_default`**，提示去 admin 添加
+   - 设置了但目标 alias 不存在（热加载竞态） → **HTTP 400
+     `default_model_alias_misconfigured`**
+
+`ConfigSchema` 用 `superRefine` 保证 `default_model_alias` 要么空串、要么
+指向 `models` 里真实存在的 key，admin Settings PUT 不允许保存指向死链的
+默认值。
+
+scope check（`isModelAllowed`）用 **effective alias**（rewrite 之后）而非
+客户端送的原始名 —— 否则 client 可以用任意"未知"名字搭配默认 alias
+绕开 per-key 模型白名单。
+
+### 副作用：trace 增加 meta 字段
+
+trace JSONL 里多了一段：
+
+```json
+{
+  "meta": {
+    "client_requested_model": "claude-sonnet-4-7",
+    "effective_model": "opus47",
+    "rewritten": true
+  }
+}
+```
+
+`src/services/trace-writer.ts:TraceEvent` 新增可选 `meta?: Record<string,
+unknown>` 字段，trace middleware 从 `c.var.trace_meta` 收集（handler 在
+rewrite 发生时 set）。设计成 free-form 是因为以后想加 `fallback_chain` /
+`forced_model_reason` 这类字段不需要再改 schema。
+
+### Settings UI
+
+`ui/src/pages/Settings.tsx` General tab 顶部新增 "Default model fallback"
+区，下拉用当前 staged 的 alias 列表（不是已保存的 `draft.models`，这样
+新加 alias 立刻能被选作默认）。两种警告：
+
+- **黄色 / amber**：默认未设置 → 客户端打错名字会拿到 400
+- **红色 / rose**：默认指向一个不在 Models tab 里（或被删了）的 alias →
+  阻断 Save 按钮
+
+### 已知坑（写在这里方便未来调试）
+
+1. **测试 fixture 兼容性**：旧测试里大量 `models: {}` + `model: "gpt-4o"`
+   的组合现在会被新拦截器 400 拦下。修复方式是给每个用到 model 名的
+   test fixture 预注册一条 alias（哪怕 upstream 名字跟 alias 完全一样）。
+   涉及到 `tests/{telemetry,trace,auth,model-routing,responses-route}.test.ts`
+   等 7 个文件。
+2. **trace meta 留空**：rewrite 没发生的请求 trace 里不会有 `meta` 字段
+   （writer 检查 `Object.keys(meta).length > 0` 后才插）。Logs UI 渲染要
+   兼容这种情况。
+3. **scope check 报错时显示哪个 alias？** —— 显示**原始名**给客户端
+   （`Model "${clientRequestedModel}" is not in your key's allowed models`），
+   这样 client 报错 stack 里直接看到自己写的什么，省得"我写了 X 怎么报
+   Y 不在白名单"的混乱。
+
+---
+
 ## D-012 · 2026-05-14 · Admin UI 重构 Phase 2–5（全部 6 页迁完）
 
 承接 D-011 的骨架，Phase 2–5 把剩下 5 个旧 SSR 页面（Keys / Usage / Logs / Audit / Settings）替换成 React + Tremor，并新增 Phase 5 的 Models 页（旧仓库没有的）。结果是 SPA 完整接管 `/admin/*`，旧 SSR 整体 fallback 到 `/admin/legacy/*`（迁移期保留供回滚），新写的 SSR 入口全部删掉。

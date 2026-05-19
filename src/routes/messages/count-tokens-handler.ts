@@ -2,6 +2,8 @@ import type { Context } from "hono"
 
 import consola from "consola"
 
+import { resolveAlias } from "~/lib/alias"
+import { getConfig } from "~/lib/config-store"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 
@@ -9,7 +11,13 @@ import { type AnthropicMessagesPayload } from "./anthropic-types"
 import { translateToOpenAI } from "./non-stream-translation"
 
 /**
- * Handles token counting for Anthropic messages
+ * Handles token counting for Anthropic messages.
+ *
+ * Claude Code calls this BEFORE every real /v1/messages to estimate the
+ * prompt cost and trigger its context-management auto-compression when the
+ * estimate crosses a threshold. The estimate doesn't need to be exact but
+ * it must be in the right order of magnitude — returning `1` (the legacy
+ * fallback) makes Claude Code think every prompt is tiny.
  */
 export async function handleCountTokens(c: Context) {
   try {
@@ -19,12 +27,20 @@ export async function handleCountTokens(c: Context) {
 
     const openAIPayload = translateToOpenAI(anthropicPayload)
 
+    // Look up the model in the upstream catalog so the tokenizer picks a
+    // matching encoding. The client sends an alias ("claude-opus-4-7"),
+    // state.models is keyed by upstream id ("claude-opus-4.7-1m-internal")
+    // so we resolve the alias first.
+    const { models: modelAliases } = getConfig()
+    const upstreamId = resolveAlias(anthropicPayload.model, modelAliases)
     const selectedModel = state.models?.data.find(
-      (model) => model.id === anthropicPayload.model,
+      (m) => m.id === upstreamId || m.id === anthropicPayload.model,
     )
 
     if (!selectedModel) {
-      consola.warn("Model not found, returning default token count")
+      consola.warn(
+        `count_tokens: model not found in upstream catalog (alias=${anthropicPayload.model} upstream=${upstreamId}); returning default`,
+      )
       return c.json({
         input_tokens: 1,
       })

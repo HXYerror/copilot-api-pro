@@ -36,12 +36,15 @@ import { listKeys } from "~/services/keys"
 import type { SessionVar } from "../session-middleware"
 
 import {
+  chooseBucket,
   distinctModels,
   errorBreakdownByStatus,
   errorRateByKey,
   latencyPercentiles,
+  requestsPerBucket,
   requestsPerMinute,
   streamEventsForCsv,
+  tokensPerBucket,
   tokensPerHour,
   topKeysByTokens,
   topModelsByRequests,
@@ -70,16 +73,21 @@ function parseRange(raw: string | undefined): TimeRange {
 
 function rangeSpanMs(range: TimeRange): number {
   switch (range) {
-    case "1h":
+    case "1h": {
       return HOUR_MS
-    case "24h":
+    }
+    case "24h": {
       return 24 * HOUR_MS
-    case "7d":
+    }
+    case "7d": {
       return 7 * DAY_MS
-    case "30d":
+    }
+    case "30d": {
       return 30 * DAY_MS
-    default:
+    }
+    default: {
       return 24 * HOUR_MS
+    }
   }
 }
 
@@ -139,6 +147,10 @@ export const usageRoute = new Hono<{ Variables: SessionVar }>()
 usageRoute.get("/", (c) => {
   const filter = parseFilter(c)
   const dbFilter = toDbFilter(filter)
+  // Pick bucket size adaptively so 7d/30d charts don't render as thousands
+  // of minute-wide bars (#6). 1h → minute; 24h → 10-minute; 7d → hour;
+  // 30d → 6-hour buckets.
+  const bucket = chooseBucket(dbFilter)
 
   let rpm: ReturnType<typeof requestsPerMinute> = []
   let tokens: ReturnType<typeof tokensPerHour> = []
@@ -150,9 +162,9 @@ usageRoute.get("/", (c) => {
   let all_models: Array<string> = []
 
   try {
-    rpm = requestsPerMinute(dbFilter)
-    tokens = tokensPerHour(dbFilter)
-    latency = latencyPercentiles(dbFilter)
+    rpm = requestsPerBucket(dbFilter, bucket.bucketMs)
+    tokens = tokensPerBucket(dbFilter, bucket.bucketMs)
+    latency = latencyPercentiles(dbFilter, bucket.bucketMs)
     top_models = topModelsByRequests(dbFilter, 10)
     top_keys_raw = topKeysByTokens(dbFilter, 10)
     errors_by_status = errorBreakdownByStatus(dbFilter)
@@ -190,9 +202,10 @@ usageRoute.get("/", (c) => {
   if (top_key_ids.length > 0) {
     const placeholders = top_key_ids.map(() => "?").join(",")
     const rows = db
-      .query<{ id: string; label: string | null }, Array<string>>(
-        `SELECT id, label FROM keys WHERE id IN (${placeholders})`,
-      )
+      .query<
+        { id: string; label: string | null },
+        Array<string>
+      >(`SELECT id, label FROM keys WHERE id IN (${placeholders})`)
       .all(...top_key_ids)
     for (const r of rows) labelById.set(r.id, r.label)
   }
@@ -205,14 +218,22 @@ usageRoute.get("/", (c) => {
 
   // Active keys for the filter dropdown (we don't need revoked ones in the
   // UI — the user generally wants to slice on a key that's still in use).
-  const all_keys = listKeys(500, 0).rows
-    .filter((k) => k.revoked_at === null)
+  const all_keys = listKeys(500, 0)
+    .rows.filter((k) => k.revoked_at === null)
     .map((k) => ({ id: k.id, label: k.label }))
 
   return c.json({
     filter,
     stats,
-    activity: { rpm, tokens, latency },
+    activity: {
+      rpm,
+      tokens,
+      latency,
+      // Echo the chosen bucket so the SPA can label charts correctly
+      // (e.g. "Requests per minute" vs "Requests per day") — fix #6.
+      bucket_ms: bucket.bucketMs,
+      bucket_label: bucket.label,
+    },
     top_models,
     top_keys,
     errors_by_status,
@@ -280,7 +301,9 @@ usageRoute.get("/export.csv", (c) => {
         }
         controller.enqueue(encoder.encode(`${eventRowToCsv(result.value)}\n`))
       } catch (err) {
-        consola.error(`[admin/api/usage] CSV export pull failed: ${String(err)}`)
+        consola.error(
+          `[admin/api/usage] CSV export pull failed: ${String(err)}`,
+        )
         controller.error(err)
         iter.return?.()
       }

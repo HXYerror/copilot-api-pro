@@ -73,8 +73,9 @@ describe("buildUpstreamPayload", () => {
     expect(result).not.toHaveProperty("output_config")
   })
 
-  // T5 — adaptive upgrade with no output_config → defaults to effort:medium
-  test("T5: adaptive upgrade with no output_config defaults to effort:medium", () => {
+  // T5 — adaptive upgrade with no output_config → effort is derived from
+  //       budget_tokens. budget=1024 falls into the "low" bucket (<5K).
+  test("T5: small budget upgrades to effort=low", () => {
     const payload = basePayload({
       model: "claude-opus-4.7",
       thinking: { type: "enabled", budget_tokens: 1024 },
@@ -82,11 +83,11 @@ describe("buildUpstreamPayload", () => {
     } as Partial<AnthropicMessagesPayload>)
     const result = buildUpstreamPayload(payload)
     expect(result.thinking).toEqual({ type: "adaptive" })
-    expect(result.output_config).toEqual({ effort: "medium" })
+    expect(result.output_config).toEqual({ effort: "low" })
   })
 
-  // T6 — output_config: {} also triggers default (not bypassed)
-  test("T6: empty output_config triggers medium effort default", () => {
+  // T6 — empty output_config + missing budget → falls back to "medium".
+  test("T6: empty output_config + no budget → medium default", () => {
     const payload = basePayload({
       model: "claude-opus-4.7",
       thinking: { type: "enabled" },
@@ -95,6 +96,39 @@ describe("buildUpstreamPayload", () => {
     const result = buildUpstreamPayload(payload)
     expect(result.thinking).toEqual({ type: "adaptive" })
     expect(result.output_config).toEqual({ effort: "medium" })
+  })
+
+  // T7 — budget 10K → medium (5K-25K bucket)
+  test("T7: budget 10000 → effort=medium", () => {
+    const result = buildUpstreamPayload(
+      basePayload({
+        model: "claude-opus-4.7",
+        thinking: { type: "enabled", budget_tokens: 10_000 },
+      } as Partial<AnthropicMessagesPayload>),
+    )
+    expect(result.output_config).toEqual({ effort: "medium" })
+  })
+
+  // T8 — budget 32K → high
+  test("T8: budget 32000 → effort=high", () => {
+    const result = buildUpstreamPayload(
+      basePayload({
+        model: "claude-opus-4.7",
+        thinking: { type: "enabled", budget_tokens: 32_000 },
+      } as Partial<AnthropicMessagesPayload>),
+    )
+    expect(result.output_config).toEqual({ effort: "high" })
+  })
+
+  // T9 — budget 64K → xhigh (Ultrathink-equivalent)
+  test("T9: budget 64000 → effort=xhigh", () => {
+    const result = buildUpstreamPayload(
+      basePayload({
+        model: "claude-opus-4.7",
+        thinking: { type: "enabled", budget_tokens: 64_000 },
+      } as Partial<AnthropicMessagesPayload>),
+    )
+    expect(result.output_config).toEqual({ effort: "xhigh" })
   })
 })
 

@@ -226,8 +226,16 @@ describe("chat-completions route blocks responses-only models", () => {
     state.manualApprove = false
   })
 
-  beforeEach(() => {
+  beforeEach(async () => {
     savedModels = state.models
+    // Pre-register the model names this block POSTs so the D-013 default-
+    // model interceptor lets them through to the responses-only check.
+    await loadModelsConfig({
+      "gpt-5-codex": { upstream: "gpt-5-codex" },
+      "o1-pro": { upstream: "o1-pro" },
+      "gpt-5.1-codex-max": { upstream: "gpt-5.1-codex-max" },
+      "o5-turbo": { upstream: "o5-turbo" },
+    })
   })
 
   afterEach(() => {
@@ -350,8 +358,11 @@ describe("chat-completions route blocks responses-only models", () => {
 describe("GET /v1/models — mode field", () => {
   let savedModels: typeof state.models
 
-  beforeEach(() => {
+  beforeEach(async () => {
     savedModels = state.models
+    // Reset config to a known auth-off state so prior describe blocks that
+    // wrote `auth: true` don't leak in and 401 our /v1/models probes.
+    await loadModelsConfig({})
   })
 
   afterEach(() => {

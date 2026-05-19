@@ -466,7 +466,14 @@ const ConfigSchema = z.object({
 	version: z.literal(1),
 	models: z.preprocess((v) => v ?? {}, z.record(z.string(), ModelEntrySchema)),
 	retention: z.preprocess((v) => v ?? {}, RetentionSchema),
-	features: z.preprocess((v) => v ?? {}, FeaturesSchema)
+	features: z.preprocess((v) => v ?? {}, FeaturesSchema),
+	default_model_alias: z.string().default("")
+}).superRefine((cfg, ctx) => {
+	if (cfg.default_model_alias && !Object.hasOwn(cfg.models, cfg.default_model_alias)) ctx.addIssue({
+		code: "custom",
+		path: ["default_model_alias"],
+		message: `default_model_alias "${cfg.default_model_alias}" is not defined in models. Add the alias to models first, or clear this field.`
+	});
 });
 const DEFAULT_CONFIG = ConfigSchema.parse({ version: 1 });
 let _currentConfig = DEFAULT_CONFIG;
@@ -1586,6 +1593,26 @@ auditApiRoute.get("/", (c) => {
 //#region src/admin/usage/queries.ts
 const MINUTE_MS = 6e4;
 const HOUR_MS$2 = 36e5;
+const DAY_MS$5 = 864e5;
+function chooseBucket(filter) {
+	const span = Math.max(0, filter.until - filter.since);
+	if (span <= 12 * HOUR_MS$2) return {
+		bucketMs: MINUTE_MS,
+		label: "per minute"
+	};
+	if (span <= 3.5 * DAY_MS$5) return {
+		bucketMs: HOUR_MS$2,
+		label: "per hour"
+	};
+	if (span <= 18 * DAY_MS$5) return {
+		bucketMs: DAY_MS$5,
+		label: "per day"
+	};
+	return {
+		bucketMs: 7 * DAY_MS$5,
+		label: "per week"
+	};
+}
 /**
 * Build a `(?,?,...)` placeholder string for a SQL IN clause.  Returns
 * `undefined` when the input list is empty/undefined, so the caller can
@@ -1615,9 +1642,9 @@ function buildWhere$1(filter) {
 		params
 	};
 }
-function requestsPerMinute(filter) {
+function requestsPerBucket(filter, bucketMs) {
 	const where = buildWhere$1(filter);
-	const sql = `SELECT (ts / ${MINUTE_MS}) * ${MINUTE_MS} AS bucket,
+	const sql = `SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket,
             model AS model,
             COUNT(*) AS count
        FROM events
@@ -1630,9 +1657,16 @@ function requestsPerMinute(filter) {
 		count: r.count
 	}));
 }
-function tokensPerHour(filter) {
+/**
+* Legacy alias kept for backwards-compat with any external caller that
+* still imports `requestsPerMinute`.  Always returns minute buckets.
+*/
+function requestsPerMinute(filter) {
+	return requestsPerBucket(filter, MINUTE_MS);
+}
+function tokensPerBucket(filter, bucketMs) {
 	const where = buildWhere$1(filter);
-	const sql = `SELECT (ts / ${HOUR_MS$2}) * ${HOUR_MS$2} AS bucket,
+	const sql = `SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket,
             COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
             COALESCE(SUM(completion_tokens), 0) AS completion_tokens
        FROM events
@@ -1644,6 +1678,9 @@ function tokensPerHour(filter) {
 		prompt_tokens: r.prompt_tokens,
 		completion_tokens: r.completion_tokens
 	}));
+}
+function tokensPerHour(filter) {
+	return tokensPerBucket(filter, HOUR_MS$2);
 }
 function p95LatencyPerHour(filter) {
 	const where = buildWhere$1(filter);
@@ -1767,9 +1804,9 @@ function recentCallsForKey(keyId, limit = 20) {
          ORDER BY ts DESC
          LIMIT ?`).all(keyId, limit);
 }
-function latencyPercentiles(filter) {
+function latencyPercentiles(filter, bucketMs = HOUR_MS$2) {
 	const where = buildWhere$1(filter);
-	const buckets = getDb().query(`SELECT (ts / ${HOUR_MS$2}) * ${HOUR_MS$2} AS bucket, COUNT(*) AS count
+	const buckets = getDb().query(`SELECT (ts / ${bucketMs}) * ${bucketMs} AS bucket, COUNT(*) AS count
          FROM events
         WHERE ${where.sql}
         GROUP BY bucket
@@ -1780,7 +1817,7 @@ function latencyPercentiles(filter) {
 	const out = [];
 	for (const b of buckets) {
 		if (b.count === 0) continue;
-		const bucketEnd = b.bucket + HOUR_MS$2;
+		const bucketEnd = b.bucket + bucketMs;
 		const pick = (frac) => {
 			const offset = Math.floor(frac * (b.count - 1));
 			const innerSql = `SELECT latency_ms FROM events
@@ -2589,6 +2626,7 @@ const usageRoute$1 = new Hono();
 usageRoute$1.get("/", (c) => {
 	const filter = parseFilter$1(c);
 	const dbFilter = toDbFilter(filter);
+	const bucket = chooseBucket(dbFilter);
 	let rpm = [];
 	let tokens = [];
 	let latency = [];
@@ -2598,9 +2636,9 @@ usageRoute$1.get("/", (c) => {
 	let error_rates = [];
 	let all_models = [];
 	try {
-		rpm = requestsPerMinute(dbFilter);
-		tokens = tokensPerHour(dbFilter);
-		latency = latencyPercentiles(dbFilter);
+		rpm = requestsPerBucket(dbFilter, bucket.bucketMs);
+		tokens = tokensPerBucket(dbFilter, bucket.bucketMs);
+		latency = latencyPercentiles(dbFilter, bucket.bucketMs);
 		top_models = topModelsByRequests(dbFilter, 10);
 		top_keys_raw = topKeysByTokens(dbFilter, 10);
 		errors_by_status = errorBreakdownByStatus(dbFilter);
@@ -2648,7 +2686,9 @@ usageRoute$1.get("/", (c) => {
 		activity: {
 			rpm,
 			tokens,
-			latency
+			latency,
+			bucket_ms: bucket.bucketMs,
+			bucket_label: bucket.label
 		},
 		top_models,
 		top_keys,
@@ -3981,6 +4021,20 @@ loginApp.post("/", async (c) => {
 //#endregion
 //#region src/admin/session-middleware.ts
 const LOOPBACK_RE = /^(?:127\.\d+\.\d+\.\d+|::1|localhost)$/;
+/**
+* Constant-time string equality. Used to compare CSRF tokens against the
+* canonical value stored in the sessions table so a server restart doesn't
+* force users to re-login (the HMAC secret changes across processes but
+* the DB token does not).
+*/
+function constantTimeEq(a, b) {
+	if (a.length !== b.length) return false;
+	try {
+		return crypto$1.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+	} catch {
+		return false;
+	}
+}
 function stripBracketsAndPort(host) {
 	const ipv6Match = /^\[([^\]]+)\](?::\d+)?$/.exec(host);
 	if (ipv6Match) return ipv6Match[1];
@@ -4038,7 +4092,10 @@ const sessionMiddleware = async (c, next) => {
 			consola.warn("[admin] CSRF: missing token");
 			return c.json({ error: "CSRF: missing token" }, 403);
 		}
-		if (!verifyCsrfToken(sessionId, effectiveToken) || !verifyCsrfToken(sessionId, tokenCookie)) {
+		const dbToken = getSession(sessionId)?.csrf_token;
+		const matchesHmac = verifyCsrfToken(sessionId, effectiveToken) && verifyCsrfToken(sessionId, tokenCookie);
+		const matchesDb = dbToken !== void 0 && constantTimeEq(effectiveToken, dbToken) && constantTimeEq(tokenCookie, dbToken);
+		if (!matchesHmac && !matchesDb) {
 			consola.warn("[admin] CSRF: token mismatch");
 			return c.json({ error: "CSRF: token mismatch" }, 403);
 		}
@@ -5345,8 +5402,10 @@ function recordEvent(row) {
 		getDb().run(`INSERT INTO events
          (ts, key_id, model, upstream_model,
           prompt_tokens, completion_tokens,
-          status, latency_ms, error, usage_unknown)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+          status, latency_ms, error, usage_unknown,
+          thinking_level, cache_read_tokens, cache_creation_tokens,
+          reasoning_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
 			row.ts,
 			row.key_id,
 			row.model,
@@ -5356,7 +5415,11 @@ function recordEvent(row) {
 			row.status,
 			row.latency_ms,
 			row.error,
-			row.usage_unknown
+			row.usage_unknown,
+			row.thinking_level,
+			row.cache_read_tokens,
+			row.cache_creation_tokens,
+			row.reasoning_tokens
 		]);
 	} catch (err) {
 		consola.error(`[telemetry] recordEvent failed (continuing): ${String(err)}`);
@@ -5392,21 +5455,47 @@ async function purgeEventsOlderThan(cutoffMs) {
 /** Cap on how much of the request body we'll buffer to look for "model". */
 const MODEL_SNAPSHOT_MAX_BYTES = 16 * 1024;
 const MODEL_FIELD_RE = /"model"\s*:\s*"([^"\\]{1,200})"/;
+const THINKING_TYPE_RE = /"thinking"\s*:\s*\{[^{}]*?"type"\s*:\s*"([^"]+)"/;
+const THINKING_BUDGET_RE = /"thinking"\s*:\s*\{[^{}]*?"budget_tokens"\s*:\s*(\d+)/;
+const MAX_THINKING_TOKENS_RE = /"max_thinking_tokens"\s*:\s*(\d+)/;
+const REASONING_EFFORT_RE = /"reasoning"\s*:\s*\{[^{}]*?"effort"\s*:\s*"([^"]+)"/;
+const OUTPUT_CONFIG_EFFORT_RE = /"output_config"\s*:\s*\{[^{}]*?"effort"\s*:\s*"([^"]+)"/;
+function captureThinkingRaw(buf) {
+	const oc = OUTPUT_CONFIG_EFFORT_RE.exec(buf);
+	if (oc && oc[1]) return oc[1];
+	const reasoning = REASONING_EFFORT_RE.exec(buf);
+	if (reasoning && reasoning[1]) return `effort:${reasoning[1]}`;
+	const budget = THINKING_BUDGET_RE.exec(buf) ?? MAX_THINKING_TOKENS_RE.exec(buf);
+	if (budget && budget[1]) return budget[1];
+	const type = THINKING_TYPE_RE.exec(buf);
+	if (type && type[1]) return type[1];
+	return null;
+}
 /**
-* Best-effort read of the client-facing model from the request body.
+* Best-effort read of a few client-facing fields (model + thinking) from
+* the request body.
 *
-* Reads at most MODEL_SNAPSHOT_MAX_BYTES from the cloned body and stops as
-* soon as a `"model": "..."` substring is found. Never buffers the entire
-* body — large vision / long-context payloads must not pin memory just for
-* a label.  Failures (no body, no model field, unreadable) silently fall
-* through to "n/a".
+* Reads at most MODEL_SNAPSHOT_MAX_BYTES from a cloned body and stops as
+* soon as both `model` and (when present) `thinking` substrings have been
+* located. Never buffers the entire body — large vision / long-context
+* payloads must not pin memory just for telemetry. Failures (no body, no
+* model field, unreadable) silently fall through to model="n/a".
+*
+* Returns:
+*   - model: client-requested model name, or "n/a" when missing
+*   - thinking_level: short level string ("auto" / "think-hard" / etc.),
+*     or null when the request didn't include a thinking field
 */
-async function readModelFromBody(reqClone) {
+async function snapshotPostMeta(reqClone) {
 	const reader = reqClone.body?.getReader();
-	if (!reader) return "n/a";
+	if (!reader) return {
+		model: "n/a",
+		thinking_level: null
+	};
 	const decoder = new TextDecoder();
 	let buf = "";
 	let totalBytes = 0;
+	let modelMatch;
 	try {
 		while (totalBytes < MODEL_SNAPSHOT_MAX_BYTES) {
 			const result = await reader.read();
@@ -5415,16 +5504,25 @@ async function readModelFromBody(reqClone) {
 			if (!value) break;
 			totalBytes += value.byteLength;
 			buf += decoder.decode(value, { stream: true });
-			const m = MODEL_FIELD_RE.exec(buf);
-			if (m && m[1]) return m[1];
+			if (!modelMatch) {
+				const m = MODEL_FIELD_RE.exec(buf);
+				if (m && m[1]) modelMatch = m[1];
+			}
+			if (modelMatch && (buf.includes("\"thinking\"") || buf.includes("\"reasoning\"") || buf.includes("\"output_config\"") || totalBytes >= 4096)) break;
 		}
 	} catch {} finally {
 		try {
 			await reader.cancel();
 		} catch {}
 	}
-	const final = MODEL_FIELD_RE.exec(buf);
-	return final && final[1] ? final[1] : "n/a";
+	if (!modelMatch) {
+		const final = MODEL_FIELD_RE.exec(buf);
+		if (final && final[1]) modelMatch = final[1];
+	}
+	return {
+		model: modelMatch ?? "n/a",
+		thinking_level: captureThinkingRaw(buf)
+	};
 }
 /**
 * Map a 4xx/5xx status to a short, low-cardinality tag.  We never store the
@@ -5466,7 +5564,11 @@ function safeInsertEvent(c, ctx) {
 			status,
 			latency_ms: Date.now() - ctx.start,
 			error: errorTag,
-			usage_unknown: usageUnknown
+			usage_unknown: usageUnknown,
+			thinking_level: ctx.thinkingLevel,
+			cache_read_tokens: usage?.cache_read_tokens ?? null,
+			cache_creation_tokens: usage?.cache_creation_tokens ?? null,
+			reasoning_tokens: usage?.reasoning_tokens ?? null
 		});
 	} catch (err) {
 		consola.error(`[telemetry] middleware insert failed: ${String(err)}`);
@@ -5474,11 +5576,14 @@ function safeInsertEvent(c, ctx) {
 }
 const telemetryMiddleware = async (c, next) => {
 	const start$1 = Date.now();
-	let clientModel = "n/a";
+	let clientModel = `${c.req.method} ${c.req.path}`;
+	let thinkingLevel = null;
 	if (c.req.method === "POST") try {
-		clientModel = await readModelFromBody(c.req.raw.clone());
+		const meta = await snapshotPostMeta(c.req.raw.clone());
+		if (meta.model !== "n/a") clientModel = meta.model;
+		thinkingLevel = meta.thinking_level;
 	} catch (err) {
-		consola.debug(`[telemetry] body model snapshot failed: ${String(err)}`);
+		consola.debug(`[telemetry] body meta snapshot failed: ${String(err)}`);
 	}
 	let threw = false;
 	try {
@@ -5490,6 +5595,7 @@ const telemetryMiddleware = async (c, next) => {
 		instrumentResponseOrInsert(c, {
 			start: start$1,
 			clientModel,
+			thinkingLevel,
 			threw
 		});
 	}
@@ -5713,7 +5819,8 @@ function eventToJSON(event) {
 		...event.upstream_req && { upstream_req: legToJSON(event.upstream_req) },
 		...event.upstream_res && { upstream_res: legToJSON(event.upstream_res) },
 		res: legToJSON(event.res),
-		latency_ms: event.latency_ms
+		latency_ms: event.latency_ms,
+		...event.meta && Object.keys(event.meta).length > 0 ? { meta: event.meta } : {}
 	};
 }
 /**
@@ -5926,6 +6033,7 @@ const traceMiddleware = async (c, next) => {
 	}
 	const finishTrace = (resState) => {
 		try {
+			const traceMeta = c.var.trace_meta;
 			writeTrace({
 				trace_id: traceId,
 				ts: start$1,
@@ -5939,7 +6047,8 @@ const traceMiddleware = async (c, next) => {
 					headers: headersToObj(c.res.headers),
 					body: bodyOrTruncated(resState)
 				},
-				latency_ms: Date.now() - start$1
+				latency_ms: Date.now() - start$1,
+				meta: traceMeta
 			});
 		} catch (err) {
 			consola.error(`[trace] writeTrace failed (continuing): ${String(err)}`);
@@ -5990,6 +6099,127 @@ function resolveUpstream(upstream, models) {
 const awaitApproval = async () => {
 	if (!await consola.prompt(`Accept incoming request?`, { type: "confirm" })) throw new HTTPError("Request rejected", Response.json({ message: "Request rejected" }, { status: 403 }));
 };
+
+//#endregion
+//#region src/lib/copilot-usage.ts
+/**
+* Read normalised token counts from an upstream response object. Returns
+* an object where every field is optional; callers should `?? undefined`
+* when stashing on `c.var.usage` (telemetry middleware tolerates absent
+* fields and records usage_unknown=1 in that case).
+*/
+function readCopilotUsage(response) {
+	if (!response || typeof response !== "object") return {};
+	const r = response;
+	const out = {};
+	const details = r.copilot_usage?.token_details;
+	if (Array.isArray(details)) for (const td of details) {
+		if (typeof td.token_count !== "number") continue;
+		switch (td.token_type) {
+			case "input":
+				out.prompt_tokens = td.token_count;
+				break;
+			case "output":
+				out.completion_tokens = td.token_count;
+				break;
+			case "cache_read":
+				out.cache_read_tokens = td.token_count;
+				break;
+			case "cache_write":
+				out.cache_creation_tokens = td.token_count;
+				break;
+		}
+	}
+	const native = r.usage;
+	if (native) {
+		out.prompt_tokens = out.prompt_tokens ?? native.input_tokens ?? native.prompt_tokens;
+		out.completion_tokens = out.completion_tokens ?? native.output_tokens ?? native.completion_tokens;
+		out.total_tokens = out.total_tokens ?? native.total_tokens;
+		out.cache_read_tokens = out.cache_read_tokens ?? native.cache_read_input_tokens ?? native.cache_read_tokens;
+		out.cache_creation_tokens = out.cache_creation_tokens ?? native.cache_creation_input_tokens ?? native.cache_creation_tokens;
+		out.reasoning_tokens = out.reasoning_tokens ?? native.output_tokens_details?.reasoning_tokens;
+	}
+	if (out.total_tokens === void 0 && out.prompt_tokens !== void 0 && out.completion_tokens !== void 0) out.total_tokens = out.prompt_tokens + out.completion_tokens;
+	return out;
+}
+
+//#endregion
+//#region src/lib/default-model.ts
+/**
+* Resolve a client-requested model name through the alias map, falling back
+* to `default_model_alias` when the request names an unconfigured alias.
+*
+* @returns ResolvedModel on success, ResolveError on bad input / unset default.
+*/
+function resolveModelWithDefault(requested, models, defaultAlias) {
+	if (!requested) return {
+		message: "Request body is missing the `model` field. Set `model` to a configured alias or a known upstream id.",
+		code: "empty_model_field"
+	};
+	if (Object.hasOwn(models, requested)) return {
+		requested,
+		effective: requested,
+		upstream: models[requested].upstream,
+		rewritten: false
+	};
+	if (!defaultAlias) return {
+		message: `Model "${requested}" is not configured and no default_model_alias is set. Add an alias in /admin/settings → Models, or set a default model.`,
+		code: "unknown_model_no_default"
+	};
+	if (!Object.hasOwn(models, defaultAlias)) return {
+		message: `default_model_alias "${defaultAlias}" is not in models. Fix /admin/settings and retry.`,
+		code: "default_model_alias_misconfigured"
+	};
+	return {
+		requested,
+		effective: defaultAlias,
+		upstream: models[defaultAlias].upstream,
+		rewritten: true
+	};
+}
+/** Narrow type-guard for the error branch. */
+function isResolveError(r) {
+	return Object.hasOwn(r, "code");
+}
+/**
+* Resolve a request body's `model` field against current config and apply
+* the side effects every D-013 handler needs:
+*
+*   - returns a 400 Response when the model is unknown + no default
+*   - sets `upstream_model` for telemetry
+*   - sets `trace_meta` with the rewrite trail when fallback fired
+*   - logs an info line when fallback fired (visible in debug)
+*
+* Returns either a `Response` (caller should return verbatim) or the
+* resolution details to feed into the rest of the handler.
+*/
+function applyDefaultModelRewrite(c, requestedModel, routeLabel) {
+	const { models, default_model_alias } = getConfig();
+	const resolved = resolveModelWithDefault(requestedModel, models, default_model_alias);
+	if (isResolveError(resolved)) return c.json({ error: {
+		message: resolved.message,
+		type: "invalid_request_error",
+		code: resolved.code
+	} }, 400);
+	if (resolved.rewritten) consola.info(`[default-model] rewrote "${resolved.requested}" → "${resolved.effective}" (upstream "${resolved.upstream}") on ${routeLabel}`);
+	const upstreamModel = resolveAlias(resolved.effective, models);
+	c.set("upstream_model", upstreamModel);
+	if (resolved.rewritten) c.set("trace_meta", {
+		client_requested_model: resolved.requested,
+		effective_model: resolved.effective,
+		rewritten: true
+	});
+	return {
+		clientRequestedModel: resolved.requested,
+		clientAlias: resolved.effective,
+		upstreamModel,
+		rewritten: resolved.rewritten
+	};
+}
+/** True when the value returned by applyDefaultModelRewrite is a 400. */
+function isAppliedError(v) {
+	return v instanceof Response;
+}
 
 //#endregion
 //#region src/lib/model-routing.ts
@@ -6273,15 +6503,16 @@ async function handleCompletion$1(c) {
 	let payload = await c.req.json();
 	consola.debug("Request payload:", JSON.stringify(payload).slice(-400));
 	const { models } = getConfig();
-	const clientAlias = payload.model;
+	const resolved = applyDefaultModelRewrite(c, payload.model, "/v1/chat/completions");
+	if (isAppliedError(resolved)) return resolved;
+	const { clientRequestedModel, clientAlias, upstreamModel } = resolved;
 	payload = {
 		...payload,
-		model: resolveAlias(payload.model, models)
+		model: upstreamModel
 	};
-	c.set("upstream_model", payload.model);
 	const key = c.get("key");
 	if (!isModelAllowed(key.allowed_models, clientAlias)) return c.json({ error: {
-		message: `Model "${clientAlias}" is not in your key's allowed models`,
+		message: `Model "${clientRequestedModel}" is not in your key's allowed models`,
 		type: "permission_denied",
 		code: "model_not_allowed"
 	} }, 403);
@@ -6312,11 +6543,7 @@ async function handleCompletion$1(c) {
 	const response = await createChatCompletions(payload, onUpstream);
 	if (isNonStreaming$1(response)) {
 		consola.debug("Non-streaming response:", JSON.stringify(response));
-		if (response.usage) c.set("usage", {
-			prompt_tokens: response.usage.prompt_tokens,
-			completion_tokens: response.usage.completion_tokens,
-			total_tokens: response.usage.total_tokens
-		});
+		c.set("usage", readCopilotUsage(response));
 		const egressModel = clientAlias !== payload.model ? clientAlias : resolveUpstream(response.model, models);
 		return c.json({
 			...response,
@@ -6351,15 +6578,9 @@ function maybeStashUsageFromChunk(c, chunk) {
 	} catch {
 		return;
 	}
-	if (typeof parsed !== "object" || parsed === null || !Object.hasOwn(parsed, "usage")) return;
-	const usage = parsed.usage;
-	if (typeof usage !== "object" || usage === null) return;
-	const u = usage;
-	c.set("usage", {
-		prompt_tokens: typeof u["prompt_tokens"] === "number" ? u["prompt_tokens"] : void 0,
-		completion_tokens: typeof u["completion_tokens"] === "number" ? u["completion_tokens"] : void 0,
-		total_tokens: typeof u["total_tokens"] === "number" ? u["total_tokens"] : void 0
-	});
+	if (typeof parsed !== "object" || parsed === null) return;
+	const u = readCopilotUsage(parsed);
+	if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0 || u.cache_read_tokens !== void 0 || u.cache_creation_tokens !== void 0) c.set("usage", u);
 }
 /**
 * Rewrite the `model` field in a single SSE chunk's `data` payload.
@@ -6656,16 +6877,24 @@ function getAnthropicToolUseBlocks(toolCalls) {
 //#endregion
 //#region src/routes/messages/count-tokens-handler.ts
 /**
-* Handles token counting for Anthropic messages
+* Handles token counting for Anthropic messages.
+*
+* Claude Code calls this BEFORE every real /v1/messages to estimate the
+* prompt cost and trigger its context-management auto-compression when the
+* estimate crosses a threshold. The estimate doesn't need to be exact but
+* it must be in the right order of magnitude — returning `1` (the legacy
+* fallback) makes Claude Code think every prompt is tiny.
 */
 async function handleCountTokens(c) {
 	try {
 		const anthropicBeta = c.req.header("anthropic-beta");
 		const anthropicPayload = await c.req.json();
 		const openAIPayload = translateToOpenAI(anthropicPayload);
-		const selectedModel = state.models?.data.find((model) => model.id === anthropicPayload.model);
+		const { models: modelAliases } = getConfig();
+		const upstreamId = resolveAlias(anthropicPayload.model, modelAliases);
+		const selectedModel = state.models?.data.find((m) => m.id === upstreamId || m.id === anthropicPayload.model);
 		if (!selectedModel) {
-			consola.warn("Model not found, returning default token count");
+			consola.warn(`count_tokens: model not found in upstream catalog (alias=${anthropicPayload.model} upstream=${upstreamId}); returning default`);
 			return c.json({ input_tokens: 1 });
 		}
 		const tokenCount = await getTokenCount(openAIPayload, selectedModel);
@@ -6727,10 +6956,10 @@ function sanitiseOutputItem(item) {
 *  - For non-streaming: the raw Anthropic JSON response object
 *  - For streaming: an async iterable of SSE events (fetch-event-stream)
 */
-const createMessagesNative = async (payload, onUpstream) => {
+const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta) => {
 	if (!state.copilotToken) throw new Error("Copilot token not found");
 	const hasVision = messageHasImages(payload);
-	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream));
+	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta);
 	headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user";
 	const upstream = `${copilotBaseUrl(state)}/v1/messages`;
 	consola.debug("Native Anthropic upstream:", upstream);
@@ -6766,20 +6995,63 @@ const createMessagesNative = async (payload, onUpstream) => {
 	return response.json();
 };
 /**
+* Build the anthropic-beta header forwarded upstream.
+*
+* We MUST forward whatever beta flags the client sent — Claude Code sends
+* the full set including `effort-2025-11-24` (which gates
+* `output_config.effort`) and `redact-thinking-2026-02-12` (which gates
+* thinking-encryption behaviour). Hard-coding our own list silently drops
+* them and the model behaves as if those features were off (we observed
+* 0 thinking blocks even with effort:"xhigh" until this was fixed).
+*
+* We additionally union in two flags we always want on so direct-API
+* callers without the right beta header still get them:
+*   - interleaved-thinking-2025-05-14  (mixed thinking + text blocks)
+*   - prompt-caching-2024-07-31        (cache_control support)
+*
+* Output is comma-separated, de-duplicated.
+*/
+function mergeAnthropicBeta(clientBeta) {
+	const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"];
+	const fromClient = (clientBeta ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+	return [...new Set([...fromClient, ...ours])].join(",");
+}
+/**
 * Build headers for the Anthropic native endpoint.
 *
 * The upstream requires `anthropic-version` and does NOT want an `openai-intent`
 * header.  We reuse `copilotHeaders()` for auth/agent headers and then layer the
 * Anthropic-specific ones on top.
 */
-function buildNativeHeaders(vision, stream) {
+function buildNativeHeaders(vision, stream, clientBeta) {
 	const { "openai-intent": _dropped,...anthropicBase } = copilotHeaders(state, vision);
 	return {
 		...anthropicBase,
 		"anthropic-version": "2023-06-01",
-		"anthropic-beta": "interleaved-thinking-2025-05-14,prompt-caching-2024-07-31",
+		"anthropic-beta": mergeAnthropicBeta(clientBeta),
 		...stream ? { accept: "text/event-stream" } : {}
 	};
+}
+/**
+* Map a legacy Anthropic `budget_tokens` value to a Copilot effort level
+* for adaptive thinking. The buckets mirror Claude Code's preset budgets
+* so a client that selects "Think hard" upstream lands on Copilot's "high"
+* (etc).
+*
+*   budget ≥ 50K → "xhigh"      (Ultrathink-equivalent)
+*   25K–50K      → "high"       (Think harder)
+*   5K–25K       → "medium"     (Think hard)
+*   < 5K         → "low"        (small explicit budget)
+*
+* When the caller didn't send a budget at all, default to "medium" — the
+* model's adaptive controller will still ramp up if the task warrants it.
+*/
+function budgetToEffort$1(budget) {
+	if (typeof budget !== "number" || budget <= 0) return "medium";
+	if (budget >= 5e4) return "xhigh";
+	if (budget >= 25e3) return "high";
+	if (budget >= 5e3) return "medium";
+	return "low";
 }
 /**
 * Produce the payload forwarded to upstream.
@@ -6789,18 +7061,21 @@ function buildNativeHeaders(vision, stream) {
 * (`thinking: { type: "adaptive" }` + `output_config.effort`) rather than the
 * legacy `{ type: "enabled", budget_tokens: N }`.  If the caller already sent
 * the correct format we leave it alone; if they sent the old format and the
-* model requires adaptive, we upgrade automatically.
+* model requires adaptive, we upgrade automatically — and we **map the
+* budget size to a Copilot effort level** (low/medium/high/xhigh) so the
+* caller's intent isn't flattened to "medium" regardless of input.
 */
 function buildUpstreamPayload(payload) {
 	const { thinking, output_config,...rest } = payload;
 	if (!thinking) return rest;
 	if (isAdaptiveThinkingModel(payload.model)) {
 		if (thinking.type === "enabled") {
-			consola.debug(`Upgrading thinking format to adaptive for model ${payload.model}`);
+			const effort = output_config?.effort ?? budgetToEffort$1(thinking.budget_tokens);
+			consola.debug(`Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`);
 			return {
 				...rest,
 				thinking: { type: "adaptive" },
-				output_config: output_config?.effort ? output_config : { effort: "medium" }
+				output_config: { effort }
 			};
 		}
 		return {
@@ -7461,15 +7736,26 @@ function translateResponsesToAnthropic(response) {
 * stash any usage figures it carries on the Hono context for the telemetry
 * middleware.
 *
-* - `message_start.message.usage.input_tokens` is captured ONCE.
-* - `message_delta.usage.output_tokens` is captured on every delta (the
-*   final delta carries the cumulative output token count).
+* Preference order:
+*   1. Copilot's `copilot_usage.token_details` if the event carries it
+*      (Copilot embeds this on `message_delta` events alongside the native
+*      anthropic `usage` block). This gives us the canonical input /
+*      output / cache_read / cache_write counts.
+*   2. Native Anthropic `usage.input_tokens` / `usage.output_tokens` as
+*      captured by previous versions.
 *
-* Returns the updated `(input, output)` pair so the caller can keep its own
-* running state without re-reading the event.
+* Returns the updated `(input, output)` pair so the caller can keep its
+* own running state without re-reading the event.
 */
 function stashAnthropicUsage(c, parsed, prev) {
 	let [input, output] = prev;
+	const fromCopilot = readCopilotUsage(parsed);
+	if (fromCopilot.prompt_tokens !== void 0 || fromCopilot.completion_tokens !== void 0 || fromCopilot.cache_read_tokens !== void 0 || fromCopilot.cache_creation_tokens !== void 0) {
+		if (fromCopilot.prompt_tokens !== void 0) input = fromCopilot.prompt_tokens;
+		if (fromCopilot.completion_tokens !== void 0) output = fromCopilot.completion_tokens;
+		c.set("usage", fromCopilot);
+		return [input, output];
+	}
 	if (parsed.type === "message_start") {
 		const m = parsed.message;
 		if (typeof m.usage.input_tokens === "number") input = m.usage.input_tokens;
@@ -7613,18 +7899,21 @@ function translateChunkToAnthropicEvents(chunk, state$1) {
 //#region src/routes/messages/handler.ts
 async function handleCompletion(c) {
 	await checkRateLimit(state);
-	const { models } = getConfig();
 	const anthropicPayload = await c.req.json();
 	consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload));
-	const clientAlias = anthropicPayload.model;
+	const stripped = anthropicPayload;
+	delete stripped.context_management;
+	delete stripped.context_mgmt;
+	const resolved = applyDefaultModelRewrite(c, anthropicPayload.model, "/v1/messages");
+	if (isAppliedError(resolved)) return resolved;
+	const { clientRequestedModel, clientAlias, upstreamModel } = resolved;
 	const payload = {
 		...anthropicPayload,
-		model: resolveAlias(anthropicPayload.model, models)
+		model: upstreamModel
 	};
-	c.set("upstream_model", payload.model);
 	const key = c.get("key");
 	if (!isModelAllowed(key.allowed_models, clientAlias)) return c.json({ error: {
-		message: `Model "${clientAlias}" is not in your key's allowed models`,
+		message: `Model "${clientRequestedModel}" is not in your key's allowed models`,
 		type: "permission_denied",
 		code: "model_not_allowed"
 	} }, 403);
@@ -7636,14 +7925,11 @@ async function handleCompletion(c) {
 async function handleNative(c, payload) {
 	consola.debug("Using native Anthropic pass-through for", payload.model);
 	const onUpstream = c.var.trace_capture_upstream;
-	const response = await createMessagesNative(payload, onUpstream);
+	const clientBeta = c.req.header("anthropic-beta");
+	const response = await createMessagesNative(payload, onUpstream, clientBeta);
 	if (!payload.stream) {
 		consola.debug("Native non-streaming response:", JSON.stringify(response).slice(0, 400));
-		const usage = response.usage;
-		if (usage) c.set("usage", {
-			prompt_tokens: usage.input_tokens,
-			completion_tokens: usage.output_tokens
-		});
+		c.set("usage", readCopilotUsage(response));
 		return c.json(response);
 	}
 	consola.debug("Native streaming response — proxying SSE events");
@@ -7695,10 +7981,7 @@ async function handleAnthropicViaResponses(c, payload) {
 	}
 	const sanitised = sanitiseResponsesOutput(typedResponse);
 	const anthropicResponse = translateResponsesToAnthropic(sanitised);
-	c.set("usage", {
-		prompt_tokens: anthropicResponse.usage.input_tokens,
-		completion_tokens: anthropicResponse.usage.output_tokens
-	});
+	c.set("usage", readCopilotUsage(typedResponse));
 	consola.debug("Responses→Anthropic translated response:", JSON.stringify(anthropicResponse).slice(0, 400));
 	return c.json(anthropicResponse);
 }
@@ -7709,11 +7992,7 @@ async function handleTranslated(c, anthropicPayload) {
 	const response = await createChatCompletions(openAIPayload, onUpstream);
 	if (isNonStreaming(response)) {
 		consola.debug("Non-streaming response from Copilot:", JSON.stringify(response).slice(-400));
-		if (response.usage) c.set("usage", {
-			prompt_tokens: response.usage.prompt_tokens,
-			completion_tokens: response.usage.completion_tokens,
-			total_tokens: response.usage.total_tokens
-		});
+		c.set("usage", readCopilotUsage(response));
 		const anthropicResponse = translateToAnthropic(response);
 		consola.debug("Translated Anthropic response:", JSON.stringify(anthropicResponse));
 		return c.json(anthropicResponse);
@@ -7731,11 +8010,8 @@ async function handleTranslated(c, anthropicPayload) {
 			if (rawEvent.data === "[DONE]") break;
 			if (!rawEvent.data) continue;
 			const chunk = JSON.parse(rawEvent.data);
-			if (chunk.usage) c.set("usage", {
-				prompt_tokens: chunk.usage.prompt_tokens,
-				completion_tokens: chunk.usage.completion_tokens,
-				total_tokens: chunk.usage.total_tokens
-			});
+			const u = readCopilotUsage(chunk);
+			if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0) c.set("usage", u);
 			const events$1 = translateChunkToAnthropicEvents(chunk, streamState);
 			for (const event of events$1) {
 				consola.debug("Translated Anthropic event:", JSON.stringify(event));
@@ -7872,28 +8148,36 @@ async function handleResponses(c) {
 		} }, 400);
 	}
 	consola.debug("Responses API request payload:", JSON.stringify(payload));
+	const resolved = applyDefaultModelRewrite(c, payload.model, "/v1/responses");
+	if (isAppliedError(resolved)) return resolved;
+	const { clientRequestedModel, clientAlias, upstreamModel } = resolved;
+	payload = {
+		...payload,
+		model: upstreamModel
+	};
+	const key = c.get("key");
+	if (!isModelAllowed(key.allowed_models, clientAlias)) return c.json({ error: {
+		message: `Model "${clientRequestedModel}" is not in your key's allowed models`,
+		type: "permission_denied",
+		code: "model_not_allowed"
+	} }, 403);
 	if (state.manualApprove) await awaitApproval();
 	const onUpstream = c.var.trace_capture_upstream;
 	const response = await createResponses(payload, onUpstream);
 	if (!payload.stream) {
 		const sanitised = sanitiseResponsesOutput(response);
 		consola.debug("Responses non-streaming response:", JSON.stringify(sanitised).slice(0, 400));
+		c.set("usage", readCopilotUsage(sanitised));
 		return c.json(sanitised);
 	}
+	return streamResponsesEvents(c, response);
+}
+function streamResponsesEvents(c, response) {
 	consola.debug("Responses streaming response — proxying SSE events");
 	return streamSSE(c, async (stream) => {
 		for await (const rawEvent of response) {
 			if (!rawEvent.data) continue;
-			let forwardData = rawEvent.data;
-			if (rawEvent.data !== "[DONE]") try {
-				const parsed = JSON.parse(rawEvent.data);
-				consola.debug("Responses SSE event:", parsed.type);
-				if (parsed["item"]) parsed["item"] = sanitiseOutputItem(parsed["item"]);
-				if (Array.isArray(parsed["output"])) parsed["output"] = parsed["output"].map((i) => sanitiseOutputItem(i));
-				forwardData = JSON.stringify(parsed);
-			} catch {
-				if (rawEvent.data !== "[DONE]") consola.warn("Could not parse Responses SSE chunk for logging:", rawEvent.data.slice(0, 200));
-			}
+			const forwardData = sanitiseSseDataIfPossible(rawEvent.data);
 			await stream.writeSSE({
 				event: rawEvent.event,
 				data: forwardData
@@ -7906,6 +8190,26 @@ async function handleResponses(c) {
 			data: JSON.stringify({ message: String(err) })
 		});
 	});
+}
+/**
+* SSE events like `response.output_item.done` carry full item snapshots which
+* can contain `status: null` that upstream rejects on re-submission.  We
+* parse, sanitise the embedded item/output, and re-serialise.  Failures fall
+* through to the original verbatim string so a malformed chunk doesn't break
+* the stream.
+*/
+function sanitiseSseDataIfPossible(data) {
+	if (data === "[DONE]") return data;
+	try {
+		const parsed = JSON.parse(data);
+		consola.debug("Responses SSE event:", parsed.type);
+		if (parsed["item"]) parsed["item"] = sanitiseOutputItem(parsed["item"]);
+		if (Array.isArray(parsed["output"])) parsed["output"] = parsed["output"].map((i) => sanitiseOutputItem(i));
+		return JSON.stringify(parsed);
+	} catch {
+		consola.warn("Could not parse Responses SSE chunk for logging:", data.slice(0, 200));
+		return data;
+	}
 }
 
 //#endregion

@@ -27,6 +27,24 @@ export interface EventRow {
   latency_ms: number
   error: string | null
   usage_unknown: number
+  /**
+   * Anthropic thinking level extracted from the request body, normalised
+   * client-side to a short string ("auto" / "think-hard" / "think-harder" /
+   * "ultrathink" / "custom:NNN"). NULL when the request didn't include a
+   * `thinking` field (the common case for non-Claude calls).
+   */
+  thinking_level: string | null
+  /**
+   * Copilot cache_read tokens (prompt-cache hits).  Sourced from
+   * copilot_usage.token_details[token_type=cache_read].  NULL when the
+   * upstream didn't report it.
+   */
+  cache_read_tokens: number | null
+  /** Copilot cache_write tokens (prompt-cache creations). */
+  cache_creation_tokens: number | null
+  /** Reasoning/thinking tokens (output_tokens_details.reasoning_tokens).
+   *  Only OpenAI /responses exposes this; Anthropic stays NULL. */
+  reasoning_tokens: number | null
 }
 
 /** Insert-shape: callers don't supply `id` (auto-increment). */
@@ -41,6 +59,10 @@ export interface NewEvent {
   latency_ms: number
   error: string | null
   usage_unknown: number
+  thinking_level: string | null
+  cache_read_tokens: number | null
+  cache_creation_tokens: number | null
+  reasoning_tokens: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -57,8 +79,10 @@ export function recordEvent(row: NewEvent): void {
       `INSERT INTO events
          (ts, key_id, model, upstream_model,
           prompt_tokens, completion_tokens,
-          status, latency_ms, error, usage_unknown)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          status, latency_ms, error, usage_unknown,
+          thinking_level, cache_read_tokens, cache_creation_tokens,
+          reasoning_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         row.ts,
         row.key_id,
@@ -70,6 +94,10 @@ export function recordEvent(row: NewEvent): void {
         row.latency_ms,
         row.error,
         row.usage_unknown,
+        row.thinking_level,
+        row.cache_read_tokens,
+        row.cache_creation_tokens,
+        row.reasoning_tokens,
       ],
     )
   } catch (err) {

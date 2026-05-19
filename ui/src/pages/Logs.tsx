@@ -1,9 +1,8 @@
-import { Badge, Button, Card, TextInput, Text } from "@tremor/react"
 import { useQuery } from "@tanstack/react-query"
+import { Badge, Button, Card, TextInput, Text } from "@tremor/react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 
-import { api } from "~/api/client"
 import type {
   FullTraceResponse,
   LogEntry,
@@ -11,6 +10,14 @@ import type {
   TraceFilesResponse,
   TraceLeg,
 } from "~/api/types"
+
+import { api } from "~/api/client"
+import {
+  extractKeyMetrics,
+  KpiBar,
+  parseBody,
+  TraceLegStructured,
+} from "~/components/TraceStructured"
 
 const NUM_FMT = new Intl.NumberFormat("en", { notation: "compact" })
 
@@ -38,6 +45,48 @@ const STATUS_COLOR = (status: number) => {
   return "slate" as const
 }
 
+/**
+ * Render the raw thinking_level enum string from the events table verbatim,
+ * with a tiny bit of polish for the well-known shapes:
+ *
+ *   - "low" / "medium" / "high" / "xhigh"  → as-is (Claude Code v2.x effort)
+ *   - "adaptive" / "enabled"               → as-is (Anthropic mode flag alone)
+ *   - "effort:high"                        → "high" (OpenAI reasoning effort)
+ *   - "10000"                              → "10K" (legacy budget, K-formatted)
+ *   - anything else                        → as-is (forward-compat)
+ *
+ * The intent is to show the **raw** signal the client sent so operators can
+ * spot exactly what level the request asked for.
+ */
+function thinkingLabel(level: string | null): string {
+  if (!level) return "—"
+  if (level.startsWith("effort:")) return level.slice("effort:".length)
+  const n = Number.parseInt(level, 10)
+  if (Number.isFinite(n) && String(n) === level) {
+    return n >= 1000 ? `${Math.round(n / 1000)}K` : String(n)
+  }
+  return level
+}
+
+function thinkingBadgeColor(
+  level: string | null,
+): "violet" | "indigo" | "blue" | "slate" {
+  if (!level) return "slate"
+  // Claude Code v2.x effort enum
+  if (level === "xhigh" || level === "effort:xhigh") return "violet"
+  if (level === "high" || level === "effort:high") return "violet"
+  if (level === "medium" || level === "effort:medium") return "indigo"
+  if (level === "low" || level === "effort:low") return "blue"
+  // Budget values: bigger budget → warmer colour
+  const n = Number.parseInt(level, 10)
+  if (Number.isFinite(n) && String(n) === level) {
+    if (n >= 50_000) return "violet"
+    if (n >= 25_000) return "indigo"
+    return "blue"
+  }
+  return "blue"
+}
+
 type StatusFilter = "all" | "ok" | "error"
 
 interface SsePayload {
@@ -58,14 +107,26 @@ export function Logs() {
   const [searchParams, setSearchParams] = useSearchParams()
   const sseRef = useRef<EventSource | null>(null)
 
+  // Pagination state. Page size matches the previous hard-coded limit so the
+  // first page renders identically. Reset to page 0 whenever a filter
+  // changes — otherwise switching from "all status" to "errors" could land
+  // the operator on an empty page deep into the result set.
+  const [page, setPage] = useState(0)
+  const PAGE_SIZE = 50
+
+  useEffect(() => {
+    setPage(0)
+  }, [search, statusFilter, modelFilter])
+
   const params = useMemo(() => {
     const sp = new URLSearchParams()
     if (search) sp.set("q", search)
     if (statusFilter !== "all") sp.set("status", statusFilter)
     if (modelFilter) sp.set("model", modelFilter)
-    sp.set("limit", "100")
+    sp.set("limit", String(PAGE_SIZE))
+    sp.set("offset", String(page * PAGE_SIZE))
     return sp.toString()
-  }, [search, statusFilter, modelFilter])
+  }, [search, statusFilter, modelFilter, page])
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["logs", params],
@@ -109,6 +170,10 @@ export function Logs() {
           latency_ms: 0,
           error: null,
           usage_unknown: 0,
+          thinking_level: null,
+          cache_read_tokens: null,
+          cache_creation_tokens: null,
+          reasoning_tokens: null,
         }
         setSelected(stub)
         searchParams.delete("event")
@@ -157,7 +222,7 @@ export function Logs() {
   if (error) {
     return (
       <div className="rounded-tremor-small border border-rose-300 bg-rose-50 p-4 text-rose-700">
-        Failed to load logs: {(error as Error).message}
+        Failed to load logs: {error.message}
       </div>
     )
   }
@@ -223,8 +288,8 @@ export function Logs() {
           </h3>
           <Text>
             Captures only fire for keys with debug mode on. The 50 most recent
-            redacted payloads stay in memory; refresh keeps the historical
-            table fresh.
+            redacted payloads stay in memory; refresh keeps the historical table
+            fresh.
           </Text>
           <div className="mt-3 max-h-64 overflow-y-auto rounded-tremor-small border border-tremor-border bg-tremor-background-muted p-2">
             {livePayloads.length === 0 ?
@@ -233,10 +298,7 @@ export function Logs() {
               </div>
             : <ul className="space-y-1 text-xs">
                 {livePayloads.map((p, i) => (
-                  <li
-                    key={i}
-                    className="rounded bg-tremor-background p-2 mono"
-                  >
+                  <li key={i} className="rounded bg-tremor-background p-2 mono">
                     {JSON.stringify(p).slice(0, 240)}
                     {JSON.stringify(p).length > 240 && "…"}
                   </li>
@@ -256,6 +318,7 @@ export function Logs() {
                 <th className="px-4 py-2">Time</th>
                 <th className="px-4 py-2">Key</th>
                 <th className="px-4 py-2">Model</th>
+                <th className="px-4 py-2">Thinking</th>
                 <th className="px-4 py-2">Status</th>
                 <th className="px-4 py-2">Latency</th>
                 <th className="px-4 py-2">Tokens (p/c)</th>
@@ -266,7 +329,7 @@ export function Logs() {
               {data.items.length === 0 ?
                 <tr>
                   <td
-                    colSpan={7}
+                    colSpan={8}
                     className="px-4 py-8 text-center text-tremor-content-subtle"
                   >
                     No events match the current filters.
@@ -291,6 +354,13 @@ export function Logs() {
                     <td className="px-4 py-2 text-tremor-content">
                       {row.model}
                     </td>
+                    <td className="px-4 py-2 text-xs">
+                      {row.thinking_level ?
+                        <Badge color={thinkingBadgeColor(row.thinking_level)}>
+                          {thinkingLabel(row.thinking_level)}
+                        </Badge>
+                      : <span className="text-tremor-content-subtle">—</span>}
+                    </td>
                     <td className="px-4 py-2">
                       <Badge color={STATUS_COLOR(row.status)}>
                         {row.status}
@@ -301,12 +371,27 @@ export function Logs() {
                     </td>
                     <td className="px-4 py-2 text-xs text-tremor-content">
                       {fmt(row.prompt_tokens)}/{fmt(row.completion_tokens)}
+                      {(row.reasoning_tokens ?? 0) > 0 && (
+                        <span className="ml-1 text-[10px] text-violet-600">
+                          ·think {fmt(row.reasoning_tokens)}
+                        </span>
+                      )}
+                      {(row.cache_read_tokens ?? 0) > 0 && (
+                        <span className="ml-1 text-[10px] text-emerald-600">
+                          ·hit {fmt(row.cache_read_tokens)}
+                        </span>
+                      )}
+                      {(row.cache_creation_tokens ?? 0) > 0 && (
+                        <span className="ml-1 text-[10px] text-violet-600">
+                          ·wr {fmt(row.cache_creation_tokens)}
+                        </span>
+                      )}
                     </td>
                     <td className="px-4 py-2 text-xs text-rose-700">
-                      {row.error
-                        ? row.error.slice(0, 60)
-                          + (row.error.length > 60 ? "…" : "")
-                        : "—"}
+                      {row.error ?
+                        row.error.slice(0, 60)
+                        + (row.error.length > 60 ? "…" : "")
+                      : "—"}
                     </td>
                   </tr>
                 ))
@@ -314,8 +399,47 @@ export function Logs() {
             </tbody>
           </table>
         </div>
-        <div className="border-t border-tremor-border px-4 py-2 text-xs text-tremor-content-subtle">
-          Showing {data.items.length} of {data.total} matching events
+        <div className="flex items-center justify-between border-t border-tremor-border px-4 py-2 text-xs text-tremor-content-subtle">
+          <span>
+            Showing{" "}
+            {data.total === 0 ?
+              "0"
+            : `${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + data.items.length}`
+            }{" "}
+            of {data.total} matching events
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className={
+                "rounded border border-tremor-border px-2 py-0.5 "
+                + (page === 0 ?
+                  "cursor-not-allowed opacity-40"
+                : "hover:bg-tremor-background-muted")
+              }
+            >
+              ‹ Prev
+            </button>
+            <span className="mono text-tremor-content">
+              Page {page + 1}
+              {data.total > 0 && (
+                <> / {Math.max(1, Math.ceil(data.total / PAGE_SIZE))}</>
+              )}
+            </span>
+            <button
+              onClick={() => setPage((p) => p + 1)}
+              disabled={(page + 1) * PAGE_SIZE >= data.total}
+              className={
+                "rounded border border-tremor-border px-2 py-0.5 "
+                + ((page + 1) * PAGE_SIZE >= data.total ?
+                  "cursor-not-allowed opacity-40"
+                : "hover:bg-tremor-background-muted")
+              }
+            >
+              Next ›
+            </button>
+          </div>
         </div>
       </Card>
 
@@ -338,8 +462,7 @@ export function Logs() {
               >
                 <span className="mono text-xs">{f.name}</span>
                 <span className="text-xs text-tremor-content-subtle">
-                  {fmt(f.size)} bytes ·{" "}
-                  {new Date(f.mtime).toLocaleDateString()}
+                  {fmt(f.size)} bytes · {new Date(f.mtime).toLocaleDateString()}
                 </span>
                 <a
                   href={`/admin/traces/${f.name.replace(/^traces-/, "").replace(/\.jsonl$/, "")}.jsonl`}
@@ -372,12 +495,15 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
   const [tab, setTab] = useState<TabKey>("summary")
   const [copied, setCopied] = useState<string | null>(null)
 
-  const { data: traceData, isLoading: traceLoading, error: traceError } =
-    useQuery({
-      queryKey: ["logs", entry.id, "trace"],
-      queryFn: () => api<FullTraceResponse>(`/logs/${entry.id}/trace`),
-      retry: false,
-    })
+  const {
+    data: traceData,
+    isLoading: traceLoading,
+    error: traceError,
+  } = useQuery({
+    queryKey: ["logs", entry.id, "trace"],
+    queryFn: () => api<FullTraceResponse>(`/logs/${entry.id}/trace`),
+    retry: false,
+  })
 
   const trace = traceData?.trace
   const noCapture =
@@ -389,7 +515,7 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
     try {
       await navigator.clipboard.writeText(text)
       setCopied(tag)
-      window.setTimeout(() => setCopied(null), 1500)
+      globalThis.setTimeout(() => setCopied(null), 1500)
     } catch {
       // ignore
     }
@@ -418,7 +544,7 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
       lines.push(`  -d '${bodyStr.replaceAll("'", `'\\''`)}'`)
     } else {
       // trim trailing backslash
-      const last = lines[lines.length - 1]
+      const last = lines.at(-1)
       lines[lines.length - 1] = last.replace(/ \\$/, "")
     }
     return lines.join("\n")
@@ -461,21 +587,32 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
               onClick={() => setTab(k)}
               className={
                 "border-b-2 px-3 py-2 text-sm font-medium "
-                + (tab === k
-                  ? "border-tremor-brand text-tremor-brand-emphasis"
-                  : "border-transparent text-tremor-content hover:text-tremor-content-strong")
+                + (tab === k ?
+                  "border-tremor-brand text-tremor-brand-emphasis"
+                : "border-transparent text-tremor-content hover:text-tremor-content-strong")
               }
             >
               {label}
-              {k !== "summary"
-                && noCapture
-                && <span className="ml-1 text-xs text-tremor-content-subtle">·</span>}
+              {k !== "summary" && noCapture && (
+                <span className="ml-1 text-xs text-tremor-content-subtle">
+                  ·
+                </span>
+              )}
             </button>
           ))}
         </div>
 
         {tab === "summary" && (
           <div className="mt-4 space-y-4">
+            {/* Key metrics bar: tokens / cache / stop / thinking / effort.
+                Reads from BOTH client→proxy request and the final response so
+                it works whether or not upstream traces were captured. */}
+            {(() => {
+              const reqBody = parseBody(trace?.req?.body).parsed
+              const resBody = parseBody(trace?.res?.body).parsed
+              const metrics = extractKeyMetrics(reqBody, resBody)
+              return <KpiBar metrics={metrics} />
+            })()}
             <dl className="grid grid-cols-2 gap-y-2 text-sm">
               <dt className="text-tremor-content-subtle">Time</dt>
               <dd className="text-tremor-content-strong">
@@ -501,9 +638,7 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
               </dd>
               <dt className="text-tremor-content-subtle">Status</dt>
               <dd>
-                <Badge color={STATUS_COLOR(entry.status)}>
-                  {entry.status}
-                </Badge>
+                <Badge color={STATUS_COLOR(entry.status)}>{entry.status}</Badge>
               </dd>
               <dt className="text-tremor-content-subtle">Latency</dt>
               <dd className="text-tremor-content-strong">
@@ -513,6 +648,42 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
               <dd className="text-tremor-content-strong">
                 {fmt(entry.prompt_tokens)}/{fmt(entry.completion_tokens)}
               </dd>
+              {(entry.reasoning_tokens ?? 0) > 0 && (
+                <>
+                  <dt className="text-tremor-content-subtle">
+                    Thinking tokens
+                  </dt>
+                  <dd className="text-violet-700">
+                    {fmt(entry.reasoning_tokens)}
+                  </dd>
+                </>
+              )}
+              {(entry.cache_read_tokens ?? 0) > 0 && (
+                <>
+                  <dt className="text-tremor-content-subtle">Cache hit</dt>
+                  <dd className="text-emerald-700">
+                    {fmt(entry.cache_read_tokens)}
+                  </dd>
+                </>
+              )}
+              {(entry.cache_creation_tokens ?? 0) > 0 && (
+                <>
+                  <dt className="text-tremor-content-subtle">Cache write</dt>
+                  <dd className="text-violet-700">
+                    {fmt(entry.cache_creation_tokens)}
+                  </dd>
+                </>
+              )}
+              {entry.thinking_level && (
+                <>
+                  <dt className="text-tremor-content-subtle">Thinking</dt>
+                  <dd>
+                    <Badge color={thinkingBadgeColor(entry.thinking_level)}>
+                      {thinkingLabel(entry.thinking_level)}
+                    </Badge>
+                  </dd>
+                </>
+              )}
               {entry.error && (
                 <>
                   <dt className="text-tremor-content-subtle">Error</dt>
@@ -562,9 +733,10 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
             {noCapture && (
               <Card decoration="top" decorationColor="amber">
                 <Text>
-                  No captured request/response for this event. Enable debug
-                  mode on the key (Keys → {entry.key_label || entry.key_id.slice(-8)} → Enable debug)
-                  to capture future calls into a JSONL trace file.
+                  No captured request/response for this event. Enable debug mode
+                  on the key (Keys → {entry.key_label || entry.key_id.slice(-8)}{" "}
+                  → Enable debug) to capture future calls into a JSONL trace
+                  file.
                 </Text>
               </Card>
             )}
@@ -574,9 +746,7 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
         {(tab === "request" || tab === "response" || tab === "metadata") && (
           <div className="mt-4">
             {traceLoading && (
-              <Text className="text-tremor-content-subtle">
-                Loading trace…
-              </Text>
+              <Text className="text-tremor-content-subtle">Loading trace…</Text>
             )}
             {noCapture && (
               <Card decoration="top" decorationColor="amber">
@@ -662,12 +832,6 @@ function TraceLegPanel({ title, leg, onCopy, copied }: TraceLegPanelProps) {
       </Text>
     )
   }
-  const bodyStr =
-    leg.body === null || leg.body === undefined
-      ? ""
-      : typeof leg.body === "string"
-        ? leg.body
-        : JSON.stringify(leg.body, null, 2)
   const headers = leg.headers ?? {}
 
   return (
@@ -681,7 +845,13 @@ function TraceLegPanel({ title, leg, onCopy, copied }: TraceLegPanelProps) {
           onClick={() =>
             onCopy(
               JSON.stringify(
-                { method: leg.method, url: leg.url, status: leg.status, headers, body: leg.body },
+                {
+                  method: leg.method,
+                  url: leg.url,
+                  status: leg.status,
+                  headers,
+                  body: leg.body,
+                },
                 null,
                 2,
               ),
@@ -710,17 +880,13 @@ function TraceLegPanel({ title, leg, onCopy, copied }: TraceLegPanelProps) {
             .join("\n")}
         </pre>
       </details>
-      <div>
-        <div className="mb-1 text-xs font-medium text-tremor-content-strong">
-          Body
-        </div>
-        {bodyStr.length === 0 ?
-          <div className="text-xs text-tremor-content-subtle">(empty)</div>
-        : <pre className="rounded bg-tremor-background-muted p-3 mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
-            {bodyStr}
-          </pre>
-        }
-      </div>
+      {/* Body — structured view with a Raw JSON toggle. The structured renderer
+          knows how to display Anthropic / OpenAI / Responses-API shapes; falls
+          back to a raw <pre> for anything else (including SSE concatenated
+          streams). bodyStr is kept as a fallback prop for legacy callers. */}
+      <TraceLegStructured body={leg.body} />
+      {/* (legacy bodyStr removed from JSX; the variable is still computed
+          above for the Copy-JSON button.) */}
     </div>
   )
 }

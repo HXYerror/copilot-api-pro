@@ -31,6 +31,7 @@ function makeTmpConfig(dir: string): string {
       audit_days: 365,
     },
     features: { auth: false, telemetry: false, debug: false },
+    default_model_alias: "",
   }
   saveConfig(cfg, cfgPath)
   return cfgPath

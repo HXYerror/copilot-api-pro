@@ -51,6 +51,7 @@ const validComplete: Config = {
     telemetry: false,
     debug: false,
   },
+  default_model_alias: "",
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,7 @@ describe("saveConfig()", () => {
     const updated = {
       ...validComplete,
       features: { ...validComplete.features, debug: true },
+      default_model_alias: "",
     }
     saveConfig(updated, cfgPath)
     const stat = fs.statSync(cfgPath)
@@ -296,6 +298,7 @@ describe("watchConfig()", () => {
     const updated = {
       ...validComplete,
       features: { ...validComplete.features, debug: true },
+      default_model_alias: "",
     }
     writeJson(cfgPath, updated)
     writeJson(cfgPath, updated)
@@ -342,6 +345,7 @@ describe("watchConfig()", () => {
     const updated = {
       ...validComplete,
       features: { ...validComplete.features, auth: true },
+      default_model_alias: "",
     }
     writeJson(cfgPath, updated)
 
@@ -386,6 +390,7 @@ describe("getConfig()", () => {
     const updated = {
       ...validComplete,
       features: { ...validComplete.features, auth: !authBefore },
+      default_model_alias: "",
     }
     saveConfig(updated, cfgPath)
     await loadConfig(cfgPath)

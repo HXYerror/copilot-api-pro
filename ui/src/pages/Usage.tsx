@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query"
 import {
   AreaChart,
   Badge,
@@ -16,16 +17,16 @@ import {
   Text,
   Title,
 } from "@tremor/react"
-import { useQuery } from "@tanstack/react-query"
 import { useMemo, useState } from "react"
 
-import { api } from "~/api/client"
 import type {
   UsageRange,
   UsageResponse,
   UsageRpmPoint,
   UsageTopKey,
 } from "~/api/types"
+
+import { api } from "~/api/client"
 
 const NUM_FMT = new Intl.NumberFormat("en", { notation: "compact" })
 
@@ -55,7 +56,35 @@ const RANGES: Array<{ label: string; value: UsageRange }> = [
   { label: "30d", value: "30d" },
 ]
 
-function bucketByMinute(points: Array<UsageRpmPoint>): {
+/**
+ * Format a bucket timestamp for the X-axis label, picking the granularity
+ * that makes sense for the bucket size:
+ *   - sub-hour buckets  → "HH:MM" (no date — same day)
+ *   - sub-day buckets   → "MMM DD HH"
+ *   - day-and-up buckets → "MMM DD"
+ */
+function formatBucketTime(ts: number, bucketMs: number): string {
+  const d = new Date(ts)
+  if (bucketMs < 3_600_000) {
+    return d.toLocaleTimeString("en", {
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+  }
+  if (bucketMs < 86_400_000) {
+    return d.toLocaleString("en", {
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+    })
+  }
+  return d.toLocaleDateString("en", { month: "short", day: "2-digit" })
+}
+
+function regroupByBucket(
+  points: Array<UsageRpmPoint>,
+  bucketMs: number,
+): {
   data: Array<Record<string, number | string>>
   categories: Array<string>
 } {
@@ -75,7 +104,7 @@ function bucketByMinute(points: Array<UsageRpmPoint>): {
     const key = p.model && top.has(p.model) ? p.model : "other"
     let row = byBucket.get(p.ts)
     if (!row) {
-      row = { ts: p.ts, time: new Date(p.ts).toLocaleTimeString() }
+      row = { ts: p.ts, time: formatBucketTime(p.ts, bucketMs) }
       byBucket.set(p.ts, row)
     }
     row[key] = ((row[key] as number) ?? 0) + p.count
@@ -113,12 +142,20 @@ export function Usage() {
   if (error) {
     return (
       <div className="rounded-tremor-small border border-rose-300 bg-rose-50 p-4 text-rose-700">
-        Failed to load usage: {(error as Error).message}
+        Failed to load usage: {error.message}
       </div>
     )
   }
 
-  const activity = bucketByMinute(data.activity.rpm)
+  // Server-chosen bucket size (defaults preserve the old minute granularity
+  // for callers that haven't been redeployed). The chart titles, X-axis time
+  // format, and Tokens/Latency bucket labels all read from this so 1h/24h/7d
+  // /30d render with appropriate granularity instead of always saying "per
+  // minute" / "per hour" (#6).
+  const bucketMs = data.activity.bucket_ms ?? 60_000
+  const bucketLabel = data.activity.bucket_label ?? "per minute"
+
+  const activity = regroupByBucket(data.activity.rpm, bucketMs)
   // Force the Tremor charts to remount when the filter changes. Tremor's
   // <AreaChart> caches SVG paths via Recharts and doesn't always re-render
   // when the `categories` array shape changes (e.g. 1h → 24h often adds
@@ -126,20 +163,12 @@ export function Usage() {
   // cheapest way to guarantee a fresh chart on every range switch.
   const chartKey = queryString
   const tokensData = data.activity.tokens.map((t) => ({
-    time: new Date(t.ts).toLocaleString("en", {
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-    }),
+    time: formatBucketTime(t.ts, bucketMs),
     Prompt: t.prompt_tokens,
     Completion: t.completion_tokens,
   }))
   const latencyData = data.activity.latency.map((p) => ({
-    time: new Date(p.ts).toLocaleString("en", {
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-    }),
+    time: formatBucketTime(p.ts, bucketMs),
     p50: p.p50,
     p95: p.p95,
     p99: p.p99,
@@ -157,9 +186,9 @@ export function Usage() {
                 onClick={() => setRange(r.value)}
                 className={
                   "rounded px-3 py-1 text-xs font-medium "
-                  + (range === r.value
-                    ? "bg-tremor-brand text-white"
-                    : "text-tremor-content hover:bg-tremor-background-muted")
+                  + (range === r.value ?
+                    "bg-tremor-brand text-white"
+                  : "text-tremor-content hover:bg-tremor-background-muted")
                 }
               >
                 {r.label}
@@ -226,9 +255,7 @@ export function Usage() {
         <KpiBox
           label="p95 latency"
           value={
-            data.stats.p95_latency_ms ?
-              `${data.stats.p95_latency_ms} ms`
-            : "—"
+            data.stats.p95_latency_ms ? `${data.stats.p95_latency_ms} ms` : "—"
           }
           tone="violet"
         />
@@ -247,7 +274,7 @@ export function Usage() {
             <TabPanel>
               <div className="space-y-6 p-4">
                 <div>
-                  <Title>Requests per minute</Title>
+                  <Title>Requests {bucketLabel}</Title>
                   <Text>Stacked by model (top 6 + other)</Text>
                   {activity.data.length === 0 ?
                     <Empty />
@@ -266,7 +293,7 @@ export function Usage() {
                   }
                 </div>
                 <div>
-                  <Title>Tokens per hour</Title>
+                  <Title>Tokens {bucketLabel}</Title>
                   <Text>Prompt vs completion</Text>
                   {tokensData.length === 0 ?
                     <Empty />
@@ -285,7 +312,7 @@ export function Usage() {
                   }
                 </div>
                 <div>
-                  <Title>Latency per hour</Title>
+                  <Title>Latency {bucketLabel}</Title>
                   <Text>p50 / p95 / p99</Text>
                   {latencyData.length === 0 ?
                     <Empty />
@@ -446,7 +473,8 @@ export function Usage() {
                               <Badge
                                 color={
                                   e.status >= 500 ? "rose"
-                                  : e.status >= 400 ? "amber"
+                                  : e.status >= 400 ?
+                                    "amber"
                                   : "slate"
                                 }
                               >
@@ -457,10 +485,10 @@ export function Usage() {
                               {fmt(e.count)}
                             </td>
                             <td className="px-2 py-2 text-tremor-content text-xs">
-                              {e.sample_error
-                                ? e.sample_error.slice(0, 120)
-                                  + (e.sample_error.length > 120 ? "…" : "")
-                                : "—"}
+                              {e.sample_error ?
+                                e.sample_error.slice(0, 120)
+                                + (e.sample_error.length > 120 ? "…" : "")
+                              : "—"}
                             </td>
                           </tr>
                         ))}

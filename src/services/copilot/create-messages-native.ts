@@ -36,11 +36,16 @@ import type { UpstreamCaptureFn } from "./create-chat-completions"
 export const createMessagesNative = async (
   payload: AnthropicMessagesPayload,
   onUpstream?: UpstreamCaptureFn,
+  clientAnthropicBeta?: string,
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
   const hasVision = messageHasImages(payload)
-  const headers = buildNativeHeaders(hasVision, Boolean(payload.stream))
+  const headers = buildNativeHeaders(
+    hasVision,
+    Boolean(payload.stream),
+    clientAnthropicBeta,
+  )
   // X-Initiator parity with /chat/completions and /responses: tells upstream
   // whether this turn is operator-initiated ("user") or part of an
   // automated/agent loop. Detected from the message history.
@@ -94,6 +99,32 @@ export const createMessagesNative = async (
 // ---------------------------------------------------------------------------
 
 /**
+ * Build the anthropic-beta header forwarded upstream.
+ *
+ * We MUST forward whatever beta flags the client sent — Claude Code sends
+ * the full set including `effort-2025-11-24` (which gates
+ * `output_config.effort`) and `redact-thinking-2026-02-12` (which gates
+ * thinking-encryption behaviour). Hard-coding our own list silently drops
+ * them and the model behaves as if those features were off (we observed
+ * 0 thinking blocks even with effort:"xhigh" until this was fixed).
+ *
+ * We additionally union in two flags we always want on so direct-API
+ * callers without the right beta header still get them:
+ *   - interleaved-thinking-2025-05-14  (mixed thinking + text blocks)
+ *   - prompt-caching-2024-07-31        (cache_control support)
+ *
+ * Output is comma-separated, de-duplicated.
+ */
+function mergeAnthropicBeta(clientBeta: string | undefined): string {
+  const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"]
+  const fromClient = (clientBeta ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  return [...new Set([...fromClient, ...ours])].join(",")
+}
+
+/**
  * Build headers for the Anthropic native endpoint.
  *
  * The upstream requires `anthropic-version` and does NOT want an `openai-intent`
@@ -103,6 +134,7 @@ export const createMessagesNative = async (
 function buildNativeHeaders(
   vision: boolean,
   stream: boolean,
+  clientBeta?: string,
 ): Record<string, string> {
   const base = copilotHeaders(state, vision)
 
@@ -112,12 +144,36 @@ function buildNativeHeaders(
   return {
     ...anthropicBase,
     "anthropic-version": "2023-06-01",
-    // Enable beta features: extended thinking + prompt caching
-    "anthropic-beta":
-      "interleaved-thinking-2025-05-14,prompt-caching-2024-07-31",
+    // Forward client beta flags + our defaults. Crucial for Claude Code's
+    // `effort-2025-11-24` flag which enables `output_config.effort`.
+    "anthropic-beta": mergeAnthropicBeta(clientBeta),
     // Only request SSE streaming format when the caller is streaming
     ...(stream ? { accept: "text/event-stream" } : {}),
   }
+}
+
+/**
+ * Map a legacy Anthropic `budget_tokens` value to a Copilot effort level
+ * for adaptive thinking. The buckets mirror Claude Code's preset budgets
+ * so a client that selects "Think hard" upstream lands on Copilot's "high"
+ * (etc).
+ *
+ *   budget ≥ 50K → "xhigh"      (Ultrathink-equivalent)
+ *   25K–50K      → "high"       (Think harder)
+ *   5K–25K       → "medium"     (Think hard)
+ *   < 5K         → "low"        (small explicit budget)
+ *
+ * When the caller didn't send a budget at all, default to "medium" — the
+ * model's adaptive controller will still ramp up if the task warrants it.
+ */
+function budgetToEffort(
+  budget: number | undefined,
+): "low" | "medium" | "high" | "xhigh" {
+  if (typeof budget !== "number" || budget <= 0) return "medium"
+  if (budget >= 50_000) return "xhigh"
+  if (budget >= 25_000) return "high"
+  if (budget >= 5_000) return "medium"
+  return "low"
 }
 
 /**
@@ -128,7 +184,9 @@ function buildNativeHeaders(
  * (`thinking: { type: "adaptive" }` + `output_config.effort`) rather than the
  * legacy `{ type: "enabled", budget_tokens: N }`.  If the caller already sent
  * the correct format we leave it alone; if they sent the old format and the
- * model requires adaptive, we upgrade automatically.
+ * model requires adaptive, we upgrade automatically — and we **map the
+ * budget size to a Copilot effort level** (low/medium/high/xhigh) so the
+ * caller's intent isn't flattened to "medium" regardless of input.
  */
 export function buildUpstreamPayload(
   payload: AnthropicMessagesPayload,
@@ -140,16 +198,17 @@ export function buildUpstreamPayload(
   }
 
   if (isAdaptiveThinkingModel(payload.model)) {
-    // Upgrade legacy enabled → adaptive if needed
+    // Upgrade legacy enabled → adaptive if needed.  Map budget_tokens to a
+    // Copilot effort level when the caller didn't already supply one.
     if (thinking.type === "enabled") {
+      const effort = output_config?.effort ?? budgetToEffort(thinking.budget_tokens)
       consola.debug(
-        `Upgrading thinking format to adaptive for model ${payload.model}`,
+        `Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`,
       )
       return {
         ...rest,
         thinking: { type: "adaptive" },
-        output_config:
-          output_config?.effort ? output_config : { effort: "medium" },
+        output_config: { effort },
       }
     }
     // Already adaptive — forward as-is

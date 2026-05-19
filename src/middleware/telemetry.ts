@@ -28,12 +28,31 @@ export interface TelemetryUsage {
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
+  /**
+   * Copilot-reported cache hit tokens.  Sourced from
+   * `copilot_usage.token_details[token_type=cache_read]` when present,
+   * falls back to native `usage.cache_read_input_tokens`.
+   */
+  cache_read_tokens?: number
+  /** Copilot-reported cache write tokens (cache_creation). */
+  cache_creation_tokens?: number
+  /** Reasoning tokens (only OpenAI /responses). */
+  reasoning_tokens?: number
 }
 
 /** Extension of KeyVar with the telemetry-only variables. */
 export type TelemetryVar = KeyVar & {
   usage?: TelemetryUsage
   upstream_model?: string
+  /**
+   * Client-facing alias that the handler decided to route to. Differs from the
+   * raw body field when default_model_alias fallback rewrites an unconfigured
+   * request (D-013). When unset, telemetry records the body-snapshot value.
+   */
+  client_requested_model?: string
+  effective_model?: string
+  /** Anthropic thinking level captured from the request body (D-014). */
+  thinking_level?: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -44,21 +63,77 @@ export type TelemetryVar = KeyVar & {
 const MODEL_SNAPSHOT_MAX_BYTES = 16 * 1024
 const MODEL_FIELD_RE = /"model"\s*:\s*"([^"\\]{1,200})"/
 
+// Anthropic / OpenAI thinking-related fields captured client-side:
+//   Claude Code v2.x: {"output_config":{"effort":"low|medium|high|xhigh"}}
+//                     (paired with {"thinking":{"type":"adaptive"}}) —
+//                     output_config.effort is the level Copilot gates on.
+//   Anthropic legacy: {"thinking":{"type":"enabled","budget_tokens":N}}
+//                     or {"max_thinking_tokens":N}
+//   OpenAI Responses: {"reasoning":{"effort":"low"|"medium"|"high"}}
+//
+// We store the RAW signal as a short tag the UI can show verbatim:
+//   "low" / "medium" / "high" / "xhigh"  — Claude Code output_config.effort
+//   "adaptive"                            — Anthropic mode without effort
+//   "10000"                               — explicit budget (just the number)
+//   "effort:high"                         — OpenAI Responses reasoning effort
+//   null                                  — no thinking-related field
+//
+// Field-priority (the LEVEL that actually controls the model):
+//   1. output_config.effort   (Claude Code v2.x — gates on Copilot)
+//   2. reasoning.effort       (OpenAI Responses — different endpoint)
+//   3. thinking.budget_tokens (Anthropic legacy enabled mode)
+//   4. max_thinking_tokens    (very-legacy top-level)
+//   5. thinking.type          (just the mode flag, no level)
+const THINKING_TYPE_RE = /"thinking"\s*:\s*\{[^{}]*?"type"\s*:\s*"([^"]+)"/
+const THINKING_BUDGET_RE =
+  /"thinking"\s*:\s*\{[^{}]*?"budget_tokens"\s*:\s*(\d+)/
+const MAX_THINKING_TOKENS_RE = /"max_thinking_tokens"\s*:\s*(\d+)/
+const REASONING_EFFORT_RE =
+  /"reasoning"\s*:\s*\{[^{}]*?"effort"\s*:\s*"([^"]+)"/
+const OUTPUT_CONFIG_EFFORT_RE =
+  /"output_config"\s*:\s*\{[^{}]*?"effort"\s*:\s*"([^"]+)"/
+
+function captureThinkingRaw(buf: string): string | null {
+  // Claude Code v2.x — primary signal, takes priority
+  const oc = OUTPUT_CONFIG_EFFORT_RE.exec(buf)
+  if (oc && oc[1]) return oc[1]
+  // OpenAI Responses
+  const reasoning = REASONING_EFFORT_RE.exec(buf)
+  if (reasoning && reasoning[1]) return `effort:${reasoning[1]}`
+  // Anthropic legacy with explicit budget
+  const budget =
+    THINKING_BUDGET_RE.exec(buf) ?? MAX_THINKING_TOKENS_RE.exec(buf)
+  if (budget && budget[1]) return budget[1]
+  // Bare thinking.type (e.g. "adaptive" with no effort)
+  const type = THINKING_TYPE_RE.exec(buf)
+  if (type && type[1]) return type[1]
+  return null
+}
+
 /**
- * Best-effort read of the client-facing model from the request body.
+ * Best-effort read of a few client-facing fields (model + thinking) from
+ * the request body.
  *
- * Reads at most MODEL_SNAPSHOT_MAX_BYTES from the cloned body and stops as
- * soon as a `"model": "..."` substring is found. Never buffers the entire
- * body — large vision / long-context payloads must not pin memory just for
- * a label.  Failures (no body, no model field, unreadable) silently fall
- * through to "n/a".
+ * Reads at most MODEL_SNAPSHOT_MAX_BYTES from a cloned body and stops as
+ * soon as both `model` and (when present) `thinking` substrings have been
+ * located. Never buffers the entire body — large vision / long-context
+ * payloads must not pin memory just for telemetry. Failures (no body, no
+ * model field, unreadable) silently fall through to model="n/a".
+ *
+ * Returns:
+ *   - model: client-requested model name, or "n/a" when missing
+ *   - thinking_level: short level string ("auto" / "think-hard" / etc.),
+ *     or null when the request didn't include a thinking field
  */
-async function readModelFromBody(reqClone: Request): Promise<string> {
+async function snapshotPostMeta(
+  reqClone: Request,
+): Promise<{ model: string; thinking_level: string | null }> {
   const reader = reqClone.body?.getReader()
-  if (!reader) return "n/a"
+  if (!reader) return { model: "n/a", thinking_level: null }
   const decoder = new TextDecoder()
   let buf = ""
   let totalBytes = 0
+  let modelMatch: string | undefined
   try {
     while (totalBytes < MODEL_SNAPSHOT_MAX_BYTES) {
       const result = (await reader.read()) as {
@@ -70,8 +145,22 @@ async function readModelFromBody(reqClone: Request): Promise<string> {
       if (!value) break
       totalBytes += value.byteLength
       buf += decoder.decode(value, { stream: true })
-      const m = MODEL_FIELD_RE.exec(buf)
-      if (m && m[1]) return m[1]
+      if (!modelMatch) {
+        const m = MODEL_FIELD_RE.exec(buf)
+        if (m && m[1]) modelMatch = m[1]
+      }
+      // Early-exit once we've grabbed the model AND seen either a thinking
+      // / reasoning / output_config field (or scanned enough that they
+      // would have been near the top).
+      if (
+        modelMatch
+        && (buf.includes('"thinking"')
+          || buf.includes('"reasoning"')
+          || buf.includes('"output_config"')
+          || totalBytes >= 4096)
+      ) {
+        break
+      }
     }
   } catch {
     // unreadable — fall through
@@ -82,8 +171,14 @@ async function readModelFromBody(reqClone: Request): Promise<string> {
       // already closed
     }
   }
-  const final = MODEL_FIELD_RE.exec(buf)
-  return final && final[1] ? final[1] : "n/a"
+  if (!modelMatch) {
+    const final = MODEL_FIELD_RE.exec(buf)
+    if (final && final[1]) modelMatch = final[1]
+  }
+  return {
+    model: modelMatch ?? "n/a",
+    thinking_level: captureThinkingRaw(buf),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +215,7 @@ function safeInsertEvent(
   ctx: {
     start: number
     clientModel: string
+    thinkingLevel: string | null
     threw: boolean
     aborted?: boolean
   },
@@ -148,6 +244,10 @@ function safeInsertEvent(
       latency_ms: Date.now() - ctx.start,
       error: errorTag,
       usage_unknown: usageUnknown,
+      thinking_level: ctx.thinkingLevel,
+      cache_read_tokens: usage?.cache_read_tokens ?? null,
+      cache_creation_tokens: usage?.cache_creation_tokens ?? null,
+      reasoning_tokens: usage?.reasoning_tokens ?? null,
     })
   } catch (err) {
     // Double-belt: recordEvent already catches its own errors, but if the
@@ -165,14 +265,20 @@ export const telemetryMiddleware: MiddlewareHandler<{
 }> = async (c, next) => {
   const start = Date.now()
 
-  // Snapshot the client-facing model name BEFORE next() consumes the body.
-  // We clone defensively so c.req.json() still works inside the handler.
-  let clientModel = "n/a"
+  // Snapshot the client-facing model name + thinking level BEFORE next()
+  // consumes the body. We clone defensively so c.req.json() still works
+  // inside the handler. GET routes (e.g. /v1/models) have no body fields —
+  // for those we record "<METHOD route>" so the Logs page row shows the
+  // actual endpoint instead of an uninformative "n/a".
+  let clientModel = `${c.req.method} ${c.req.path}`
+  let thinkingLevel: string | null = null
   if (c.req.method === "POST") {
     try {
-      clientModel = await readModelFromBody(c.req.raw.clone() as Request)
+      const meta = await snapshotPostMeta(c.req.raw.clone() as Request)
+      if (meta.model !== "n/a") clientModel = meta.model
+      thinkingLevel = meta.thinking_level
     } catch (err) {
-      consola.debug(`[telemetry] body model snapshot failed: ${String(err)}`)
+      consola.debug(`[telemetry] body meta snapshot failed: ${String(err)}`)
     }
   }
 
@@ -189,13 +295,23 @@ export const telemetryMiddleware: MiddlewareHandler<{
     // middleware returns. Wrap the response body in a passthrough that fires
     // the telemetry insert when the underlying stream closes — that way the
     // handler has had a chance to stash usage on c.var.
-    instrumentResponseOrInsert(c, { start, clientModel, threw })
+    instrumentResponseOrInsert(c, {
+      start,
+      clientModel,
+      thinkingLevel,
+      threw,
+    })
   }
 }
 
 function instrumentResponseOrInsert(
   c: Context<{ Variables: TelemetryVar }>,
-  ctx: { start: number; clientModel: string; threw: boolean },
+  ctx: {
+    start: number
+    clientModel: string
+    thinkingLevel: string | null
+    threw: boolean
+  },
 ): void {
   const body = c.res.body
   const contentType = c.res.headers.get("content-type") ?? ""

@@ -61,6 +61,13 @@ export type TraceCaptureUpstream = (capture: UpstreamCapture) => void
 
 export type TraceVar = KeyVar & {
   trace_capture_upstream?: TraceCaptureUpstream
+  /**
+   * Free-form metadata bag the route handler stashes onto the context for the
+   * trace writer.  Today carries:
+   *   { client_requested_model, effective_model, rewritten }
+   * when the default-model fallback kicks in.  See lib/default-model.ts.
+   */
+  trace_meta?: Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +331,8 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
 
   const finishTrace = (resState: ResponseCaptureState): void => {
     try {
+      const traceMeta = (c.var as { trace_meta?: Record<string, unknown> })
+        .trace_meta
       writeTrace({
         trace_id: traceId,
         ts: start,
@@ -338,6 +347,7 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
           body: bodyOrTruncated(resState),
         },
         latency_ms: Date.now() - start,
+        meta: traceMeta,
       })
     } catch (err) {
       consola.error(`[trace] writeTrace failed (continuing): ${String(err)}`)

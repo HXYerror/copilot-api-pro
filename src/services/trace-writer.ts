@@ -52,6 +52,12 @@ export interface TraceEvent {
   upstream_res?: TraceLeg
   res: TraceLeg
   latency_ms: number
+  /**
+   * Optional per-request metadata.  Free-form record so future fields don't
+   * need a schema bump.  Today we use it to surface the default-model
+   * fallback rewrite (client_requested_model / effective_model / rewritten).
+   */
+  meta?: Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +103,9 @@ function eventToJSON(event: TraceEvent): Record<string, unknown> {
     ...(event.upstream_res && { upstream_res: legToJSON(event.upstream_res) }),
     res: legToJSON(event.res),
     latency_ms: event.latency_ms,
+    ...(event.meta && Object.keys(event.meta).length > 0 ?
+      { meta: event.meta }
+    : {}),
   }
 }
 

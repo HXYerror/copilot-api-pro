@@ -7,7 +7,11 @@ import {
   beforeEach,
   afterEach,
 } from "bun:test"
+import { writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
+import { loadConfig } from "../src/lib/config-store"
 import { state } from "../src/lib/state"
 import { server } from "../src/server"
 
@@ -34,12 +38,28 @@ const fetchMock = mock(() =>
 // @ts-expect-error – mock doesn't implement full fetch signature
 ;(globalThis as unknown as { fetch: typeof fetch }).fetch = fetchMock
 
-// Set up copilot token so createResponses doesn't throw
-beforeAll(() => {
+// Set up copilot token so createResponses doesn't throw, and register the
+// model name this file POSTs (`gpt-4o`) as a config alias so the D-013
+// default-model interceptor doesn't 400 the request before reaching upstream.
+beforeAll(async () => {
   state.copilotToken = "test-token"
   state.vsCodeVersion = "1.99.0"
   state.accountType = "individual"
   state.manualApprove = false
+
+  const cfgPath = join(tmpdir(), `responses-route-test-${Date.now()}.json`)
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      version: 1,
+      models: {
+        "gpt-4o": { upstream: "gpt-4o", enabled: true, allowed_keys: ["*"] },
+      },
+      features: { auth: false, telemetry: false, debug: false },
+    }),
+    "utf8",
+  )
+  await loadConfig(cfgPath)
 })
 
 // ---------------------------------------------------------------------------
