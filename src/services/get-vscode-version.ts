@@ -83,14 +83,20 @@ export async function getVSCodeVersion(): Promise<string> {
     }
   }
 
-  const version =
-    fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched) ? fetched : FALLBACK
+  // Validate format. Note: a fetched value that HAPPENS to equal FALLBACK
+  // (e.g. upstream is currently at the same version we baked in) is still
+  // a successful fetch — don't warn about it. The bug we used to have here
+  // checked `version !== FALLBACK` to decide between cache/warn paths,
+  // which falsely reported "invalid format" every time upstream returned
+  // exactly the fallback string.
+  const isValid = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched)
+  const version = isValid ? fetched : FALLBACK
 
-  if (fetched !== null && version !== FALLBACK) {
+  if (isValid) {
     // eslint-disable-next-line require-atomic-updates
     cache = { version, fetchedAt: Date.now() }
   } else if (fetched !== null) {
-    // Format validation rejected the fetched value
+    // We got SOMETHING from the network but it didn't pass the regex.
     const safeVersion = fetched.slice(0, 40).replaceAll(/[^\x20-\x7E]/g, "?")
     consola.warn(
       `Invalid version format received: ${safeVersion}, using fallback`,

@@ -182,6 +182,12 @@ async function handleNative(
             data: rawEvent.data,
           })
 
+          // Skip the OpenAI-style `[DONE]` sentinel that Copilot's
+          // Anthropic endpoint mirrors for compatibility — it's not JSON,
+          // attempting to parse it just emits noise. The real terminator
+          // is `message_stop`, which we already handled above.
+          if (rawEvent.data === "[DONE]") continue
+
           try {
             const parsed = JSON.parse(
               rawEvent.data,

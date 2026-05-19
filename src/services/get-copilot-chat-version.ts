@@ -71,14 +71,17 @@ export async function getCopilotChatVersion(): Promise<string> {
     )
   }
 
-  const version =
-    fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched) ? fetched : FALLBACK
+  // Validate format. Same bug class as get-vscode-version: previously we
+  // checked `version !== FALLBACK` to choose between cache/warn paths, so
+  // when Marketplace returned exactly the fallback string we'd falsely
+  // warn about "invalid format". Decide based on regex validity instead.
+  const isValid = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched)
+  const version = isValid ? fetched : FALLBACK
 
-  if (fetched !== null && version !== FALLBACK) {
+  if (isValid) {
     // eslint-disable-next-line require-atomic-updates
     cache = { version, fetchedAt: Date.now() }
   } else if (fetched !== null) {
-    // Format validation rejected the fetched value
     const safeVersion = fetched.slice(0, 40).replaceAll(/[^\x20-\x7E]/g, "?")
     consola.warn(
       `Invalid version format received: ${safeVersion}, using fallback`,

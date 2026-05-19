@@ -80,8 +80,9 @@ async function getCopilotChatVersion() {
 	} catch {
 		consola.warn("Failed to fetch Copilot Chat version from Marketplace, using fallback");
 	}
-	const version = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched) ? fetched : FALLBACK;
-	if (fetched !== null && version !== FALLBACK) cache$1 = {
+	const isValid = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched);
+	const version = isValid ? fetched : FALLBACK;
+	if (isValid) cache$1 = {
 		version,
 		fetchedAt: Date.now()
 	};
@@ -143,8 +144,9 @@ async function getVSCodeVersion() {
 			consola.warn("Failed to fetch VS Code version from all sources, using fallback");
 		}
 	}
-	const version = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched) ? fetched : FALLBACK$1;
-	if (fetched !== null && version !== FALLBACK$1) cache = {
+	const isValid = fetched !== null && /^\d+\.\d+\.\d+$/.test(fetched);
+	const version = isValid ? fetched : FALLBACK$1;
+	if (isValid) cache = {
 		version,
 		fetchedAt: Date.now()
 	};
@@ -7141,7 +7143,10 @@ const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, de
 			}
 			let resBody = buf;
 			if (truncated) resBody += "[TRUNCATED]";
-			if (streamErr !== void 0) resBody += `[STREAM_ERROR: ${String(streamErr)}]`;
+			if (streamErr !== void 0) {
+				const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+				resBody += `[STREAM_ERROR: ${msg}]`;
+			}
 			return {
 				status: upstreamResStatus,
 				headers: upstreamResHeaders,
@@ -7327,19 +7332,33 @@ function clampEffortForModel(effort, modelId) {
 * model requires adaptive, we upgrade automatically — and we **map the
 * budget size to a Copilot effort level** (low/medium/high/xhigh) so the
 * caller's intent isn't flattened to "medium" regardless of input.
+*
+* Additionally: we scrub empty content blocks before forwarding. Copilot
+* routes some Anthropic requests through Google Vertex AI (the response
+* `request_id` starts with `req_vrtx_`); Vertex enforces a stricter
+* "messages: text content blocks must be non-empty" rule that the
+* Anthropic-direct backend does not. Claude Code occasionally emits
+* `{type:"text", text:""}` blocks (e.g. after a tool_use turn with no
+* assistant prose); leaving them in makes upstream 400 unpredictably
+* depending on which backend gets the request. See sanitiseMessages.
 */
 function buildUpstreamPayload(payload, defaultEffort) {
-	const { thinking, output_config,...rest } = payload;
+	const { thinking, output_config, messages,...rest } = payload;
+	const sanitisedMessages = sanitiseMessages(messages);
 	if (!thinking && defaultEffort && defaultEffort !== "") {
 		const clamped = clampEffortForModel(defaultEffort, payload.model) ?? defaultEffort;
 		consola.debug(`[alias-effort] injecting default effort=${defaultEffort} (clamped=${clamped}) for model=${payload.model}`);
 		return {
 			...rest,
+			messages: sanitisedMessages,
 			thinking: { type: "adaptive" },
 			output_config: { effort: clamped }
 		};
 	}
-	if (!thinking) return rest;
+	if (!thinking) return {
+		...rest,
+		messages: sanitisedMessages
+	};
 	if (isAdaptiveThinkingModel(payload.model)) {
 		if (thinking.type === "enabled") {
 			const rawEffort = output_config?.effort ?? budgetToEffort$1(thinking.budget_tokens);
@@ -7347,6 +7366,7 @@ function buildUpstreamPayload(payload, defaultEffort) {
 			consola.debug(`Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`);
 			return {
 				...rest,
+				messages: sanitisedMessages,
 				thinking: { type: "adaptive" },
 				output_config: { effort }
 			};
@@ -7355,14 +7375,108 @@ function buildUpstreamPayload(payload, defaultEffort) {
 		const clamped = clampEffortForModel(callerEffort, payload.model);
 		return {
 			...rest,
+			messages: sanitisedMessages,
 			thinking,
 			output_config: clamped ? { effort: clamped } : output_config
 		};
 	}
 	return {
 		...rest,
+		messages: sanitisedMessages,
 		thinking
 	};
+}
+/**
+* Strip content blocks that Copilot's Vertex-routed Anthropic backend
+* rejects with "messages: text content blocks must be non-empty".
+*
+* Observed in the wild from Claude Code: after a tool_use turn the
+* assistant sometimes emits an empty `{type:"text", text:""}` block; same
+* shape from translated requests when a `content` array had whitespace
+* stripped to nothing. Anthropic-direct accepts these silently, Vertex
+* 400s. Routing decision is made by Copilot per-request and not under our
+* control, so we always scrub.
+*
+* Rules:
+*   - text blocks where `text` is empty/whitespace → drop the block
+*   - tool_result with `content` array → recurse into nested text blocks
+*   - tool_result with empty string content → coerce to a single-space
+*     placeholder (tool_result MUST have content per Anthropic spec; we
+*     can't just drop the whole block without orphaning the tool_use_id)
+*   - if a message's content array becomes entirely empty → coerce to a
+*     single-space text block (Anthropic requires non-empty content per
+*     message; dropping the whole message would desync tool_use/result
+*     pairing)
+*   - message.content as a plain string with empty/whitespace value →
+*     coerce to a single space too
+*
+* Pure function; does NOT mutate the input payload.
+*/
+function sanitiseMessages(messages) {
+	const PLACEHOLDER = " ";
+	let modified = false;
+	const out = messages.map((msg) => {
+		if (typeof msg.content === "string") {
+			if (msg.content.trim().length === 0) {
+				modified = true;
+				return {
+					...msg,
+					content: PLACEHOLDER
+				};
+			}
+			return msg;
+		}
+		if (!Array.isArray(msg.content)) return msg;
+		const cleaned = msg.content.map((block) => {
+			if (block.type === "text") {
+				if (typeof block.text !== "string" || block.text.length === 0) return null;
+				return block;
+			}
+			if (block.type === "tool_result") {
+				if (typeof block.content === "string") {
+					if (block.content.length === 0) return {
+						...block,
+						content: PLACEHOLDER
+					};
+					return block;
+				}
+				if (Array.isArray(block.content)) {
+					const nestedCleaned = block.content.filter((nested) => {
+						if (nested.type === "text") return typeof nested.text === "string" && nested.text.length > 0;
+						return true;
+					});
+					if (nestedCleaned.length === 0) return {
+						...block,
+						content: PLACEHOLDER
+					};
+					if (nestedCleaned.length !== block.content.length) return {
+						...block,
+						content: nestedCleaned
+					};
+					return block;
+				}
+				return block;
+			}
+			return block;
+		}).filter((b) => b !== null);
+		if (cleaned.length !== msg.content.length) modified = true;
+		if (cleaned.length === 0) {
+			modified = true;
+			return {
+				...msg,
+				content: [{
+					type: "text",
+					text: PLACEHOLDER
+				}]
+			};
+		}
+		return {
+			...msg,
+			content: cleaned
+		};
+	});
+	if (modified) consola.debug("[sanitise] scrubbed empty content blocks (Vertex compatibility)");
+	return out;
 }
 /**
 * Returns true for models that require the adaptive thinking API
@@ -8314,6 +8428,7 @@ async function handleNative(c, payload, clientAlias) {
 					event: rawEvent.event,
 					data: rawEvent.data
 				});
+				if (rawEvent.data === "[DONE]") continue;
 				try {
 					const parsed = JSON.parse(rawEvent.data);
 					consola.debug("Native SSE event:", parsed.type);

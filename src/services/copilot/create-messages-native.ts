@@ -498,12 +498,22 @@ export function clampEffortForModel(
  * model requires adaptive, we upgrade automatically — and we **map the
  * budget size to a Copilot effort level** (low/medium/high/xhigh) so the
  * caller's intent isn't flattened to "medium" regardless of input.
+ *
+ * Additionally: we scrub empty content blocks before forwarding. Copilot
+ * routes some Anthropic requests through Google Vertex AI (the response
+ * `request_id` starts with `req_vrtx_`); Vertex enforces a stricter
+ * "messages: text content blocks must be non-empty" rule that the
+ * Anthropic-direct backend does not. Claude Code occasionally emits
+ * `{type:"text", text:""}` blocks (e.g. after a tool_use turn with no
+ * assistant prose); leaving them in makes upstream 400 unpredictably
+ * depending on which backend gets the request. See sanitiseMessages.
  */
 export function buildUpstreamPayload(
   payload: AnthropicMessagesPayload,
   defaultEffort?: "low" | "medium" | "high" | "xhigh" | "",
 ): AnthropicMessagesPayload {
-  const { thinking, output_config, ...rest } = payload
+  const { thinking, output_config, messages, ...rest } = payload
+  const sanitisedMessages = sanitiseMessages(messages)
 
   // Per-alias default effort: when the client didn't ask for thinking at
   // all AND the alias config provides a default, synthesise an adaptive
@@ -518,13 +528,15 @@ export function buildUpstreamPayload(
     )
     return {
       ...rest,
+      messages: sanitisedMessages,
       thinking: { type: "adaptive" },
       output_config: { effort: clamped },
     }
   }
 
   if (!thinking) {
-    return rest // safe: output_config only valid alongside thinking
+    // output_config only valid alongside thinking — drop it.
+    return { ...rest, messages: sanitisedMessages }
   }
 
   if (isAdaptiveThinkingModel(payload.model)) {
@@ -542,6 +554,7 @@ export function buildUpstreamPayload(
       )
       return {
         ...rest,
+        messages: sanitisedMessages,
         thinking: { type: "adaptive" },
         output_config: { effort },
       }
@@ -551,13 +564,118 @@ export function buildUpstreamPayload(
     const clamped = clampEffortForModel(callerEffort, payload.model)
     return {
       ...rest,
+      messages: sanitisedMessages,
       thinking,
       output_config: clamped ? { effort: clamped } : output_config,
     }
   }
 
   // Non-adaptive model — forward legacy format, drop output_config
-  return { ...rest, thinking }
+  return { ...rest, messages: sanitisedMessages, thinking }
+}
+
+/**
+ * Strip content blocks that Copilot's Vertex-routed Anthropic backend
+ * rejects with "messages: text content blocks must be non-empty".
+ *
+ * Observed in the wild from Claude Code: after a tool_use turn the
+ * assistant sometimes emits an empty `{type:"text", text:""}` block; same
+ * shape from translated requests when a `content` array had whitespace
+ * stripped to nothing. Anthropic-direct accepts these silently, Vertex
+ * 400s. Routing decision is made by Copilot per-request and not under our
+ * control, so we always scrub.
+ *
+ * Rules:
+ *   - text blocks where `text` is empty/whitespace → drop the block
+ *   - tool_result with `content` array → recurse into nested text blocks
+ *   - tool_result with empty string content → coerce to a single-space
+ *     placeholder (tool_result MUST have content per Anthropic spec; we
+ *     can't just drop the whole block without orphaning the tool_use_id)
+ *   - if a message's content array becomes entirely empty → coerce to a
+ *     single-space text block (Anthropic requires non-empty content per
+ *     message; dropping the whole message would desync tool_use/result
+ *     pairing)
+ *   - message.content as a plain string with empty/whitespace value →
+ *     coerce to a single space too
+ *
+ * Pure function; does NOT mutate the input payload.
+ */
+function sanitiseMessages(
+  messages: AnthropicMessagesPayload["messages"],
+): AnthropicMessagesPayload["messages"] {
+  const PLACEHOLDER = " "
+  let modified = false
+  const out = messages.map((msg) => {
+    if (typeof msg.content === "string") {
+      if (msg.content.trim().length === 0) {
+        modified = true
+        return { ...msg, content: PLACEHOLDER }
+      }
+      return msg
+    }
+    if (!Array.isArray(msg.content)) return msg
+
+    const cleaned = msg.content
+      .map((block) => {
+        if (block.type === "text") {
+          if (typeof block.text !== "string" || block.text.length === 0) {
+            return null
+          }
+          return block
+        }
+        if (block.type === "tool_result") {
+          // tool_result content can be a string OR an array of blocks.
+          if (typeof block.content === "string") {
+            if (block.content.length === 0) {
+              return { ...block, content: PLACEHOLDER }
+            }
+            return block
+          }
+          if (Array.isArray(block.content)) {
+            const nestedCleaned = block.content.filter((nested) => {
+              if (nested.type === "text") {
+                return (
+                  typeof nested.text === "string" && nested.text.length > 0
+                )
+              }
+              return true
+            })
+            if (nestedCleaned.length === 0) {
+              return { ...block, content: PLACEHOLDER }
+            }
+            if (nestedCleaned.length !== block.content.length) {
+              return { ...block, content: nestedCleaned }
+            }
+            return block
+          }
+          return block
+        }
+        return block
+      })
+      .filter((b): b is NonNullable<typeof b> => b !== null)
+
+    if (cleaned.length !== msg.content.length) modified = true
+
+    if (cleaned.length === 0) {
+      // Anthropic requires non-empty content. Coerce rather than drop the
+      // whole message, since dropping desyncs tool_use/tool_result pairing.
+      modified = true
+      return {
+        ...msg,
+        content: [{ type: "text" as const, text: PLACEHOLDER }],
+      }
+    }
+    return { ...msg, content: cleaned }
+  })
+
+  if (modified) {
+    consola.debug(
+      "[sanitise] scrubbed empty content blocks (Vertex compatibility)",
+    )
+  }
+  // Cast back to the original union: each branch above preserves either
+  // the user or assistant shape exactly (we only touch content blocks).
+  return out as AnthropicMessagesPayload["messages"]
 }
 
 /**
