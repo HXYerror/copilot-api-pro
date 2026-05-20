@@ -87,6 +87,88 @@ function thinkingBadgeColor(
   return "blue"
 }
 
+/**
+ * Pull the human-readable error message out of a trace's response bodies.
+ *
+ * The events table only stores a short tag (`bad_request`, `forbidden`, …)
+ * — useful for filtering, useless for diagnosing the actual failure. The
+ * full upstream message lives in trace.upstream_res.body (when present) or
+ * trace.res.body (what we returned to the client). Both can be:
+ *   - a plain object: { error: { message: "..." } }
+ *   - a JSON string of the above
+ *   - DOUBLE-encoded: { error: { message: "{\"error\":{\"message\":\"...\"}}" } }
+ *     (forwardError stringifies the upstream error into the outer message)
+ *
+ * Returns a single-line summary or null when no error detail is locatable.
+ */
+function extractErrorDetail(
+  trace:
+    | {
+        upstream_res?: { body?: unknown }
+        res?: { body?: unknown }
+      }
+    | undefined,
+): string | null {
+  if (!trace) return null
+
+  const candidates: Array<unknown> = []
+  if (trace.upstream_res?.body !== undefined) {
+    candidates.push(trace.upstream_res.body)
+  }
+  if (trace.res?.body !== undefined) {
+    candidates.push(trace.res.body)
+  }
+
+  for (const raw of candidates) {
+    const msg = digErrorMessage(raw)
+    if (msg) return msg
+  }
+  return null
+}
+
+function digErrorMessage(raw: unknown, depth = 0): string | null {
+  if (depth > 4 || raw === undefined || raw === null) return null
+
+  // String — try to parse as JSON, else treat as the message itself if it
+  // looks like one (contains `error` substring).
+  if (typeof raw === "string") {
+    if (raw.length === 0) return null
+    try {
+      return digErrorMessage(JSON.parse(raw), depth + 1)
+    } catch {
+      // Not JSON; only return as-is when short enough to be a real msg.
+      return raw.length < 400 ? raw : null
+    }
+  }
+
+  if (typeof raw !== "object") return null
+
+  const obj = raw as Record<string, unknown>
+
+  // Shape 1: { error: { message: "..." } } or { error: { message: "..." , type: "..." } }
+  const err = obj["error"]
+  if (err !== undefined) {
+    if (typeof err === "string") {
+      return digErrorMessage(err, depth + 1)
+    }
+    if (typeof err === "object" && err !== null) {
+      const m = (err as Record<string, unknown>)["message"]
+      if (typeof m === "string") {
+        // m may itself be a stringified inner error envelope.
+        return digErrorMessage(m, depth + 1) ?? m
+      }
+    }
+  }
+
+  // Shape 2: { message: "..." } at top level
+  const topMsg = obj["message"]
+  if (typeof topMsg === "string") {
+    return digErrorMessage(topMsg, depth + 1) ?? topMsg
+  }
+
+  return null
+}
+
 type StatusFilter = "all" | "ok" | "error"
 
 interface SsePayload {
@@ -688,7 +770,16 @@ function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
                 <>
                   <dt className="text-tremor-content-subtle">Error</dt>
                   <dd className="text-rose-700 whitespace-pre-wrap break-words">
-                    {entry.error}
+                    <div className="font-medium">{entry.error}</div>
+                    {(() => {
+                      const detail = extractErrorDetail(trace)
+                      if (!detail) return null
+                      return (
+                        <div className="mt-1 text-xs font-normal text-rose-800">
+                          {detail}
+                        </div>
+                      )
+                    })()}
                   </dd>
                 </>
               )}
