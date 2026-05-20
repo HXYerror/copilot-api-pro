@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "build": "bun run build:server && bun run build:ui",
-    "build:server": "tsdown",
+    "build:server": "bun ./node_modules/tsdown/dist/run.mjs",
     "build:ui": "bun install --cwd ui && bun run --cwd ui build",
     "dev": "bun run --watch ./src/main.ts",
     "dev:ui": "bun run --cwd ui dev",
