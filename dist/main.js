@@ -7345,18 +7345,23 @@ function clampEffortForModel(effort, modelId) {
 function buildUpstreamPayload(payload, defaultEffort) {
 	const { thinking, output_config, messages,...rest } = payload;
 	const sanitisedMessages = sanitiseMessages(messages);
+	const adjustedMaxTokens = adjustMaxTokensForBudget(rest.max_tokens, thinking, payload.model);
+	const restWithMaxTokens = adjustedMaxTokens !== void 0 && adjustedMaxTokens !== rest.max_tokens ? {
+		...rest,
+		max_tokens: adjustedMaxTokens
+	} : rest;
 	if (!thinking && defaultEffort && defaultEffort !== "") {
 		const clamped = clampEffortForModel(defaultEffort, payload.model) ?? defaultEffort;
 		consola.debug(`[alias-effort] injecting default effort=${defaultEffort} (clamped=${clamped}) for model=${payload.model}`);
 		return {
-			...rest,
+			...restWithMaxTokens,
 			messages: sanitisedMessages,
 			thinking: { type: "adaptive" },
 			output_config: { effort: clamped }
 		};
 	}
 	if (!thinking) return {
-		...rest,
+		...restWithMaxTokens,
 		messages: sanitisedMessages
 	};
 	if (isAdaptiveThinkingModel(payload.model)) {
@@ -7365,7 +7370,7 @@ function buildUpstreamPayload(payload, defaultEffort) {
 			const effort = clampEffortForModel(rawEffort, payload.model) ?? rawEffort;
 			consola.debug(`Upgrading thinking format to adaptive for model ${payload.model} (budget=${thinking.budget_tokens} → effort=${effort})`);
 			return {
-				...rest,
+				...restWithMaxTokens,
 				messages: sanitisedMessages,
 				thinking: { type: "adaptive" },
 				output_config: { effort }
@@ -7374,17 +7379,45 @@ function buildUpstreamPayload(payload, defaultEffort) {
 		const callerEffort = output_config?.effort;
 		const clamped = clampEffortForModel(callerEffort, payload.model);
 		return {
-			...rest,
+			...restWithMaxTokens,
 			messages: sanitisedMessages,
 			thinking,
 			output_config: clamped ? { effort: clamped } : output_config
 		};
 	}
 	return {
-		...rest,
+		...restWithMaxTokens,
 		messages: sanitisedMessages,
 		thinking
 	};
+}
+/**
+* Anthropic's invariant: `max_tokens > thinking.budget_tokens`. When the
+* caller violates this (Claude Code occasionally pairs a generous budget
+* with the default 4096 max_tokens), we silently grow `max_tokens` to
+* `budget + headroom` so the request goes through.
+*
+* Only applies when:
+*   - thinking is the legacy `{type:"enabled", budget_tokens: N}` shape
+*     (adaptive thinking has no budget_tokens to clash with)
+*   - the model is not in the adaptive-thinking family (those get the
+*     thinking field rewritten anyway, no budget_tokens reaches upstream)
+*
+* Returns `undefined` to mean "no change"; the caller compares and only
+* overwrites when this differs from the input.
+*
+* Headroom of 1024 matches Anthropic's example in the docs error message
+* and stays well under any model's max_output_tokens.
+*/
+function adjustMaxTokensForBudget(maxTokens, thinking, modelId) {
+	if (!thinking || thinking.type !== "enabled" || typeof thinking.budget_tokens !== "number") return;
+	if (isAdaptiveThinkingModel(modelId)) return void 0;
+	if (typeof maxTokens !== "number") return void 0;
+	if (maxTokens > thinking.budget_tokens) return void 0;
+	const HEADROOM = 1024;
+	const bumped = thinking.budget_tokens + HEADROOM;
+	consola.warn(`[max-tokens-fix] max_tokens=${maxTokens} <= budget_tokens=${thinking.budget_tokens} for ${modelId}; bumping max_tokens to ${bumped} (budget + ${HEADROOM} headroom)`);
+	return bumped;
 }
 /**
 * Strip content blocks that Copilot's Vertex-routed Anthropic backend
