@@ -9396,7 +9396,8 @@ async function runServer(options) {
 	serve({
 		fetch: server.fetch,
 		port: options.port,
-		hostname: options.host
+		hostname: options.host,
+		bun: { idleTimeout: 255 }
 	});
 }
 const start = defineCommand({

@@ -283,6 +283,13 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     fetch: server.fetch as ServerHandler,
     port: options.port,
     hostname: options.host,
+    // Bun's default idleTimeout is 10 seconds — far too short for LLM
+    // streaming where the model can think for 30-120+ seconds before
+    // producing any output.  During thinking, no data flows to the
+    // client and Bun kills the TCP connection.  255 is the Bun maximum
+    // (4 min 15 s); for truly extreme thinking durations a keepalive
+    // heartbeat would be needed on top of this.
+    bun: { idleTimeout: 255 },
   })
 }
 
