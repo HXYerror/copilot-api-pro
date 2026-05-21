@@ -38,13 +38,14 @@ export function Logs() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
   const [kindFilter, setKindFilter] = useState<KindFilter>("messages")
   const [modelFilter, setModelFilter] = useState("")
+  const [keyFilter, setKeyFilter] = useState("")
   const [liveTail, setLiveTail] = useState(false)
   const [selected, setSelected] = useState<LogEntry | null>(null)
   const [page, setPage] = useState(0)
 
   useEffect(() => {
     setPage(0)
-  }, [search, statusFilter, kindFilter, modelFilter])
+  }, [search, statusFilter, kindFilter, modelFilter, keyFilter])
 
   const params = useMemo(() => {
     const sp = new URLSearchParams()
@@ -52,10 +53,11 @@ export function Logs() {
     if (statusFilter !== "all") sp.set("status", statusFilter)
     if (kindFilter !== "all") sp.set("kind", kindFilter)
     if (modelFilter) sp.set("model", modelFilter)
+    if (keyFilter) sp.set("key_id", keyFilter)
     sp.set("limit", String(PAGE_SIZE))
     sp.set("offset", String(page * PAGE_SIZE))
     return sp.toString()
-  }, [search, statusFilter, kindFilter, modelFilter, page])
+  }, [search, statusFilter, kindFilter, modelFilter, keyFilter, page])
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["logs", params],
@@ -98,7 +100,10 @@ export function Logs() {
         setStatusFilter={setStatusFilter}
         modelFilter={modelFilter}
         setModelFilter={setModelFilter}
+        keyFilter={keyFilter}
+        setKeyFilter={setKeyFilter}
         allModels={data.all_models}
+        allKeys={data.all_keys ?? []}
         liveTail={liveTail}
         setLiveTail={setLiveTail}
         livePayloadCount={livePayloads.length}
@@ -256,7 +261,10 @@ function FilterBar({
   setStatusFilter,
   modelFilter,
   setModelFilter,
+  keyFilter,
+  setKeyFilter,
   allModels,
+  allKeys,
   liveTail,
   setLiveTail,
   livePayloadCount,
@@ -268,7 +276,10 @@ function FilterBar({
   setStatusFilter: (s: StatusFilter) => void
   modelFilter: string
   setModelFilter: (s: string) => void
+  keyFilter: string
+  setKeyFilter: (s: string) => void
   allModels: Array<string>
+  allKeys: Array<{ id: string; label: string | null }>
   liveTail: boolean
   setLiveTail: (v: boolean) => void
   livePayloadCount: number
@@ -278,7 +289,7 @@ function FilterBar({
     <Card className="!p-3">
       <div className="flex flex-wrap items-center gap-2">
         <TextInput
-          placeholder="Search key, model, error…"
+          placeholder="Search key, label, model, error…"
           value={search}
           onValueChange={setSearch}
           className="max-w-xs"
@@ -301,6 +312,18 @@ function FilterBar({
           {allModels.map((m) => (
             <option key={m} value={m}>
               {m}
+            </option>
+          ))}
+        </select>
+        <select
+          value={keyFilter}
+          onChange={(e) => setKeyFilter(e.target.value)}
+          className="rounded-tremor-small border border-tremor-border bg-tremor-background px-3 py-2 text-sm"
+        >
+          <option value="">All keys</option>
+          {allKeys.map((k) => (
+            <option key={k.id} value={k.id}>
+              {k.label ? `${k.label} (${k.id.slice(0, 8)})` : k.id.slice(0, 8)}
             </option>
           ))}
         </select>

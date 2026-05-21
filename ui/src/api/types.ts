@@ -277,6 +277,11 @@ export interface LogsListResponse {
   offset: number
   all_models: Array<string>
   /**
+   * Keys that have ever served a request — used to populate the Key
+   * filter dropdown. Includes revoked keys (label may be null).
+   */
+  all_keys?: Array<{ id: string; label: string | null }>
+  /**
    * Counts per request kind for the current filter set, ignoring the
    * `kind` filter itself so the tabs can render badges showing how many
    * events would land in each tab. Optional so an older server build —

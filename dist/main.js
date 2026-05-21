@@ -2181,9 +2181,10 @@ function buildWhere(c, options = {}) {
 	}
 	const q = c.req.query("q");
 	if (q && q.length > 0) {
-		parts.push("(key_id LIKE ? OR model LIKE ? OR error LIKE ?)");
+		parts.push(`(key_id LIKE ? OR model LIKE ? OR error LIKE ?
+         OR key_id IN (SELECT id FROM keys WHERE label LIKE ?))`);
 		const like = `%${q}%`;
-		params.push(like, like, like);
+		params.push(like, like, like, like);
 	}
 	return {
 		sql: parts.length === 0 ? "" : `WHERE ${parts.join(" AND ")}`,
@@ -2208,6 +2209,10 @@ logsRoute.get("/", (c) => {
 		for (const r of labelRows) labelById.set(r.id, r.label);
 	}
 	const allModels = db.query("SELECT DISTINCT model FROM events WHERE model NOT LIKE '%/%' ORDER BY model").all().map((r) => r.model);
+	const allKeys = db.query(`SELECT DISTINCT e.key_id AS id, k.label AS label
+         FROM events e
+         LEFT JOIN keys k ON k.id = e.key_id
+         ORDER BY COALESCE(k.label, e.key_id)`).all();
 	const whereNoKind = buildWhere(c, { excludeKind: true });
 	const kindCountsRow = db.query(`SELECT
          SUM(CASE WHEN model NOT LIKE '%/%' THEN 1 ELSE 0 END) AS messages,
@@ -2226,6 +2231,7 @@ logsRoute.get("/", (c) => {
 		limit,
 		offset,
 		all_models: allModels,
+		all_keys: allKeys,
 		kind_counts: kindCounts
 	});
 });

@@ -120,10 +120,16 @@ function buildWhere(
 
   const q = c.req.query("q")
   if (q && q.length > 0) {
-    // Search by key_id substring or model substring or error substring
-    parts.push("(key_id LIKE ? OR model LIKE ? OR error LIKE ?)")
+    // Search by key_id substring (UUID), key label (resolved via subquery
+    // against the keys table — events only stores the id), model substring,
+    // or error substring. The label lookup is what lets operators type a
+    // human name like "lin_review" instead of a UUID.
+    parts.push(
+      `(key_id LIKE ? OR model LIKE ? OR error LIKE ?
+         OR key_id IN (SELECT id FROM keys WHERE label LIKE ?))`,
+    )
     const like = `%${q}%`
-    params.push(like, like, like)
+    params.push(like, like, like, like)
   }
 
   return {
@@ -187,6 +193,19 @@ logsRoute.get("/", (c) => {
     .all()
     .map((r) => r.model)
 
+  // Keys that have ever served a request, joined with the keys table so
+  // the dropdown can show "lin_review (dff27cd3)" rather than just a UUID.
+  // Includes revoked keys — they still appear in historical logs and the
+  // operator needs to be able to filter on them.
+  const allKeys = db
+    .query<{ id: string; label: string | null }, []>(
+      `SELECT DISTINCT e.key_id AS id, k.label AS label
+         FROM events e
+         LEFT JOIN keys k ON k.id = e.key_id
+         ORDER BY COALESCE(k.label, e.key_id)`,
+    )
+    .all()
+
   // Per-kind totals, computed ignoring the current `kind` filter so the tab
   // badges always reflect the full counts under the *other* active filters
   // (search, status, model, key).
@@ -213,6 +232,7 @@ logsRoute.get("/", (c) => {
     limit,
     offset,
     all_models: allModels,
+    all_keys: allKeys,
     kind_counts: kindCounts,
   })
 })
