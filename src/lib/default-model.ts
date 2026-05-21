@@ -179,6 +179,12 @@ export function applyDefaultModelRewrite(
   }
   const upstreamModel = resolveAlias(resolved.effective, models)
   c.set("upstream_model", upstreamModel)
+  // Always stash the client-requested alias so telemetry can use it when
+  // the body snapshot didn't surface a model (large bodies, exotic JSON
+  // shapes, etc). When the request didn't carry a model at all, fall back
+  // to the effective alias.
+  c.set("client_requested_model", resolved.requested || resolved.effective)
+  c.set("effective_model", resolved.effective)
   if (resolved.rewritten) {
     c.set("trace_meta", {
       client_requested_model: resolved.requested,

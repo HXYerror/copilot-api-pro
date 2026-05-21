@@ -125,6 +125,17 @@ function captureThinkingRaw(buf: string): string | null {
  *   - thinking_level: short level string ("auto" / "think-hard" / etc.),
  *     or null when the request didn't include a thinking field
  */
+async function drainReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+  // Drain to EOF so Bun's request.clone() tee-buffer doesn't block the
+  // handler's c.req.json() waiting for bytes the snapshot already buffered.
+  while (true) {
+    const r = (await reader.read()) as { done: boolean }
+    if (r.done) break
+  }
+}
+
 async function snapshotPostMeta(
   reqClone: Request,
 ): Promise<{ model: string; thinking_level: string | null }> {
@@ -150,18 +161,7 @@ async function snapshotPostMeta(
         if (m && m[1]) modelMatch = m[1]
       }
     }
-    // IMPORTANT: drain the rest of the cloned stream silently. We've
-    // already scanned what we want (or hit the cap), but if we stop
-    // reading here while the original is also being read by the handler,
-    // Bun's request.clone() tee-buffer blocks the source — handler's
-    // c.req.json() then hangs forever waiting for body bytes that the
-    // tee is buffering. Reading to EOF on the clone releases backpressure.
-    if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) {
-      while (true) {
-        const r = (await reader.read()) as { done: boolean }
-        if (r.done) break
-      }
-    }
+    if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) await drainReader(reader)
   } catch {
     // unreadable — fall through
   }
@@ -204,6 +204,65 @@ function statusToErrorTag(status: number): string | null {
 // Insert helper — fully wrapped in try/catch so a failure never propagates
 // ---------------------------------------------------------------------------
 
+function resolveFinalModel(
+  c: Context<{ Variables: TelemetryVar }>,
+  snapshotModel: string,
+): string {
+  // ctx.clientModel comes from the body snapshot — it can fall back to
+  // "<METHOD> <path>" when the model field wasn't found in the first 16KB.
+  // Handlers' applyDefaultModelRewrite always sets client_requested_model,
+  // so prefer that when the snapshot fell back.
+  const isFallback = /^[A-Z]+ \//.test(snapshotModel)
+  if (!isFallback) return snapshotModel
+  const handlerModel = c.get("client_requested_model")
+  if (typeof handlerModel === "string" && handlerModel.length > 0) {
+    return handlerModel
+  }
+  return snapshotModel
+}
+
+function resolveFinalThinking(
+  c: Context<{ Variables: TelemetryVar }>,
+  snapshotThinking: string | null,
+): string | null {
+  // Handlers can override after default_effort injection.
+  const handlerThinking = c.get("thinking_level")
+  if (typeof handlerThinking === "string" && handlerThinking.length > 0) {
+    return handlerThinking
+  }
+  return snapshotThinking
+}
+
+function computeStatusAndError(
+  c: Context<{ Variables: TelemetryVar }>,
+  ctx: { threw: boolean; aborted?: boolean },
+): { status: number; errorTag: string | null } {
+  const status = ctx.threw ? 500 : c.res.status
+  const errorTag =
+    ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status)
+  return { status, errorTag }
+}
+
+function extractUsageCounts(usage: TelemetryUsage | undefined): {
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  cache_read_tokens: number | null
+  cache_creation_tokens: number | null
+  reasoning_tokens: number | null
+  usage_unknown: number
+} {
+  const promptTokens = usage?.prompt_tokens ?? null
+  const completionTokens = usage?.completion_tokens ?? null
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    cache_read_tokens: usage?.cache_read_tokens ?? null,
+    cache_creation_tokens: usage?.cache_creation_tokens ?? null,
+    reasoning_tokens: usage?.reasoning_tokens ?? null,
+    usage_unknown: promptTokens === null && completionTokens === null ? 1 : 0,
+  }
+}
+
 function safeInsertEvent(
   c: Context<{ Variables: TelemetryVar }>,
   ctx: {
@@ -218,40 +277,21 @@ function safeInsertEvent(
     const key = c.get("key") as KeyVar["key"] | undefined
     const usage = c.get("usage")
     const upstream = c.get("upstream_model") ?? ctx.clientModel
-
-    // Prefer a handler-set effective thinking level (the value actually
-    // sent upstream after default_effort injection) over the body-snapshot
-    // we took before next(). If the handler didn't set anything, fall back
-    // to whatever the client supplied — that may be null.
-    const effectiveThinking = c.get("thinking_level")
-    const finalThinking =
-      typeof effectiveThinking === "string" && effectiveThinking.length > 0 ?
-        effectiveThinking
-      : ctx.thinkingLevel
-
-    const status = ctx.threw ? 500 : c.res.status
-    const errorTag =
-      ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status)
-    const promptTokens = usage?.prompt_tokens ?? null
-    const completionTokens = usage?.completion_tokens ?? null
-    const usageUnknown =
-      promptTokens === null && completionTokens === null ? 1 : 0
+    const finalModel = resolveFinalModel(c, ctx.clientModel)
+    const finalThinking = resolveFinalThinking(c, ctx.thinkingLevel)
+    const { status, errorTag } = computeStatusAndError(c, ctx)
+    const usageCounts = extractUsageCounts(usage)
 
     recordEvent({
       ts: ctx.start,
       key_id: key?.id ?? "__noauth__",
-      model: ctx.clientModel,
+      model: finalModel,
       upstream_model: upstream,
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
       status,
       latency_ms: Date.now() - ctx.start,
       error: errorTag,
-      usage_unknown: usageUnknown,
       thinking_level: finalThinking,
-      cache_read_tokens: usage?.cache_read_tokens ?? null,
-      cache_creation_tokens: usage?.cache_creation_tokens ?? null,
-      reasoning_tokens: usage?.reasoning_tokens ?? null,
+      ...usageCounts,
     })
   } catch (err) {
     // Double-belt: recordEvent already catches its own errors, but if the

@@ -5668,6 +5668,9 @@ function captureThinkingRaw(buf) {
 *   - thinking_level: short level string ("auto" / "think-hard" / etc.),
 *     or null when the request didn't include a thinking field
 */
+async function drainReader(reader) {
+	while (true) if ((await reader.read()).done) break;
+}
 async function snapshotPostMeta(reqClone) {
 	const reader = reqClone.body?.getReader();
 	if (!reader) return {
@@ -5691,9 +5694,7 @@ async function snapshotPostMeta(reqClone) {
 				if (m && m[1]) modelMatch = m[1];
 			}
 		}
-		if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) {
-			while (true) if ((await reader.read()).done) break;
-		}
+		if (totalBytes >= MODEL_SNAPSHOT_MAX_BYTES) await drainReader(reader);
 	} catch {}
 	if (!modelMatch) {
 		const final = MODEL_FIELD_RE.exec(buf);
@@ -5724,33 +5725,56 @@ function statusToErrorTag(status) {
 	if (status >= 400 && status < 500) return "client_error";
 	return "error";
 }
+function resolveFinalModel(c, snapshotModel) {
+	if (!/^[A-Z]+ \//.test(snapshotModel)) return snapshotModel;
+	const handlerModel = c.get("client_requested_model");
+	if (typeof handlerModel === "string" && handlerModel.length > 0) return handlerModel;
+	return snapshotModel;
+}
+function resolveFinalThinking(c, snapshotThinking) {
+	const handlerThinking = c.get("thinking_level");
+	if (typeof handlerThinking === "string" && handlerThinking.length > 0) return handlerThinking;
+	return snapshotThinking;
+}
+function computeStatusAndError(c, ctx) {
+	const status = ctx.threw ? 500 : c.res.status;
+	const errorTag = ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status);
+	return {
+		status,
+		errorTag
+	};
+}
+function extractUsageCounts(usage) {
+	const promptTokens = usage?.prompt_tokens ?? null;
+	const completionTokens = usage?.completion_tokens ?? null;
+	return {
+		prompt_tokens: promptTokens,
+		completion_tokens: completionTokens,
+		cache_read_tokens: usage?.cache_read_tokens ?? null,
+		cache_creation_tokens: usage?.cache_creation_tokens ?? null,
+		reasoning_tokens: usage?.reasoning_tokens ?? null,
+		usage_unknown: promptTokens === null && completionTokens === null ? 1 : 0
+	};
+}
 function safeInsertEvent(c, ctx) {
 	try {
 		const key = c.get("key");
 		const usage = c.get("usage");
 		const upstream = c.get("upstream_model") ?? ctx.clientModel;
-		const effectiveThinking = c.get("thinking_level");
-		const finalThinking = typeof effectiveThinking === "string" && effectiveThinking.length > 0 ? effectiveThinking : ctx.thinkingLevel;
-		const status = ctx.threw ? 500 : c.res.status;
-		const errorTag = ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status);
-		const promptTokens = usage?.prompt_tokens ?? null;
-		const completionTokens = usage?.completion_tokens ?? null;
-		const usageUnknown = promptTokens === null && completionTokens === null ? 1 : 0;
+		const finalModel = resolveFinalModel(c, ctx.clientModel);
+		const finalThinking = resolveFinalThinking(c, ctx.thinkingLevel);
+		const { status, errorTag } = computeStatusAndError(c, ctx);
+		const usageCounts = extractUsageCounts(usage);
 		recordEvent({
 			ts: ctx.start,
 			key_id: key?.id ?? "__noauth__",
-			model: ctx.clientModel,
+			model: finalModel,
 			upstream_model: upstream,
-			prompt_tokens: promptTokens,
-			completion_tokens: completionTokens,
 			status,
 			latency_ms: Date.now() - ctx.start,
 			error: errorTag,
-			usage_unknown: usageUnknown,
 			thinking_level: finalThinking,
-			cache_read_tokens: usage?.cache_read_tokens ?? null,
-			cache_creation_tokens: usage?.cache_creation_tokens ?? null,
-			reasoning_tokens: usage?.reasoning_tokens ?? null
+			...usageCounts
 		});
 	} catch (err) {
 		consola.error(`[telemetry] middleware insert failed: ${String(err)}`);
@@ -6398,6 +6422,8 @@ function applyDefaultModelRewrite(c, requestedModel, routeLabel) {
 	if (resolved.rewritten) consola.info(`[default-model] rewrote "${resolved.requested}" → "${resolved.effective}" (upstream "${resolved.upstream}") on ${routeLabel}`);
 	const upstreamModel = resolveAlias(resolved.effective, models);
 	c.set("upstream_model", upstreamModel);
+	c.set("client_requested_model", resolved.requested || resolved.effective);
+	c.set("effective_model", resolved.effective);
 	if (resolved.rewritten) c.set("trace_meta", {
 		client_requested_model: resolved.requested,
 		effective_model: resolved.effective,
