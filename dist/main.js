@@ -2308,6 +2308,7 @@ logsRoute.get("/:id/trace", (c) => {
 //#region src/lib/build-identity.ts
 let cached = null;
 let inflight = null;
+const STARTED_AT = Date.now();
 async function getBuildIdentity() {
 	if (cached) return cached;
 	if (inflight) return inflight;
@@ -2318,32 +2319,54 @@ async function getBuildIdentity() {
 	});
 	return inflight;
 }
-async function computeBuildIdentity() {
-	let version = "unknown";
-	try {
-		const pkgPath = new URL("../../package.json", import.meta.url).pathname;
-		version = JSON.parse(await fs.readFile(pkgPath)).version;
+/**
+* Walk upward from the bundled / source file location until we find a
+* package.json. Handles both layouts in one shot.
+*/
+async function findRepoRoot() {
+	let dir = path.dirname(new URL(import.meta.url).pathname);
+	for (let i = 0; i < 6; i++) try {
+		await fs.access(path.join(dir, "package.json"));
+		return dir;
 	} catch {
-		try {
-			const pkgPath = new URL("../package.json", import.meta.url).pathname;
-			version = JSON.parse(await fs.readFile(pkgPath)).version;
-		} catch {}
+		const parent = path.dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
 	}
-	const repoRoot = path.resolve(new URL(".", import.meta.url).pathname, "..", "..");
-	const branch = runGit([
-		"rev-parse",
-		"--abbrev-ref",
-		"HEAD"
-	], repoRoot);
-	const commit = runGit([
-		"rev-parse",
-		"--short",
-		"HEAD"
-	], repoRoot);
+	return null;
+}
+async function computeBuildIdentity() {
+	const repoRoot = await findRepoRoot();
+	let version = "unknown";
+	if (repoRoot) try {
+		version = JSON.parse(await fs.readFile(path.join(repoRoot, "package.json"))).version;
+	} catch {}
+	let branch = null;
+	let commit = null;
+	let commitTime = null;
+	if (repoRoot) {
+		branch = runGit([
+			"rev-parse",
+			"--abbrev-ref",
+			"HEAD"
+		], repoRoot);
+		commit = runGit([
+			"rev-parse",
+			"--short",
+			"HEAD"
+		], repoRoot);
+		commitTime = runGit([
+			"log",
+			"-1",
+			"--format=%cI"
+		], repoRoot);
+	}
 	return {
 		version,
 		branch: branch || void 0,
-		commit: commit || void 0
+		commit: commit || void 0,
+		commit_time: commitTime || void 0,
+		started_at: STARTED_AT
 	};
 }
 function runGit(args, cwd) {

@@ -8,6 +8,60 @@ interface TopBarProps {
   title: string
 }
 
+interface BuildInfo {
+  version: string
+  branch?: string
+  commit?: string
+  commit_time?: string
+  started_at: number
+}
+
+function shortRel(ts: number): string {
+  const age = Date.now() - ts
+  if (age < 60_000) return `${Math.floor(age / 1000)}s`
+  if (age < 3600_000) return `${Math.floor(age / 60_000)}m`
+  if (age < 86_400_000) return `${Math.floor(age / 3_600_000)}h`
+  return `${Math.floor(age / 86_400_000)}d`
+}
+
+function BuildBadge({ build }: { build: BuildInfo }) {
+  const commitTs =
+    build.commit_time ? new Date(build.commit_time).getTime() : null
+  const tooltip = [
+    `version ${build.version}`,
+    build.branch && `branch ${build.branch}`,
+    build.commit && `commit ${build.commit}`,
+    build.commit_time
+      && `committed ${new Date(build.commit_time).toLocaleString()}`,
+    `started ${new Date(build.started_at).toLocaleString()}`,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+  return (
+    <span className="mono text-xs text-tremor-content-subtle" title={tooltip}>
+      v{build.version}
+      {build.branch && (
+        <span className="ml-1 rounded bg-tremor-background-subtle px-1.5 py-0.5">
+          {build.branch}
+          {build.commit && (
+            <span className="ml-1 text-tremor-content-subtle">
+              @{build.commit}
+            </span>
+          )}
+        </span>
+      )}
+      {commitTs !== null && (
+        <span className="ml-1 text-tremor-content-subtle">
+          ·commit {shortRel(commitTs)} ago
+        </span>
+      )}
+      <span className="ml-1 text-tremor-content-subtle">
+        ·up {shortRel(build.started_at)}
+      </span>
+    </span>
+  )
+}
+
 export function TopBar({ title }: TopBarProps) {
   const qc = useQueryClient()
 
@@ -33,28 +87,7 @@ export function TopBar({ title }: TopBarProps) {
         </h1>
       </div>
       <div className="flex items-center gap-3 text-sm text-tremor-content">
-        {me?.build && (
-          <span
-            className="mono text-xs text-tremor-content-subtle"
-            title={
-              `version ${me.build.version}`
-              + (me.build.branch ? ` · branch ${me.build.branch}` : "")
-              + (me.build.commit ? ` · commit ${me.build.commit}` : "")
-            }
-          >
-            v{me.build.version}
-            {me.build.branch && (
-              <span className="ml-1 rounded bg-tremor-background-subtle px-1.5 py-0.5">
-                {me.build.branch}
-                {me.build.commit && (
-                  <span className="ml-1 text-tremor-content-subtle">
-                    @{me.build.commit}
-                  </span>
-                )}
-              </span>
-            )}
-          </span>
-        )}
+        {me?.build && <BuildBadge build={me.build} />}
         {me && (
           <>
             <span className="inline-flex items-center rounded-full bg-tremor-background-subtle px-2.5 py-0.5 text-xs font-medium text-tremor-content-emphasis">

@@ -13,14 +13,16 @@ export interface MeResponse {
   auth_mode_label: string
   bind_address: string
   /**
-   * Build identity assembled at startup from package.json + `git`. Branch
-   * and commit are absent when running from a tarball or when git isn't
-   * on PATH — the top bar just hides those bits.
+   * Build identity assembled at startup from package.json + `git`. Branch,
+   * commit and commit_time are absent when running from a tarball or when
+   * git isn't on PATH — the top bar just hides those bits.
    */
   build?: {
     version: string
     branch?: string
     commit?: string
+    commit_time?: string
+    started_at: number
   }
 }
 
