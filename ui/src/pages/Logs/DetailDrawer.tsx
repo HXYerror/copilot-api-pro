@@ -47,6 +47,13 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
   const trace = traceData?.trace
   const noCapture =
     traceError !== null && (traceError as { status?: number }).status === 404
+  // The 404 body carries diagnostic context (key still on debug?
+  // wrong server? key revoked?) — pull it out for the drawer.
+  const noCaptureBody =
+    noCapture ?
+      ((traceError as { body?: { reason?: string; key_diagnosis?: string } })
+        .body ?? null)
+    : null
 
   async function copy(text: string, tag: string) {
     try {
@@ -74,6 +81,8 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
             entry={entry}
             trace={trace}
             noCapture={noCapture}
+            noCaptureReason={noCaptureBody?.reason ?? null}
+            noCaptureKeyDiag={noCaptureBody?.key_diagnosis ?? null}
             copied={copied}
             onCopyCurl={(s) => void copy(s, "curl")}
           />
@@ -85,6 +94,7 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
             traceData={traceData}
             traceLoading={traceLoading}
             noCapture={noCapture}
+            noCaptureReason={noCaptureBody?.reason ?? null}
             copied={copied}
             onCopy={(s, t) => void copy(s, t)}
           />
@@ -172,12 +182,16 @@ function SummaryTab({
   entry,
   trace,
   noCapture,
+  noCaptureReason,
+  noCaptureKeyDiag,
   copied,
   onCopyCurl,
 }: {
   entry: LogEntry
   trace: FullTrace | undefined
   noCapture: boolean
+  noCaptureReason: string | null
+  noCaptureKeyDiag: string | null
   copied: string | null
   onCopyCurl: (curl: string) => void
 }) {
@@ -211,11 +225,17 @@ function SummaryTab({
       )}
       {noCapture && (
         <Card decoration="top" decorationColor="amber">
-          <Text>
-            No captured request/response for this event. Enable debug mode on
-            the key (Keys → {entry.key_label || entry.key_id.slice(-8)} → Enable
-            debug) to capture future calls into a JSONL trace file.
+          <Text className="font-medium text-tremor-content-strong">
+            No captured request/response for this event.
           </Text>
+          {noCaptureKeyDiag && (
+            <Text className="mt-1.5">{noCaptureKeyDiag}</Text>
+          )}
+          {noCaptureReason && noCaptureReason !== noCaptureKeyDiag && (
+            <Text className="mt-1.5 text-xs text-tremor-content-subtle">
+              {noCaptureReason}
+            </Text>
+          )}
         </Card>
       )}
     </div>
@@ -349,6 +369,7 @@ function LegsTab({
   traceData,
   traceLoading,
   noCapture,
+  noCaptureReason,
   copied,
   onCopy,
 }: {
@@ -357,6 +378,7 @@ function LegsTab({
   traceData: FullTraceResponse | undefined
   traceLoading: boolean
   noCapture: boolean
+  noCaptureReason: string | null
   copied: string | null
   onCopy: (s: string, tag: string) => void
 }) {
@@ -368,9 +390,9 @@ function LegsTab({
       {noCapture && (
         <Card decoration="top" decorationColor="amber">
           <Text>
-            No captured trace for this event — the key was not in debug mode
-            when the request fired, or the trace file was swept. Enable debug on
-            this key and re-run the request to see full bodies here.
+            {noCaptureReason
+              ?? `No captured trace for this event. Enable debug on the key`
+                + ` and re-run the request to capture future calls.`}
           </Text>
         </Card>
       )}

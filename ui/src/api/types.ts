@@ -333,6 +333,12 @@ export interface NoCaptureResponse {
   error: "no_capture"
   reason: string
   event: { id: number; ts: number; key_id: string; model: string }
+  /**
+   * One-sentence summary of the key's debug state at the time of the
+   * request (or "key no longer exists"). Surfaced in the drawer so
+   * operators can tell whether the right key was even in debug mode.
+   */
+  key_diagnosis?: string
 }
 
 // ---------------------------------------------------------------------------

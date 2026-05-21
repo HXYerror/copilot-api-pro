@@ -2256,12 +2256,24 @@ function dateStrForTs(ts) {
 	const day = String(d.getDate()).padStart(2, "0");
 	return `${y}-${m}-${day}`;
 }
+function describeKeyDebugState(row, eventTs) {
+	if (!row) return "The event's key no longer exists in this database — it may have been deleted, or the event was recorded by a different server instance writing to a different data directory.";
+	const labelDisplay = row.label ?? "(no label)";
+	if (row.revoked_at !== null) return `Key ${labelDisplay} is currently revoked.`;
+	if (row.debug_enabled !== 1) return `Key ${labelDisplay} currently has debug OFF — enable it on the Keys page, then re-run the request to capture future calls.`;
+	if (row.debug_expires_at !== null && row.debug_expires_at <= eventTs) return `Key ${labelDisplay} had debug enabled but the 24h TTL had already expired by the time of this request.`;
+	return `Key ${labelDisplay} has debug ON now, but it was likely off when this request (at ${new Date(eventTs).toLocaleString()}) was served. Make a fresh request to capture a trace.`;
+}
 logsRoute.get("/:id/trace", (c) => {
 	const idRaw = c.req.param("id");
 	const id = Number.parseInt(idRaw, 10);
 	if (!Number.isFinite(id) || id <= 0) return c.json({ error: "Bad id" }, 400);
-	const event = getDb().query(`SELECT id, ts, key_id, model FROM events WHERE id = ?`).get(id);
+	const db = getDb();
+	const event = db.query(`SELECT id, ts, key_id, model FROM events WHERE id = ?`).get(id);
 	if (!event) return c.json({ error: "Event not found" }, 404);
+	const keyRow = db.query(`SELECT label, debug_enabled, debug_expires_at, revoked_at
+         FROM keys WHERE id = ?`).get(event.key_id);
+	const keyDiag = describeKeyDebugState(keyRow, event.ts);
 	const dateStr = dateStrForTs(event.ts);
 	const filePath = path.join(tracesDir(), `traces-${dateStr}.jsonl`);
 	let raw;
@@ -2270,8 +2282,9 @@ logsRoute.get("/:id/trace", (c) => {
 	} catch {
 		return c.json({
 			error: "no_capture",
-			reason: `No trace file for ${dateStr} — the key's debug mode was likely off when this request was served, or retention swept the file. Enable debug on the key (Keys → detail) to capture future calls.`,
-			event
+			reason: `No trace file exists for ${dateStr}. ${keyDiag} Capture only fires when debug mode is on *at the moment* the request is served.`,
+			event,
+			key_diagnosis: keyDiag
 		}, 404);
 	}
 	let best = null;
@@ -2294,8 +2307,9 @@ logsRoute.get("/:id/trace", (c) => {
 	}
 	if (!best) return c.json({
 		error: "no_capture",
-		reason: `No matching trace line for event #${id} on ${dateStr}. Either the key's debug mode was off when the request fired, or the trace was filtered (e.g. wrong route).`,
-		event
+		reason: `Trace file ${dateStr} exists but no line matches event #${id} (key + ts within 2s). ${keyDiag} The most common cause is that debug was off when this exact request fired.`,
+		event,
+		key_diagnosis: keyDiag
 	}, 404);
 	return c.json({
 		event,
