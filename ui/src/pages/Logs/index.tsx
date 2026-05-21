@@ -431,7 +431,9 @@ function LogRow({ row, onClick }: { row: LogEntry; onClick: () => void }) {
           {row.key_label || row.key_id.slice(-8)}
         </span>
       </td>
-      <td className="px-4 py-2 text-tremor-content">{row.model}</td>
+      <td className="px-4 py-2 text-tremor-content">
+        <ModelOrEndpoint value={row.model} />
+      </td>
       <td className="px-4 py-2 text-xs">
         {row.thinking_level ?
           <Badge color={thinkingBadgeColor(row.thinking_level)}>
@@ -452,6 +454,30 @@ function LogRow({ row, onClick }: { row: LogEntry; onClick: () => void }) {
         : "—"}
       </td>
     </tr>
+  )
+}
+
+function methodColor(method: string): "blue" | "emerald" | "rose" | "slate" {
+  if (method === "GET") return "blue"
+  if (method === "POST") return "emerald"
+  if (method === "DELETE") return "rose"
+  return "slate"
+}
+
+function ModelOrEndpoint({ value }: { value: string }) {
+  // Telemetry stores non-message routes as "<METHOD> <path>" (the path
+  // always contains a "/", real model names never do). Detect that and
+  // render the method as a coloured pill so the Other tab clearly shows
+  // which endpoint each row is for.
+  const m = /^([A-Z]+)\s+(\/.*)$/.exec(value)
+  if (!m) return <span>{value}</span>
+  const method = m[1]
+  const path = m[2]
+  return (
+    <div className="flex items-center gap-1.5">
+      <Badge color={methodColor(method)}>{method}</Badge>
+      <span className="mono text-xs">{path}</span>
+    </div>
   )
 }
 

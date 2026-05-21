@@ -37,7 +37,7 @@ function configToRows(cfg: AppConfig): Array<ModelRow> {
     upstream: e.upstream,
     enabled: e.enabled,
     allowed_keys: e.allowed_keys,
-    default_effort: (e.default_effort ?? "") as ModelRow["default_effort"],
+    default_effort: e.default_effort ?? "",
   }))
 }
 
@@ -70,6 +70,10 @@ export function Settings() {
   const [draft, setDraft] = useState<AppConfig | null>(null)
   const [rows, setRows] = useState<Array<ModelRow>>([])
   const [toast, setToast] = useState<string | null>(null)
+  // Controlled tab index so "Use as alias" can hop the user from the
+  // Catalog tab (index 2) over to the Models tab (index 1) where the
+  // newly-added row actually lives.
+  const [tabIndex, setTabIndex] = useState(0)
 
   useEffect(() => {
     if (data) {
@@ -212,7 +216,7 @@ export function Settings() {
       )}
 
       <Card className="!p-0">
-        <TabGroup>
+        <TabGroup index={tabIndex} onIndexChange={setTabIndex}>
           <TabList className="border-b border-tremor-border">
             <Tab>General</Tab>
             <Tab>Models</Tab>
@@ -464,8 +468,8 @@ export function Settings() {
                                 value={r.default_effort}
                                 onChange={(e) =>
                                   updateRow(i, {
-                                    default_effort:
-                                      e.target.value as ModelRow["default_effort"],
+                                    default_effort: e.target
+                                      .value as ModelRow["default_effort"],
                                   })
                                 }
                                 className="w-full rounded-tremor-small border border-tremor-border bg-tremor-background px-2 py-1 text-xs"
@@ -527,6 +531,11 @@ export function Settings() {
                     }
                     return [...prev, next]
                   })
+                  // Hop the user over to the Models tab so the newly-added
+                  // row is actually visible — otherwise the click looks like
+                  // a no-op because the Catalog tab doesn't render the row.
+                  setTabIndex(1)
+                  setToast(`Added "${alias}" — edit alias / save below.`)
                 }}
               />
             </TabPanel>
