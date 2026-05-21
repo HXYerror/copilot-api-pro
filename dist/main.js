@@ -13,7 +13,7 @@ import { serve } from "srvx";
 import invariant from "tiny-invariant";
 import { getProxyForUrl } from "proxy-from-env";
 import { Agent, ProxyAgent, setGlobalDispatcher } from "undici";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import process$1 from "node:process";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -2133,7 +2133,21 @@ function parseTs(raw) {
 	const n = Number.parseInt(raw, 10);
 	return Number.isFinite(n) ? n : null;
 }
-function buildWhere(c) {
+function statusClause(status) {
+	if (status === "ok") return { sql: "status < 400" };
+	if (status === "error") return { sql: "status >= 400" };
+	if (status && /^\d+$/.test(status)) return {
+		sql: "status = ?",
+		param: Number.parseInt(status, 10)
+	};
+	return null;
+}
+function kindClause(kind) {
+	if (kind === "messages") return "model NOT LIKE '%/%'";
+	if (kind === "other") return "model LIKE '%/%'";
+	return null;
+}
+function buildWhere(c, options = {}) {
 	const parts = [];
 	const params = [];
 	const since = parseTs(c.req.query("since"));
@@ -2156,12 +2170,14 @@ function buildWhere(c) {
 		parts.push(`model IN (${models.map(() => "?").join(",")})`);
 		params.push(...models);
 	}
-	const statusFilter = c.req.query("status");
-	if (statusFilter === "ok") parts.push("status < 400");
-	else if (statusFilter === "error") parts.push("status >= 400");
-	else if (statusFilter && /^\d+$/.test(statusFilter)) {
-		parts.push("status = ?");
-		params.push(Number.parseInt(statusFilter, 10));
+	const status = statusClause(c.req.query("status"));
+	if (status) {
+		parts.push(status.sql);
+		if (status.param !== void 0) params.push(status.param);
+	}
+	if (!options.excludeKind) {
+		const kindSql = kindClause(c.req.query("kind"));
+		if (kindSql) parts.push(kindSql);
 	}
 	const q = c.req.query("q");
 	if (q && q.length > 0) {
@@ -2191,7 +2207,16 @@ logsRoute.get("/", (c) => {
 		const labelRows = db.query(`SELECT id, label FROM keys WHERE id IN (${placeholders})`).all(...keyIds);
 		for (const r of labelRows) labelById.set(r.id, r.label);
 	}
-	const allModels = db.query("SELECT DISTINCT model FROM events ORDER BY model").all().map((r) => r.model);
+	const allModels = db.query("SELECT DISTINCT model FROM events WHERE model NOT LIKE '%/%' ORDER BY model").all().map((r) => r.model);
+	const whereNoKind = buildWhere(c, { excludeKind: true });
+	const kindCountsRow = db.query(`SELECT
+         SUM(CASE WHEN model NOT LIKE '%/%' THEN 1 ELSE 0 END) AS messages,
+         SUM(CASE WHEN model LIKE '%/%' THEN 1 ELSE 0 END) AS other
+       FROM events ${whereNoKind.sql}`).get(...whereNoKind.params);
+	const kindCounts = {
+		messages: kindCountsRow?.messages ?? 0,
+		other: kindCountsRow?.other ?? 0
+	};
 	return c.json({
 		items: rows.map((r) => ({
 			...r,
@@ -2200,12 +2225,13 @@ logsRoute.get("/", (c) => {
 		total,
 		limit,
 		offset,
-		all_models: allModels
+		all_models: allModels,
+		kind_counts: kindCounts
 	});
 });
 logsRoute.get("/traces", (c) => {
 	const dir = tracesDir();
-	let entries = [];
+	let entries;
 	try {
 		entries = fs$1.readdirSync(dir).filter((f) => f.startsWith("traces-") && f.endsWith(".jsonl")).map((f) => {
 			const stat = fs$1.statSync(path.join(dir, f));
@@ -2279,11 +2305,68 @@ logsRoute.get("/:id/trace", (c) => {
 });
 
 //#endregion
+//#region src/lib/build-identity.ts
+let cached = null;
+let inflight = null;
+async function getBuildIdentity() {
+	if (cached) return cached;
+	if (inflight) return inflight;
+	inflight = computeBuildIdentity().then((id) => {
+		cached = id;
+		inflight = null;
+		return id;
+	});
+	return inflight;
+}
+async function computeBuildIdentity() {
+	let version = "unknown";
+	try {
+		const pkgPath = new URL("../../package.json", import.meta.url).pathname;
+		version = JSON.parse(await fs.readFile(pkgPath)).version;
+	} catch {
+		try {
+			const pkgPath = new URL("../package.json", import.meta.url).pathname;
+			version = JSON.parse(await fs.readFile(pkgPath)).version;
+		} catch {}
+	}
+	const repoRoot = path.resolve(new URL(".", import.meta.url).pathname, "..", "..");
+	const branch = runGit([
+		"rev-parse",
+		"--abbrev-ref",
+		"HEAD"
+	], repoRoot);
+	const commit = runGit([
+		"rev-parse",
+		"--short",
+		"HEAD"
+	], repoRoot);
+	return {
+		version,
+		branch: branch || void 0,
+		commit: commit || void 0
+	};
+}
+function runGit(args, cwd) {
+	try {
+		const res = spawnSync("git", args, {
+			cwd,
+			encoding: "utf8",
+			timeout: 1e3
+		});
+		if (res.status !== 0) return null;
+		return res.stdout.trim() || null;
+	} catch {
+		return null;
+	}
+}
+
+//#endregion
 //#region src/admin/api/me.ts
 const meRoute = new Hono();
-meRoute.get("/", (c) => {
+meRoute.get("/", async (c) => {
 	const session = c.get("session");
 	const key = findKeyById(session.key_id);
+	const build = await getBuildIdentity();
 	return c.json({
 		authenticated: true,
 		key_id: session.key_id,
@@ -2291,7 +2374,8 @@ meRoute.get("/", (c) => {
 		tier: "admin",
 		csrf_token: session.csrf_token,
 		auth_mode_label: state.authModeLabel ?? "on",
-		bind_address: state.bindAddress ?? "unknown"
+		bind_address: state.bindAddress ?? "unknown",
+		build
 	});
 });
 
@@ -2333,6 +2417,21 @@ modelsRoute.get("/upstream", (c) => {
 		items,
 		count: items.length
 	});
+});
+modelsRoute.post("/refresh", async (c) => {
+	try {
+		await cacheModels();
+		return c.json({
+			ok: true,
+			catalog_size: state.models?.data.length ?? 0
+		});
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		return c.json({
+			ok: false,
+			error: msg
+		}, 502);
+	}
 });
 modelsRoute.get("/", (c) => {
 	const config = getConfig();
@@ -6365,8 +6464,8 @@ const calculateTokens = (messages, encoder$1, constants) => {
 */
 const getEncodeChatFunction = async (encoding) => {
 	if (encodingCache.has(encoding)) {
-		const cached = encodingCache.get(encoding);
-		if (cached) return cached;
+		const cached$1 = encodingCache.get(encoding);
+		if (cached$1) return cached$1;
 	}
 	const supportedEncoding = encoding;
 	if (!(supportedEncoding in ENCODING_MAP)) {
