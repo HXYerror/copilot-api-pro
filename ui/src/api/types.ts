@@ -12,6 +12,16 @@ export interface MeResponse {
   csrf_token: string
   auth_mode_label: string
   bind_address: string
+  /**
+   * Build identity assembled at startup from package.json + `git`. Branch
+   * and commit are absent when running from a tarball or when git isn't
+   * on PATH — the top bar just hides those bits.
+   */
+  build?: {
+    version: string
+    branch?: string
+    commit?: string
+  }
 }
 
 export interface OverviewKpis {

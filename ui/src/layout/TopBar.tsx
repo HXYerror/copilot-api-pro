@@ -1,7 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 
-import { api } from "~/api/client"
 import type { MeResponse } from "~/api/types"
+
+import { api } from "~/api/client"
 
 interface TopBarProps {
   title: string
@@ -20,7 +21,7 @@ export function TopBar({ title }: TopBarProps) {
     mutationFn: () => api<{ ok: true }>("/logout", { method: "POST" }),
     onSuccess: () => {
       qc.clear()
-      window.location.href = "/admin/login"
+      globalThis.location.href = "/admin/login"
     },
   })
 
@@ -32,6 +33,28 @@ export function TopBar({ title }: TopBarProps) {
         </h1>
       </div>
       <div className="flex items-center gap-3 text-sm text-tremor-content">
+        {me?.build && (
+          <span
+            className="mono text-xs text-tremor-content-subtle"
+            title={
+              `version ${me.build.version}`
+              + (me.build.branch ? ` · branch ${me.build.branch}` : "")
+              + (me.build.commit ? ` · commit ${me.build.commit}` : "")
+            }
+          >
+            v{me.build.version}
+            {me.build.branch && (
+              <span className="ml-1 rounded bg-tremor-background-subtle px-1.5 py-0.5">
+                {me.build.branch}
+                {me.build.commit && (
+                  <span className="ml-1 text-tremor-content-subtle">
+                    @{me.build.commit}
+                  </span>
+                )}
+              </span>
+            )}
+          </span>
+        )}
         {me && (
           <>
             <span className="inline-flex items-center rounded-full bg-tremor-background-subtle px-2.5 py-0.5 text-xs font-medium text-tremor-content-emphasis">

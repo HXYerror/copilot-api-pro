@@ -12,6 +12,7 @@
 
 import { Hono } from "hono"
 
+import { getBuildIdentity } from "~/lib/build-identity"
 import { state } from "~/lib/state"
 import { findKeyById } from "~/services/keys"
 
@@ -19,10 +20,11 @@ import type { SessionVar } from "../session-middleware"
 
 export const meRoute = new Hono<{ Variables: SessionVar }>()
 
-meRoute.get("/", (c) => {
+meRoute.get("/", async (c) => {
   const session = c.get("session")
   // requireAdminSession guarantees this exists and is admin-tier.
   const key = findKeyById(session.key_id)
+  const build = await getBuildIdentity()
   return c.json({
     authenticated: true,
     key_id: session.key_id,
@@ -31,5 +33,6 @@ meRoute.get("/", (c) => {
     csrf_token: session.csrf_token,
     auth_mode_label: state.authModeLabel ?? "on",
     bind_address: state.bindAddress ?? "unknown",
+    build,
   })
 })
