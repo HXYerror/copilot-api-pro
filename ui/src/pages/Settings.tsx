@@ -665,12 +665,30 @@ interface CatalogPanelProps {
 }
 
 function CatalogPanel({ catalog, draft, onUseAlias }: CatalogPanelProps) {
+  const qc = useQueryClient()
   const [query, setQuery] = useState("")
   const [vendor, setVendor] = useState("")
   const [showOnlyEnabled, setShowOnlyEnabled] = useState(false)
   const [expandedCatalog, setExpandedCatalog] = useState<
     Record<string, boolean>
   >({})
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    setRefreshError(null)
+    try {
+      await api<{ ok: boolean; catalog_size: number }>("/models/refresh", {
+        method: "POST",
+      })
+      await qc.invalidateQueries({ queryKey: ["models", "upstream"] })
+    } catch (e) {
+      setRefreshError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   // For each upstream id, list the aliases that point to it.
   const aliasesByUpstream = new Map<string, Array<string>>()
@@ -708,13 +726,27 @@ function CatalogPanel({ catalog, draft, onUseAlias }: CatalogPanelProps) {
 
   return (
     <div className="space-y-4 p-4">
-      <div>
-        <Title>Copilot upstream catalog</Title>
-        <Text>
-          Live model list reported by GitHub Copilot at startup. Read-only. Use
-          the "Use as alias" button to start a new alias row in the Models tab;
-          the alias defaults to the upstream id but is editable.
-        </Text>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <Title>Copilot upstream catalog</Title>
+          <Text>
+            Live model list reported by GitHub Copilot at startup. Read-only.
+            Use the "Use as alias" button to start a new alias row in the
+            Models tab; the alias defaults to the upstream id but is editable.
+          </Text>
+        </div>
+        <div className="flex items-center gap-2">
+          {refreshError && (
+            <span className="text-xs text-rose-700">{refreshError}</span>
+          )}
+          <Button
+            variant="secondary"
+            loading={refreshing}
+            onClick={handleRefresh}
+          >
+            Refresh
+          </Button>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
