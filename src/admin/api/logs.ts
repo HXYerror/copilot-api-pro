@@ -222,10 +222,11 @@ logsRoute.get("/", (c) => {
 // ---------------------------------------------------------------------------
 logsRoute.get("/traces", (c) => {
   const dir = tracesDir()
-  let entries: Array<{ name: string; size: number; mtime: number }> = []
+  type Entry = { name: string; size: number; mtime: number }
+  let entries: Array<Entry>
   try {
-    const files = fs.readdirSync(dir)
-    entries = files
+    entries = fs
+      .readdirSync(dir)
       .filter((f) => f.startsWith("traces-") && f.endsWith(".jsonl"))
       .map((f) => {
         const stat = fs.statSync(path.join(dir, f))
