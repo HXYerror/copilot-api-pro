@@ -52,12 +52,32 @@ function parseTs(raw: string | undefined): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-function buildWhere(c: {
-  req: {
-    query: (k: string) => string | undefined
-    queries: (k: string) => Array<string> | undefined
+function statusClause(
+  status: string | undefined,
+): { sql: string; param?: number } | null {
+  if (status === "ok") return { sql: "status < 400" }
+  if (status === "error") return { sql: "status >= 400" }
+  if (status && /^\d+$/.test(status)) {
+    return { sql: "status = ?", param: Number.parseInt(status, 10) }
   }
-}): { sql: string; params: Array<unknown> } {
+  return null
+}
+
+function kindClause(kind: string | undefined): string | null {
+  if (kind === "messages") return "model NOT LIKE '%/%'"
+  if (kind === "other") return "model LIKE '%/%'"
+  return null
+}
+
+function buildWhere(
+  c: {
+    req: {
+      query: (k: string) => string | undefined
+      queries: (k: string) => Array<string> | undefined
+    }
+  },
+  options: { excludeKind?: boolean } = {},
+): { sql: string; params: Array<unknown> } {
   const parts: Array<string> = []
   const params: Array<unknown> = []
 
@@ -82,12 +102,20 @@ function buildWhere(c: {
     params.push(...models)
   }
 
-  const statusFilter = c.req.query("status")
-  if (statusFilter === "ok") parts.push("status < 400")
-  else if (statusFilter === "error") parts.push("status >= 400")
-  else if (statusFilter && /^\d+$/.test(statusFilter)) {
-    parts.push("status = ?")
-    params.push(Number.parseInt(statusFilter, 10))
+  const status = statusClause(c.req.query("status"))
+  if (status) {
+    parts.push(status.sql)
+    if (status.param !== undefined) params.push(status.param)
+  }
+
+  // Kind filter: real message requests vs non-message endpoints (model
+  // listings, etc). Telemetry middleware writes `model = "<METHOD> <path>"`
+  // for non-POST routes — those always contain a "/", whereas real model
+  // names never do, so the "/" heuristic is reliable. Skipped when caller
+  // wants per-kind counts under the same other-filters set.
+  if (!options.excludeKind) {
+    const kindSql = kindClause(c.req.query("kind"))
+    if (kindSql) parts.push(kindSql)
   }
 
   const q = c.req.query("q")
@@ -127,9 +155,8 @@ logsRoute.get("/", (c) => {
 
   const countSql = `SELECT COUNT(*) AS n FROM events ${where.sql}`
   const total =
-    db
-      .query<{ n: number }, Array<unknown>>(countSql)
-      .get(...where.params)?.n ?? 0
+    db.query<{ n: number }, Array<unknown>>(countSql).get(...where.params)?.n
+    ?? 0
 
   const rowsSql = `SELECT * FROM events ${where.sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
   const rows = db
@@ -142,20 +169,40 @@ logsRoute.get("/", (c) => {
   if (keyIds.length > 0) {
     const placeholders = keyIds.map(() => "?").join(",")
     const labelRows = db
-      .query<{ id: string; label: string | null }, Array<string>>(
-        `SELECT id, label FROM keys WHERE id IN (${placeholders})`,
-      )
+      .query<
+        { id: string; label: string | null },
+        Array<string>
+      >(`SELECT id, label FROM keys WHERE id IN (${placeholders})`)
       .all(...keyIds)
     for (const r of labelRows) labelById.set(r.id, r.label)
   }
 
-  // Distinct models for the filter dropdown
+  // Distinct models for the filter dropdown. Strip the synthetic
+  // "<METHOD> <path>" entries that telemetry writes for non-POST routes —
+  // those aren't real models and shouldn't appear in the model picker.
   const allModels = db
     .query<{ model: string }, []>(
-      "SELECT DISTINCT model FROM events ORDER BY model",
+      "SELECT DISTINCT model FROM events WHERE model NOT LIKE '%/%' ORDER BY model",
     )
     .all()
     .map((r) => r.model)
+
+  // Per-kind totals, computed ignoring the current `kind` filter so the tab
+  // badges always reflect the full counts under the *other* active filters
+  // (search, status, model, key).
+  const whereNoKind = buildWhere(c, { excludeKind: true })
+  const kindCountsRow = db
+    .query<{ messages: number; other: number }, Array<unknown>>(
+      `SELECT
+         SUM(CASE WHEN model NOT LIKE '%/%' THEN 1 ELSE 0 END) AS messages,
+         SUM(CASE WHEN model LIKE '%/%' THEN 1 ELSE 0 END) AS other
+       FROM events ${whereNoKind.sql}`,
+    )
+    .get(...whereNoKind.params)
+  const kindCounts = {
+    messages: kindCountsRow?.messages ?? 0,
+    other: kindCountsRow?.other ?? 0,
+  }
 
   return c.json({
     items: rows.map((r) => ({
@@ -166,6 +213,7 @@ logsRoute.get("/", (c) => {
     limit,
     offset,
     all_models: allModels,
+    kind_counts: kindCounts,
   })
 })
 
@@ -250,9 +298,7 @@ logsRoute.get("/:id/trace", (c) => {
     .query<
       { id: number; ts: number; key_id: string; model: string },
       [number]
-    >(
-      `SELECT id, ts, key_id, model FROM events WHERE id = ?`,
-    )
+    >(`SELECT id, ts, key_id, model FROM events WHERE id = ?`)
     .get(id)
   if (!event) return c.json({ error: "Event not found" }, 404)
 

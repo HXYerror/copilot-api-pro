@@ -1,9 +1,10 @@
-import { Badge, Card, Grid, Text, Title } from "@tremor/react"
 import { useQuery } from "@tanstack/react-query"
+import { Badge, Button, Card, Grid, Text, Title } from "@tremor/react"
 import { useState } from "react"
 
-import { api } from "~/api/client"
 import type { ModelEntry, ModelsListResponse } from "~/api/types"
+
+import { api } from "~/api/client"
 
 const NUM_FMT = new Intl.NumberFormat("en", { notation: "compact" })
 
@@ -44,11 +45,57 @@ function vendorColor(
   return "slate"
 }
 
+function RefreshHeader({
+  isFetching,
+  onRefetch,
+}: {
+  isFetching: boolean
+  onRefetch: () => Promise<unknown>
+}) {
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    setRefreshError(null)
+    try {
+      await api<{ ok: boolean; catalog_size: number }>("/models/refresh", {
+        method: "POST",
+      })
+      await onRefetch()
+    } catch (e) {
+      setRefreshError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <Text className="text-tremor-content-subtle">
+        Upstream catalog cached at startup — refresh to pull the latest model
+        list from Copilot.
+      </Text>
+      <div className="flex items-center gap-2">
+        {refreshError && (
+          <span className="text-xs text-rose-700">{refreshError}</span>
+        )}
+        <Button
+          variant="secondary"
+          loading={refreshing || isFetching}
+          onClick={handleRefresh}
+        >
+          Refresh
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 export function Models() {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ["models"],
     queryFn: () => api<ModelsListResponse>("/models"),
-    refetchInterval: 30_000,
   })
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
@@ -59,7 +106,7 @@ export function Models() {
   if (error) {
     return (
       <div className="rounded-tremor-small border border-rose-300 bg-rose-50 p-4 text-rose-700">
-        Failed to load models: {(error as Error).message}
+        Failed to load models: {error.message}
       </div>
     )
   }
@@ -70,6 +117,7 @@ export function Models() {
 
   return (
     <div className="space-y-4">
+      <RefreshHeader isFetching={isFetching} onRefetch={refetch} />
       <Grid numItemsSm={2} numItemsLg={4} className="gap-4">
         <Card decoration="top" decorationColor="blue">
           <Text>Aliases configured</Text>
@@ -99,9 +147,7 @@ export function Models() {
           <p className="mt-1 text-2xl font-semibold">
             {data.summary.catalog_size}
           </p>
-          <Text className="mt-1 text-xs">
-            models available from Copilot
-          </Text>
+          <Text className="mt-1 text-xs">models available from Copilot</Text>
         </Card>
       </Grid>
 
@@ -147,15 +193,12 @@ export function Models() {
                     | (NonNullable<ModelEntry["capabilities"]>
                         & Record<string, unknown>)
                     | null
-                  const limits = (caps?.limits ?? {}) as Record<
-                    string,
-                    unknown
-                  >
+                  const limits = (caps?.limits ?? {}) as Record<string, unknown>
                   const supports = (caps?.supports ?? {}) as Record<
                     string,
                     unknown
                   >
-                  const isOpen = !!expanded[m.alias]
+                  const isOpen = Boolean(expanded[m.alias])
                   return (
                     <RowGroup
                       key={m.alias}
@@ -186,7 +229,14 @@ interface RowGroupProps {
   onToggle: () => void
 }
 
-function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps) {
+function RowGroup({
+  m,
+  caps,
+  limits,
+  supports,
+  isOpen,
+  onToggle,
+}: RowGroupProps) {
   const ctx = limits.max_context_window_tokens as number | undefined
   const out = limits.max_output_tokens as number | undefined
   const nonStreamOut = limits.max_non_streaming_output_tokens as
@@ -197,8 +247,9 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
   const minThink = supports.min_thinking_budget as number | undefined
   const maxThink = supports.max_thinking_budget as number | undefined
   const adaptiveThink = supports.adaptive_thinking === true
-  const reasoning = Array.isArray(supports.reasoning_effort)
-    ? (supports.reasoning_effort as Array<string>)
+  const reasoning =
+    Array.isArray(supports.reasoning_effort) ?
+      (supports.reasoning_effort as Array<string>)
     : null
   const visionObj = limits.vision as Record<string, unknown> | undefined
 
@@ -228,12 +279,9 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
               <Badge color={vendorColor(caps.vendor as string | undefined)}>
                 {(caps.vendor as string) ?? "—"}
               </Badge>
-              <div className="text-tremor-content">
-                {caps.family as string}
-              </div>
+              <div className="text-tremor-content">{caps.family as string}</div>
             </div>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-4 py-2 text-xs text-tremor-content">
           {caps ?
@@ -252,26 +300,23 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
                 </div>
               )}
             </>
-          : "—"
-          }
+          : "—"}
         </td>
         <td className="px-4 py-2 text-xs">
-          {Array.isArray(caps?.supported_endpoints)
-            && (caps?.supported_endpoints as Array<string>).length > 0 ?
+          {(
+            Array.isArray(caps?.supported_endpoints)
+            && (caps?.supported_endpoints as Array<string>).length > 0
+          ) ?
             <div className="flex flex-wrap gap-1">
               {(caps?.supported_endpoints as Array<string>)
                 .filter((p) => !p.startsWith("ws:"))
                 .map((p) => (
-                  <Badge
-                    key={p}
-                    color={p === "/responses" ? "violet" : "blue"}
-                  >
+                  <Badge key={p} color={p === "/responses" ? "violet" : "blue"}>
                     {p}
                   </Badge>
                 ))}
             </div>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-4 py-2 text-xs">
           {maxThink !== undefined ?
@@ -283,8 +328,7 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
                 <div className="mt-1 text-tremor-content">adaptive</div>
               )}
             </>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-4 py-2 text-xs">
           {reasoning ?
@@ -295,8 +339,7 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
                 </Badge>
               ))}
             </div>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-4 py-2 text-xs">
           {supports.tool_calls === true ?
@@ -309,8 +352,7 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
                 <Badge color="violet">structured</Badge>
               )}
             </div>
-          : <span className="text-tremor-content-subtle">no</span>
-          }
+          : <span className="text-tremor-content-subtle">no</span>}
         </td>
         <td className="px-4 py-2 text-xs">
           {supports.vision === true ?
@@ -322,14 +364,12 @@ function RowGroup({ m, caps, limits, supports, isOpen, onToggle }: RowGroupProps
                 </div>
               )}
             </div>
-          : <span className="text-tremor-content-subtle">—</span>
-          }
+          : <span className="text-tremor-content-subtle">—</span>}
         </td>
         <td className="px-4 py-2">
           {m.enabled ?
             <Badge color="emerald">enabled</Badge>
-          : <Badge color="slate">disabled</Badge>
-          }
+          : <Badge color="slate">disabled</Badge>}
         </td>
         <td className="px-4 py-2 text-right text-tremor-content">
           <div>{fmt(m.requests_24h)}</div>
@@ -373,27 +413,36 @@ function RowDetails({
   if (!caps) {
     return (
       <Text className="text-tremor-content-subtle">
-        No capability metadata available — model is not in the upstream
-        catalog (may have been retired).
+        No capability metadata available — model is not in the upstream catalog
+        (may have been retired).
       </Text>
     )
   }
   return (
     <div className="space-y-3 text-xs">
       <div className="grid gap-3 sm:grid-cols-3">
-        <KvCard title="Identity" rows={{
-          alias: m.alias,
-          upstream: m.upstream,
-          version: caps.version,
-          family: caps.family,
-          type: caps.type,
-          tokenizer: caps.tokenizer,
-          vendor: caps.vendor,
-          preview: caps.preview,
-          model_picker_enabled: caps.model_picker_enabled,
-        }} />
-        <KvCard title="Limits" rows={(caps.limits as Record<string, unknown>) ?? {}} />
-        <KvCard title="Supports" rows={(caps.supports as Record<string, unknown>) ?? {}} />
+        <KvCard
+          title="Identity"
+          rows={{
+            alias: m.alias,
+            upstream: m.upstream,
+            version: caps.version,
+            family: caps.family,
+            type: caps.type,
+            tokenizer: caps.tokenizer,
+            vendor: caps.vendor,
+            preview: caps.preview,
+            model_picker_enabled: caps.model_picker_enabled,
+          }}
+        />
+        <KvCard
+          title="Limits"
+          rows={(caps.limits as Record<string, unknown>) ?? {}}
+        />
+        <KvCard
+          title="Supports"
+          rows={(caps.supports as Record<string, unknown>) ?? {}}
+        />
       </div>
       <details>
         <summary className="cursor-pointer text-tremor-content-subtle hover:text-tremor-content-strong">
@@ -436,9 +485,7 @@ function RenderKv({ k, v }: { k: string; v: unknown }) {
   return (
     <>
       <dt className="text-tremor-content-subtle">{k}</dt>
-      <dd className="text-tremor-content-strong break-all">
-        {renderValue(v)}
-      </dd>
+      <dd className="text-tremor-content-strong break-all">{renderValue(v)}</dd>
     </>
   )
 }
@@ -455,9 +502,9 @@ function renderValue(v: unknown): React.ReactNode {
       <div className="flex flex-wrap gap-1">
         {v.map((item, i) => (
           <Badge key={i} color="slate">
-            {typeof item === "string" || typeof item === "number"
-              ? String(item)
-              : JSON.stringify(item)}
+            {typeof item === "string" || typeof item === "number" ?
+              String(item)
+            : JSON.stringify(item)}
           </Badge>
         ))}
       </div>

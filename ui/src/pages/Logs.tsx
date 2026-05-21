@@ -170,6 +170,7 @@ function digErrorMessage(raw: unknown, depth = 0): string | null {
 }
 
 type StatusFilter = "all" | "ok" | "error"
+type KindFilter = "messages" | "other" | "all"
 
 interface SsePayload {
   ts?: number
@@ -182,6 +183,7 @@ interface SsePayload {
 export function Logs() {
   const [search, setSearch] = useState("")
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
+  const [kindFilter, setKindFilter] = useState<KindFilter>("messages")
   const [modelFilter, setModelFilter] = useState("")
   const [liveTail, setLiveTail] = useState(false)
   const [livePayloads, setLivePayloads] = useState<Array<SsePayload>>([])
@@ -198,17 +200,18 @@ export function Logs() {
 
   useEffect(() => {
     setPage(0)
-  }, [search, statusFilter, modelFilter])
+  }, [search, statusFilter, kindFilter, modelFilter])
 
   const params = useMemo(() => {
     const sp = new URLSearchParams()
     if (search) sp.set("q", search)
     if (statusFilter !== "all") sp.set("status", statusFilter)
+    if (kindFilter !== "all") sp.set("kind", kindFilter)
     if (modelFilter) sp.set("model", modelFilter)
     sp.set("limit", String(PAGE_SIZE))
     sp.set("offset", String(page * PAGE_SIZE))
     return sp.toString()
-  }, [search, statusFilter, modelFilter, page])
+  }, [search, statusFilter, kindFilter, modelFilter, page])
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["logs", params],
@@ -311,6 +314,35 @@ export function Logs() {
 
   return (
     <div className="space-y-4">
+      {/* Kind tabs: separate real message requests from non-message endpoints
+          (model listings, etc) so debugging chat traffic isn't drowned out by
+          frequent metadata polls from clients. */}
+      <div className="flex gap-1 border-b border-tremor-border">
+        {(
+          [
+            ["messages", "Messages", data.kind_counts.messages],
+            ["other", "Other", data.kind_counts.other],
+            ["all", "All", data.kind_counts.messages + data.kind_counts.other],
+          ] as Array<[KindFilter, string, number]>
+        ).map(([k, label, count]) => (
+          <button
+            key={k}
+            onClick={() => setKindFilter(k)}
+            className={
+              "border-b-2 px-3 py-2 text-sm font-medium "
+              + (kindFilter === k ?
+                "border-tremor-brand text-tremor-brand-emphasis"
+              : "border-transparent text-tremor-content hover:text-tremor-content-strong")
+            }
+          >
+            {label}
+            <span className="ml-1.5 text-xs text-tremor-content-subtle">
+              {fmt(count)}
+            </span>
+          </button>
+        ))}
+      </div>
+
       {/* Filter bar */}
       <Card className="!p-3">
         <div className="flex flex-wrap items-center gap-2">

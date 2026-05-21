@@ -16,6 +16,7 @@ import { Hono } from "hono"
 import { getConfig } from "~/lib/config-store"
 import { getDb } from "~/lib/db"
 import { state } from "~/lib/state"
+import { cacheModels } from "~/lib/utils"
 
 import type { SessionVar } from "../session-middleware"
 
@@ -42,9 +43,9 @@ modelsRoute.get("/upstream", (c) => {
   // Spread the model record so any forward-compat fields Copilot adds in the
   // future (new supports.* / limits.* / unknown top-level keys) surface in
   // the catalog response without a code change here.
-  const items = (state.models?.data ?? []).map(
-    (m) => ({ ...(m as Record<string, unknown>) }),
-  )
+  const items = (state.models?.data ?? []).map((m) => ({
+    ...(m as Record<string, unknown>),
+  }))
   // Sort: enabled first, then vendor, then id
   items.sort((a, b) => {
     const aP = (a as { model_picker_enabled?: boolean }).model_picker_enabled
@@ -58,6 +59,27 @@ modelsRoute.get("/upstream", (c) => {
     return aI.localeCompare(bI)
   })
   return c.json({ items, count: items.length })
+})
+
+// ---------------------------------------------------------------------------
+// POST /admin/api/models/refresh
+//
+// Re-pulls the upstream Copilot model catalog and replaces state.models. Lets
+// the admin UI surface newly-added upstream models (or capability changes)
+// without restarting the proxy. Returns the fresh catalog size on success.
+// Also defined BEFORE the catch-all `/:alias`.
+// ---------------------------------------------------------------------------
+modelsRoute.post("/refresh", async (c) => {
+  try {
+    await cacheModels()
+    return c.json({
+      ok: true,
+      catalog_size: state.models?.data.length ?? 0,
+    })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return c.json({ ok: false, error: msg }, 502)
+  }
 })
 
 modelsRoute.get("/", (c) => {
@@ -171,7 +193,7 @@ modelsRoute.get("/:alias", (c) => {
   const entry = (
     config.models as Record<
       string,
-      { upstream: string; enabled: boolean; allowed_keys: Array<string> }
+      | { upstream: string; enabled: boolean; allowed_keys: Array<string> }
       | undefined
     >
   )[alias]
@@ -225,8 +247,9 @@ modelsRoute.get("/:alias", (c) => {
   return c.json({
     alias,
     config: entry,
-    upstream_info: upstreamModel
-      ? {
+    upstream_info:
+      upstreamModel ?
+        {
           id: upstreamModel.id,
           name: upstreamModel.name,
           vendor: upstreamModel.vendor,

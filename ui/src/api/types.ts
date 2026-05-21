@@ -264,6 +264,15 @@ export interface LogsListResponse {
   limit: number
   offset: number
   all_models: Array<string>
+  /**
+   * Counts per request kind for the current filter set, ignoring the
+   * `kind` filter itself so the tabs can render badges showing how many
+   * events would land in each tab.
+   */
+  kind_counts: {
+    messages: number
+    other: number
+  }
 }
 
 export interface TraceFileEntry {
