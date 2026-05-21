@@ -138,6 +138,16 @@ async function handleNative(
   // `models[clientAlias].default_effort` set AND the client didn't ask for
   // thinking, inject adaptive + effort. See `buildUpstreamPayload`.
   const defaultEffort = getConfig().models[clientAlias]?.default_effort
+  // Tell telemetry the effective thinking level so the Logs row reflects
+  // what actually went upstream — the body-snapshot would otherwise be
+  // null when the client supplied no thinking field but default_effort
+  // kicked in.
+  if (payload.thinking) {
+    // Client supplied thinking; leave telemetry to pick it up from the
+    // body snapshot (it captures budget_tokens / type the same way).
+  } else if (defaultEffort && defaultEffort !== "") {
+    c.set("thinking_level", defaultEffort)
+  }
   const response = await createMessagesNative(
     payload,
     onUpstream,
@@ -189,9 +199,7 @@ async function handleNative(
           if (rawEvent.data === "[DONE]") continue
 
           try {
-            const parsed = JSON.parse(
-              rawEvent.data,
-            ) as AnthropicStreamEventData
+            const parsed = JSON.parse(rawEvent.data) as AnthropicStreamEventData
             consola.debug("Native SSE event:", parsed.type)
             ;[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [
               inputTokens,
@@ -261,6 +269,9 @@ async function handleAnthropicViaResponses(
 ): Promise<Response> {
   consola.debug("Routing /v1/messages via Responses API for", payload.model)
   const defaultEffort = getConfig().models[clientAlias]?.default_effort
+  if (!payload.thinking && defaultEffort && defaultEffort !== "") {
+    c.set("thinking_level", defaultEffort)
+  }
 
   if (payload.stream) {
     return streamResponsesAsAnthropic(c, payload, defaultEffort)
@@ -374,6 +385,9 @@ async function handleTranslated(
       `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias}, translated path)`,
     )
     finalPayload = { ...openAIPayload, reasoning_effort: e }
+    c.set("thinking_level", `effort:${e}`)
+  } else if (openAIPayload.reasoning_effort) {
+    c.set("thinking_level", `effort:${openAIPayload.reasoning_effort}`)
   }
 
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })
@@ -584,10 +598,7 @@ function streamResponsesAsAnthropic(
             )
 
             for (const event of anthropicEvents) {
-              consola.debug(
-                "Translated Responses→Anthropic event:",
-                event.type,
-              )
+              consola.debug("Translated Responses→Anthropic event:", event.type)
               ;[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [
                 inputTokens,
                 outputTokens,

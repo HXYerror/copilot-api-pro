@@ -5729,6 +5729,8 @@ function safeInsertEvent(c, ctx) {
 		const key = c.get("key");
 		const usage = c.get("usage");
 		const upstream = c.get("upstream_model") ?? ctx.clientModel;
+		const effectiveThinking = c.get("thinking_level");
+		const finalThinking = typeof effectiveThinking === "string" && effectiveThinking.length > 0 ? effectiveThinking : ctx.thinkingLevel;
 		const status = ctx.threw ? 500 : c.res.status;
 		const errorTag = ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status);
 		const promptTokens = usage?.prompt_tokens ?? null;
@@ -5745,7 +5747,7 @@ function safeInsertEvent(c, ctx) {
 			latency_ms: Date.now() - ctx.start,
 			error: errorTag,
 			usage_unknown: usageUnknown,
-			thinking_level: ctx.thinkingLevel,
+			thinking_level: finalThinking,
 			cache_read_tokens: usage?.cache_read_tokens ?? null,
 			cache_creation_tokens: usage?.cache_creation_tokens ?? null,
 			reasoning_tokens: usage?.reasoning_tokens ?? null
@@ -6740,7 +6742,8 @@ async function handleCompletion$1(c) {
 			...payload,
 			reasoning_effort: e
 		};
-	}
+		c.set("thinking_level", `effort:${e}`);
+	} else if (payload.reasoning_effort) c.set("thinking_level", `effort:${payload.reasoning_effort}`);
 	const response = await createChatCompletions(payload, onUpstream);
 	if (isNonStreaming$1(response)) {
 		consola.debug("Non-streaming response:", JSON.stringify(response));
@@ -8586,6 +8589,7 @@ async function handleNative(c, payload, clientAlias) {
 	const onUpstream = c.var.trace_capture_upstream;
 	const clientBeta = c.req.header("anthropic-beta");
 	const defaultEffort = getConfig().models[clientAlias]?.default_effort;
+	if (payload.thinking) {} else if (defaultEffort && defaultEffort !== "") c.set("thinking_level", defaultEffort);
 	const response = await createMessagesNative(payload, onUpstream, clientBeta, defaultEffort);
 	if (!payload.stream) {
 		consola.debug("Native non-streaming response:", JSON.stringify(response).slice(0, 400));
@@ -8650,6 +8654,7 @@ async function handleNative(c, payload, clientAlias) {
 async function handleAnthropicViaResponses(c, payload, clientAlias) {
 	consola.debug("Routing /v1/messages via Responses API for", payload.model);
 	const defaultEffort = getConfig().models[clientAlias]?.default_effort;
+	if (!payload.thinking && defaultEffort && defaultEffort !== "") c.set("thinking_level", defaultEffort);
 	if (payload.stream) return streamResponsesAsAnthropic(c, payload, defaultEffort);
 	const responsesPayload = translateAnthropicToResponses(payload, defaultEffort);
 	const onUpstreamRes = c.var.trace_capture_upstream;
@@ -8694,7 +8699,8 @@ async function handleTranslated(c, anthropicPayload, clientAlias) {
 			...openAIPayload,
 			reasoning_effort: e
 		};
-	}
+		c.set("thinking_level", `effort:${e}`);
+	} else if (openAIPayload.reasoning_effort) c.set("thinking_level", `effort:${openAIPayload.reasoning_effort}`);
 	const onUpstream = c.var.trace_capture_upstream;
 	const response = await createChatCompletions(finalPayload, onUpstream);
 	if (isNonStreaming(response)) {
@@ -8962,7 +8968,8 @@ async function handleResponses(c) {
 				effort: e
 			}
 		};
-	}
+		c.set("thinking_level", `effort:${e}`);
+	} else if (payload.reasoning?.effort) c.set("thinking_level", `effort:${payload.reasoning.effort}`);
 	const onUpstream = c.var.trace_capture_upstream;
 	const response = await createResponses(payload, onUpstream);
 	if (!payload.stream) {

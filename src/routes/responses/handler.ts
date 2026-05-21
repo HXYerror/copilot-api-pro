@@ -91,6 +91,9 @@ export async function handleResponses(
       ...payload,
       reasoning: { ...payload.reasoning, effort: e },
     }
+    c.set("thinking_level", `effort:${e}`)
+  } else if (payload.reasoning?.effort) {
+    c.set("thinking_level", `effort:${payload.reasoning.effort}`)
   }
 
   const onUpstream = (c.var as { trace_capture_upstream?: UpstreamCaptureFn })

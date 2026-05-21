@@ -119,6 +119,11 @@ export async function handleCompletion(
       `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias})`,
     )
     payload = { ...payload, reasoning_effort: e }
+    // Tell telemetry the effective thinking level so the Logs row reflects
+    // what actually went upstream (not the empty body the client sent).
+    c.set("thinking_level", `effort:${e}`)
+  } else if (payload.reasoning_effort) {
+    c.set("thinking_level", `effort:${payload.reasoning_effort}`)
   }
 
   const response = await createChatCompletions(payload, onUpstream)

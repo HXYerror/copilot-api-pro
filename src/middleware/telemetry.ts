@@ -219,6 +219,16 @@ function safeInsertEvent(
     const usage = c.get("usage")
     const upstream = c.get("upstream_model") ?? ctx.clientModel
 
+    // Prefer a handler-set effective thinking level (the value actually
+    // sent upstream after default_effort injection) over the body-snapshot
+    // we took before next(). If the handler didn't set anything, fall back
+    // to whatever the client supplied — that may be null.
+    const effectiveThinking = c.get("thinking_level")
+    const finalThinking =
+      typeof effectiveThinking === "string" && effectiveThinking.length > 0 ?
+        effectiveThinking
+      : ctx.thinkingLevel
+
     const status = ctx.threw ? 500 : c.res.status
     const errorTag =
       ctx.aborted && status < 400 ? "client_aborted" : statusToErrorTag(status)
@@ -238,7 +248,7 @@ function safeInsertEvent(
       latency_ms: Date.now() - ctx.start,
       error: errorTag,
       usage_unknown: usageUnknown,
-      thinking_level: ctx.thinkingLevel,
+      thinking_level: finalThinking,
       cache_read_tokens: usage?.cache_read_tokens ?? null,
       cache_creation_tokens: usage?.cache_creation_tokens ?? null,
       reasoning_tokens: usage?.reasoning_tokens ?? null,
