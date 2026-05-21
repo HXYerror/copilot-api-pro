@@ -267,9 +267,11 @@ export interface LogsListResponse {
   /**
    * Counts per request kind for the current filter set, ignoring the
    * `kind` filter itself so the tabs can render badges showing how many
-   * events would land in each tab.
+   * events would land in each tab. Optional so an older server build —
+   * one served before the kind filter shipped — doesn't crash the UI:
+   * we just render zero badges instead.
    */
-  kind_counts: {
+  kind_counts?: {
     messages: number
     other: number
   }

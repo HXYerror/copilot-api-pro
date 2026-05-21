@@ -89,7 +89,7 @@ export function Logs() {
       <KindTabs
         kindFilter={kindFilter}
         setKindFilter={setKindFilter}
-        kindCounts={data.kind_counts}
+        kindCounts={data.kind_counts ?? { messages: 0, other: 0 }}
       />
       <FilterBar
         search={search}

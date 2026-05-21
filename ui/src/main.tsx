@@ -4,17 +4,18 @@ import ReactDOM from "react-dom/client"
 import { BrowserRouter } from "react-router-dom"
 
 import App from "./App"
+import { ErrorBoundary } from "./components/ErrorBoundary"
 import "./index.css"
 
 // Fail loudly if the SPA is being served from somewhere unexpected — the
 // router and API client both assume we live at /admin.
 if (
-  typeof window !== "undefined"
-  && !window.location.pathname.startsWith("/admin")
+  typeof globalThis.window !== "undefined"
+  && !globalThis.location.pathname.startsWith("/admin")
 ) {
   console.warn(
     "Copilot API admin SPA loaded from",
-    window.location.pathname,
+    globalThis.location.pathname,
     "— expected /admin/*. Routing may misbehave.",
   )
 }
@@ -31,15 +32,17 @@ const queryClient = new QueryClient({
   },
 })
 
-const root = document.getElementById("root")
+const root = document.querySelector("#root")
 if (!root) throw new Error("#root missing")
 
 ReactDOM.createRoot(root).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter basename="/admin">
-        <App />
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter basename="/admin">
+          <App />
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   </React.StrictMode>,
 )
