@@ -453,7 +453,9 @@ function diagnosticsToReason(
   parts.push(`retention.traces_days = ${d.traces_days}.`)
   if (d.traces_days <= 0) {
     parts.push(
-      `Trace disk-write is DISABLED — Settings → Advanced → set traces_days > 0 to start persisting captures.`,
+      `(Traces are still written when debug is on, but the sweeper deletes`
+        + ` them on the next cycle. Set traces_days > 0 in Settings → Advanced`
+        + ` to keep captures around.)`,
     )
   }
   if (!d.file_exists) {

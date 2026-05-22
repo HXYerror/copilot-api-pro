@@ -2331,7 +2331,7 @@ function scanTraceFile(filePath, eventKeyId, eventTs) {
 function diagnosticsToReason(d, keyDiag) {
 	const parts = [keyDiag];
 	parts.push(`retention.traces_days = ${d.traces_days}.`);
-	if (d.traces_days <= 0) parts.push(`Trace disk-write is DISABLED — Settings → Advanced → set traces_days > 0 to start persisting captures.`);
+	if (d.traces_days <= 0) parts.push("(Traces are still written when debug is on, but the sweeper deletes them on the next cycle. Set traces_days > 0 in Settings → Advanced to keep captures around.)");
 	if (!d.file_exists) {
 		parts.push(`No trace file at ${d.file_path} for ${d.date_str}.`);
 		return parts.join(" ");
@@ -6118,7 +6118,18 @@ function eventToJSON(event) {
 	};
 }
 /**
-* Persist (when retention is enabled) and broadcast a single trace event.
+* Persist and broadcast a single trace event.
+*
+* Always writes to disk when invoked. The trace middleware's `shouldCapture`
+* check is the canonical gate — by the time we get here the operator has
+* explicitly opted in (per-key debug, global features.debug, or admin
+* X-Capi-Debug header), and silently dropping their capture because
+* retention.traces_days happens to be 0 was incomprehensibly bad UX
+* (operators stared at "no captured request/response" with no clue why).
+*
+* `retention.traces_days` now controls only RETENTION — the sweeper
+* deletes files older than that many days. 0 still means "keep nothing
+* for long", but newly-captured traces are visible until the next sweep.
 *
 * Best-effort: a failing disk write must never crash the proxied request.
 * A failing assertRedacted aborts BOTH the disk write and the broadcast —
@@ -6138,7 +6149,7 @@ function writeTrace(event) {
 		consola.error(`[trace-writer] redaction sanity check failed, dropping trace: ${String(err)}`);
 		return;
 	}
-	if (getConfig().retention.traces_days > 0) try {
+	try {
 		appendToDisk(line);
 	} catch (err) {
 		consola.error(`[trace-writer] append failed (continuing): ${String(err)}`);

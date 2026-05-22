@@ -24,7 +24,6 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { getConfig } from "~/lib/config-store"
 import { tracesDir } from "~/lib/paths"
 
 import { broadcastTrace } from "./trace-broadcaster"
@@ -114,7 +113,18 @@ function eventToJSON(event: TraceEvent): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 /**
- * Persist (when retention is enabled) and broadcast a single trace event.
+ * Persist and broadcast a single trace event.
+ *
+ * Always writes to disk when invoked. The trace middleware's `shouldCapture`
+ * check is the canonical gate — by the time we get here the operator has
+ * explicitly opted in (per-key debug, global features.debug, or admin
+ * X-Capi-Debug header), and silently dropping their capture because
+ * retention.traces_days happens to be 0 was incomprehensibly bad UX
+ * (operators stared at "no captured request/response" with no clue why).
+ *
+ * `retention.traces_days` now controls only RETENTION — the sweeper
+ * deletes files older than that many days. 0 still means "keep nothing
+ * for long", but newly-captured traces are visible until the next sweep.
  *
  * Best-effort: a failing disk write must never crash the proxied request.
  * A failing assertRedacted aborts BOTH the disk write and the broadcast —
@@ -138,13 +148,10 @@ export function writeTrace(event: TraceEvent): void {
     return
   }
 
-  const cfg = getConfig()
-  if (cfg.retention.traces_days > 0) {
-    try {
-      appendToDisk(line)
-    } catch (err) {
-      consola.error(`[trace-writer] append failed (continuing): ${String(err)}`)
-    }
+  try {
+    appendToDisk(line)
+  } catch (err) {
+    consola.error(`[trace-writer] append failed (continuing): ${String(err)}`)
   }
 
   try {
