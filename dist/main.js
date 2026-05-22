@@ -2269,16 +2269,18 @@ function dateStrForTs(ts) {
 	return `${y}-${m}-${day}`;
 }
 function describeKeyDebugState(row, eventTs, keyId) {
+	const globalDebug = getConfig().features.debug;
 	if (keyId === "__noauth__") {
-		if (getConfig().features.debug) return "This request came in via --no-auth mode. Global features.debug is ON, so capture should have fired — a missing trace points to a writer or middleware issue, not a debug-toggle issue.";
+		if (globalDebug) return "This request came in via --no-auth mode and global features.debug is ON, so capture should have fired — a missing trace points to a writer/middleware issue, not a debug toggle.";
 		return "This request came in via --no-auth mode and the global features.debug toggle is OFF. Enable Settings → Advanced → features.debug to capture --no-auth requests (per-key debug doesn't apply since there is no real key).";
 	}
+	if (globalDebug) return `Global features.debug is ON, so this request (key ${row?.label ?? keyId.slice(0, 8)}) should have been captured regardless of the per-key debug toggle. A missing trace points to a writer/middleware issue.`;
 	if (!row) return "The event's key no longer exists in this database — it may have been deleted, or the event was recorded by a different server instance writing to a different data directory.";
 	const labelDisplay = row.label ?? "(no label)";
 	if (row.revoked_at !== null) return `Key ${labelDisplay} is currently revoked.`;
-	if (row.debug_enabled !== 1) return `Key ${labelDisplay} currently has debug OFF — enable it on the Keys page, then re-run the request to capture future calls.`;
-	if (row.debug_expires_at !== null && row.debug_expires_at <= eventTs) return `Key ${labelDisplay} had debug enabled but the 24h TTL had already expired by the time of this request.`;
-	return `Key ${labelDisplay} currently has debug ON.`;
+	if (row.debug_enabled !== 1) return `Key ${labelDisplay} currently has debug OFF, and global features.debug is also OFF. Either enable per-key debug on the Keys page (just this key) or flip global features.debug in Settings → Advanced (every key).`;
+	if (row.debug_expires_at !== null && row.debug_expires_at <= eventTs) return `Key ${labelDisplay} had per-key debug enabled but the 24h TTL had already expired by the time of this request.`;
+	return `Key ${labelDisplay} currently has per-key debug ON.`;
 }
 function scanTraceFile(filePath, eventKeyId, eventTs) {
 	let raw;

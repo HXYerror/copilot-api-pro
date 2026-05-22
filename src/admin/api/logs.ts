@@ -335,16 +335,16 @@ function describeKeyDebugState(
   eventTs: number,
   keyId: string,
 ): string {
-  // --no-auth sentinel: not a real key, can't toggle per-key debug.
-  // Capture in --no-auth mode is gated entirely by the global
-  // features.debug switch.
+  const globalDebug = getConfig().features.debug
+
+  // --no-auth sentinel: no real key, no per-key toggle. Gate is the
+  // global features.debug switch.
   if (keyId === "__noauth__") {
-    const globalDebug = getConfig().features.debug
     if (globalDebug) {
       return (
-        `This request came in via --no-auth mode. Global features.debug`
-        + ` is ON, so capture should have fired — a missing trace points`
-        + ` to a writer or middleware issue, not a debug-toggle issue.`
+        `This request came in via --no-auth mode and global`
+        + ` features.debug is ON, so capture should have fired — a missing`
+        + ` trace points to a writer/middleware issue, not a debug toggle.`
       )
     }
     return (
@@ -354,6 +354,19 @@ function describeKeyDebugState(
       + ` doesn't apply since there is no real key).`
     )
   }
+
+  // Real keys: capture fires when EITHER global features.debug is on,
+  // OR the key has per-key debug active. Honour that in the message —
+  // if global is on, the per-key toggle is irrelevant.
+  if (globalDebug) {
+    const label = row?.label ?? keyId.slice(0, 8)
+    return (
+      `Global features.debug is ON, so this request (key ${label}) should`
+      + ` have been captured regardless of the per-key debug toggle. A`
+      + ` missing trace points to a writer/middleware issue.`
+    )
+  }
+
   if (!row) {
     return (
       `The event's key no longer exists in this database — it may have`
@@ -367,17 +380,19 @@ function describeKeyDebugState(
   }
   if (row.debug_enabled !== 1) {
     return (
-      `Key ${labelDisplay} currently has debug OFF — enable it on the`
-      + ` Keys page, then re-run the request to capture future calls.`
+      `Key ${labelDisplay} currently has debug OFF, and global`
+      + ` features.debug is also OFF. Either enable per-key debug on the`
+      + ` Keys page (just this key) or flip global features.debug in`
+      + ` Settings → Advanced (every key).`
     )
   }
   if (row.debug_expires_at !== null && row.debug_expires_at <= eventTs) {
     return (
-      `Key ${labelDisplay} had debug enabled but the 24h TTL had`
+      `Key ${labelDisplay} had per-key debug enabled but the 24h TTL had`
       + ` already expired by the time of this request.`
     )
   }
-  return `Key ${labelDisplay} currently has debug ON.`
+  return `Key ${labelDisplay} currently has per-key debug ON.`
 }
 
 interface TraceLookupDiagnostics {
