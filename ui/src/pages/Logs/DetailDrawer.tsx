@@ -30,6 +30,20 @@ interface DetailDrawerProps {
 
 type TabKey = "summary" | "request" | "response" | "metadata"
 
+interface NoCaptureBody {
+  reason?: string
+  key_diagnosis?: string
+  diagnostics?: Record<string, unknown>
+}
+
+function extractNoCaptureBody(
+  traceError: unknown,
+  noCapture: boolean,
+): NoCaptureBody | null {
+  if (!noCapture) return null
+  return (traceError as { body?: NoCaptureBody } | null)?.body ?? null
+}
+
 export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
   const [tab, setTab] = useState<TabKey>("summary")
   const [copied, setCopied] = useState<string | null>(null)
@@ -49,11 +63,7 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
     traceError !== null && (traceError as { status?: number }).status === 404
   // The 404 body carries diagnostic context (key still on debug?
   // wrong server? key revoked?) — pull it out for the drawer.
-  const noCaptureBody =
-    noCapture ?
-      ((traceError as { body?: { reason?: string; key_diagnosis?: string } })
-        .body ?? null)
-    : null
+  const noCaptureBody = extractNoCaptureBody(traceError, noCapture)
 
   async function copy(text: string, tag: string) {
     try {
@@ -83,6 +93,7 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
             noCapture={noCapture}
             noCaptureReason={noCaptureBody?.reason ?? null}
             noCaptureKeyDiag={noCaptureBody?.key_diagnosis ?? null}
+            noCaptureDiag={noCaptureBody?.diagnostics ?? null}
             copied={copied}
             onCopyCurl={(s) => void copy(s, "curl")}
           />
@@ -184,6 +195,7 @@ function SummaryTab({
   noCapture,
   noCaptureReason,
   noCaptureKeyDiag,
+  noCaptureDiag,
   copied,
   onCopyCurl,
 }: {
@@ -192,6 +204,7 @@ function SummaryTab({
   noCapture: boolean
   noCaptureReason: string | null
   noCaptureKeyDiag: string | null
+  noCaptureDiag: Record<string, unknown> | null
   copied: string | null
   onCopyCurl: (curl: string) => void
 }) {
@@ -235,6 +248,16 @@ function SummaryTab({
             <Text className="mt-1.5 text-xs text-tremor-content-subtle">
               {noCaptureReason}
             </Text>
+          )}
+          {noCaptureDiag && (
+            <details className="mt-3">
+              <summary className="cursor-pointer text-xs font-medium text-tremor-content-subtle hover:text-tremor-content-strong">
+                Trace lookup diagnostics
+              </summary>
+              <pre className="mt-2 mono text-xs whitespace-pre-wrap break-words rounded bg-tremor-background-muted p-2">
+                {JSON.stringify(noCaptureDiag, null, 2)}
+              </pre>
+            </details>
           )}
         </Card>
       )}

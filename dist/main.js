@@ -2274,7 +2274,73 @@ function describeKeyDebugState(row, eventTs) {
 	if (row.revoked_at !== null) return `Key ${labelDisplay} is currently revoked.`;
 	if (row.debug_enabled !== 1) return `Key ${labelDisplay} currently has debug OFF — enable it on the Keys page, then re-run the request to capture future calls.`;
 	if (row.debug_expires_at !== null && row.debug_expires_at <= eventTs) return `Key ${labelDisplay} had debug enabled but the 24h TTL had already expired by the time of this request.`;
-	return `Key ${labelDisplay} has debug ON now, but it was likely off when this request (at ${new Date(eventTs).toLocaleString()}) was served. Make a fresh request to capture a trace.`;
+	return `Key ${labelDisplay} currently has debug ON.`;
+}
+function scanTraceFile(filePath, eventKeyId, eventTs) {
+	let raw;
+	try {
+		raw = fs$1.readFileSync(filePath, "utf8");
+	} catch {
+		return {
+			best: null,
+			diag: {
+				file_size_bytes: null,
+				file_line_count: null,
+				lines_with_event_key: 0,
+				closest_delta_ms: null,
+				closest_line_ts: null,
+				best_match_within_2s: false
+			}
+		};
+	}
+	let lineCount = 0;
+	let linesWithKey = 0;
+	let best = null;
+	let bestDelta = Infinity;
+	let closestTs = null;
+	for (const line of raw.split("\n")) {
+		if (line.length === 0) continue;
+		lineCount++;
+		let parsed;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (parsed.key_id !== eventKeyId) continue;
+		linesWithKey++;
+		const delta = Math.abs((parsed.ts ?? 0) - eventTs);
+		if (delta < bestDelta) {
+			bestDelta = delta;
+			closestTs = parsed.ts ?? null;
+		}
+		if (delta <= 2e3 && (!best || delta < bestDelta)) best = parsed;
+	}
+	return {
+		best,
+		diag: {
+			file_size_bytes: raw.length,
+			file_line_count: lineCount,
+			lines_with_event_key: linesWithKey,
+			closest_delta_ms: bestDelta === Infinity ? null : bestDelta,
+			closest_line_ts: closestTs,
+			best_match_within_2s: best !== null
+		}
+	};
+}
+function diagnosticsToReason(d, keyDiag) {
+	const parts = [keyDiag];
+	parts.push(`retention.traces_days = ${d.traces_days}.`);
+	if (d.traces_days <= 0) parts.push(`Trace disk-write is DISABLED — Settings → Advanced → set traces_days > 0 to start persisting captures.`);
+	if (!d.file_exists) {
+		parts.push(`No trace file at ${d.file_path} for ${d.date_str}.`);
+		return parts.join(" ");
+	}
+	parts.push(`File exists (${d.file_size_bytes} bytes, ${d.file_line_count} lines).`, `${d.lines_with_event_key} line(s) match this key.`);
+	if (d.closest_delta_ms !== null) parts.push(`Closest line for this key is ${d.closest_delta_ms} ms away from the event ts (line ts ${d.closest_line_ts === null ? "?" : new Date(d.closest_line_ts).toISOString()}).`);
+	if (d.lines_with_event_key === 0) parts.push("→ Trace middleware almost certainly didn't fire for this request. Most likely: debug wasn't *effective* at request time, OR the route bypassed the trace middleware.");
+	else if (!d.best_match_within_2s) parts.push("→ Trace lines for this key exist but none within ±2s of the event. This is usually a clock-skew issue between the telemetry insert and the trace writer.");
+	return parts.join(" ");
 }
 logsRoute.get("/:id/trace", (c) => {
 	const idRaw = c.req.param("id");
@@ -2288,46 +2354,39 @@ logsRoute.get("/:id/trace", (c) => {
 	const keyDiag = describeKeyDebugState(keyRow, event.ts);
 	const dateStr = dateStrForTs(event.ts);
 	const filePath = path.join(tracesDir(), `traces-${dateStr}.jsonl`);
-	let raw;
-	try {
-		raw = fs$1.readFileSync(filePath, "utf8");
-	} catch {
-		return c.json({
-			error: "no_capture",
-			reason: `No trace file exists for ${dateStr}. ${keyDiag} Capture only fires when debug mode is on *at the moment* the request is served.`,
-			event,
-			key_diagnosis: keyDiag
-		}, 404);
-	}
-	let best = null;
-	let bestDelta = Infinity;
-	for (const line of raw.split("\n")) {
-		if (line.length === 0) continue;
-		let parsed;
-		try {
-			parsed = JSON.parse(line);
-		} catch {
-			continue;
+	const fileExists = fs$1.existsSync(filePath);
+	const { best, diag: scanDiag } = fileExists ? scanTraceFile(filePath, event.key_id, event.ts) : {
+		best: null,
+		diag: {
+			file_size_bytes: null,
+			file_line_count: null,
+			lines_with_event_key: 0,
+			closest_delta_ms: null,
+			closest_line_ts: null,
+			best_match_within_2s: false
 		}
-		if (parsed.key_id !== event.key_id) continue;
-		const delta = Math.abs((parsed.ts ?? 0) - event.ts);
-		if (delta > 2e3) continue;
-		if (delta < bestDelta) {
-			bestDelta = delta;
-			best = parsed;
-		}
-	}
-	if (!best) return c.json({
-		error: "no_capture",
-		reason: `Trace file ${dateStr} exists but no line matches event #${id} (key + ts within 2s). ${keyDiag} The most common cause is that debug was off when this exact request fired.`,
-		event,
-		key_diagnosis: keyDiag
-	}, 404);
-	return c.json({
+	};
+	const diagnostics = {
+		traces_dir: tracesDir(),
+		traces_days: getConfig().retention.traces_days,
+		date_str: dateStr,
+		file_path: filePath,
+		file_exists: fileExists,
+		...scanDiag
+	};
+	if (best) return c.json({
 		event,
 		trace: best,
-		file: `traces-${dateStr}.jsonl`
+		file: `traces-${dateStr}.jsonl`,
+		diagnostics
 	});
+	return c.json({
+		error: "no_capture",
+		reason: diagnosticsToReason(diagnostics, keyDiag),
+		event,
+		key_diagnosis: keyDiag,
+		diagnostics
+	}, 404);
 });
 
 //#endregion
