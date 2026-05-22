@@ -193,18 +193,32 @@ logsRoute.get("/", (c) => {
     .all()
     .map((r) => r.model)
 
-  // Keys that have ever served a request, joined with the keys table so
-  // the dropdown can show "lin_review (dff27cd3)" rather than just a UUID.
-  // Includes revoked keys — they still appear in historical logs and the
-  // operator needs to be able to filter on them.
-  const allKeys = db
+  // Key dropdown population. UNION of:
+  //   1. every key currently in the keys table (active + revoked) — so the
+  //      operator can filter by a freshly-created key BEFORE it has served
+  //      any requests, and
+  //   2. every distinct key_id that has actually served an event but no
+  //      longer exists in the keys table (orphan rows from deleted keys
+  //      whose historical events are still in the events table).
+  // Sorted in JS so the SQL stays portable across SQLite versions.
+  const allKeysRaw = db
     .query<{ id: string; label: string | null }, []>(
-      `SELECT DISTINCT e.key_id AS id, k.label AS label
+      `SELECT id, label FROM keys
+       UNION
+       SELECT DISTINCT e.key_id AS id, NULL AS label
          FROM events e
-         LEFT JOIN keys k ON k.id = e.key_id
-         ORDER BY COALESCE(k.label, e.key_id)`,
+         WHERE e.key_id NOT IN (SELECT id FROM keys)`,
     )
     .all()
+  const allKeys = allKeysRaw.slice().sort((a, b) => {
+    // Labelled keys first, then by label, then by id.
+    if (a.label !== null && b.label === null) return -1
+    if (a.label === null && b.label !== null) return 1
+    if (a.label !== null && b.label !== null) {
+      return a.label.localeCompare(b.label)
+    }
+    return a.id.localeCompare(b.id)
+  })
 
   // Per-kind totals, computed ignoring the current `kind` filter so the tab
   // badges always reflect the full counts under the *other* active filters

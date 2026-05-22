@@ -2209,10 +2209,16 @@ logsRoute.get("/", (c) => {
 		for (const r of labelRows) labelById.set(r.id, r.label);
 	}
 	const allModels = db.query("SELECT DISTINCT model FROM events WHERE model NOT LIKE '%/%' ORDER BY model").all().map((r) => r.model);
-	const allKeys = db.query(`SELECT DISTINCT e.key_id AS id, k.label AS label
+	const allKeys = db.query(`SELECT id, label FROM keys
+       UNION
+       SELECT DISTINCT e.key_id AS id, NULL AS label
          FROM events e
-         LEFT JOIN keys k ON k.id = e.key_id
-         ORDER BY COALESCE(k.label, e.key_id)`).all();
+         WHERE e.key_id NOT IN (SELECT id FROM keys)`).all().slice().sort((a, b) => {
+		if (a.label !== null && b.label === null) return -1;
+		if (a.label === null && b.label !== null) return 1;
+		if (a.label !== null && b.label !== null) return a.label.localeCompare(b.label);
+		return a.id.localeCompare(b.id);
+	});
 	const whereNoKind = buildWhere(c, { excludeKind: true });
 	const kindCountsRow = db.query(`SELECT
          SUM(CASE WHEN model NOT LIKE '%/%' THEN 1 ELSE 0 END) AS messages,
