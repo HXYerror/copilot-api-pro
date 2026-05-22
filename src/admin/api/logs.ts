@@ -333,7 +333,18 @@ function describeKeyDebugState(
     | undefined
     | null,
   eventTs: number,
+  keyId: string,
 ): string {
+  // --no-auth sentinel: not a real row, never in the keys table. Capture
+  // is wired on by default (auth.ts NO_AUTH_SENTINEL.debug_enabled = 1)
+  // so requests in this mode SHOULD have traces — say so.
+  if (keyId === "__noauth__") {
+    return (
+      `This request came in via --no-auth mode (no real key). Capture is`
+      + ` always on in that mode, so a missing trace points to a writer`
+      + ` issue, not a debug-toggle issue.`
+    )
+  }
   if (!row) {
     return (
       `The event's key no longer exists in this database — it may have`
@@ -518,7 +529,7 @@ logsRoute.get("/:id/trace", (c) => {
          FROM keys WHERE id = ?`,
     )
     .get(event.key_id)
-  const keyDiag = describeKeyDebugState(keyRow, event.ts)
+  const keyDiag = describeKeyDebugState(keyRow, event.ts, event.key_id)
 
   const dateStr = dateStrForTs(event.ts)
   const filePath = path.join(tracesDir(), `traces-${dateStr}.jsonl`)

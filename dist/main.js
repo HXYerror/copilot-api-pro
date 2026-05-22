@@ -2268,7 +2268,8 @@ function dateStrForTs(ts) {
 	const day = String(d.getDate()).padStart(2, "0");
 	return `${y}-${m}-${day}`;
 }
-function describeKeyDebugState(row, eventTs) {
+function describeKeyDebugState(row, eventTs, keyId) {
+	if (keyId === "__noauth__") return "This request came in via --no-auth mode (no real key). Capture is always on in that mode, so a missing trace points to a writer issue, not a debug-toggle issue.";
 	if (!row) return "The event's key no longer exists in this database — it may have been deleted, or the event was recorded by a different server instance writing to a different data directory.";
 	const labelDisplay = row.label ?? "(no label)";
 	if (row.revoked_at !== null) return `Key ${labelDisplay} is currently revoked.`;
@@ -2351,7 +2352,7 @@ logsRoute.get("/:id/trace", (c) => {
 	if (!event) return c.json({ error: "Event not found" }, 404);
 	const keyRow = db.query(`SELECT label, debug_enabled, debug_expires_at, revoked_at
          FROM keys WHERE id = ?`).get(event.key_id);
-	const keyDiag = describeKeyDebugState(keyRow, event.ts);
+	const keyDiag = describeKeyDebugState(keyRow, event.ts, event.key_id);
 	const dateStr = dateStrForTs(event.ts);
 	const filePath = path.join(tracesDir(), `traces-${dateStr}.jsonl`);
 	const fileExists = fs$1.existsSync(filePath);
@@ -5579,7 +5580,8 @@ const NO_AUTH_SENTINEL = {
 	label: null,
 	allowed_models: "[\"*\"]",
 	rate_limit_override: null,
-	debug_enabled: 0,
+	debug_enabled: 1,
+	debug_expires_at: null,
 	created_at: 0,
 	revoked_at: null
 };
