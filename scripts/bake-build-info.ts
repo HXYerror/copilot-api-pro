@@ -32,11 +32,31 @@ const pkg = JSON.parse(
   await fs.readFile(path.join(repoRoot, "package.json")),
 ) as { version: string }
 
+const branch = git(["rev-parse", "--abbrev-ref", "HEAD"])
+const commit = git(["rev-parse", "--short", "HEAD"])
+const commitTime = git(["log", "-1", "--format=%cI"])
+
+// Refuse to clobber an existing build-info.json when git isn't available
+// (bunx install from a tarball / tmp dir has no .git — `prepare` would
+// otherwise overwrite the committed identity with empty fields and leave
+// operators staring at "v0.8.0 ·up 31s" again).
+if (!commit) {
+  try {
+    await fs.access(outPath)
+    console.log(
+      `[bake-build-info] no git available; keeping existing ${outPath}`,
+    )
+    process.exit(0)
+  } catch {
+    // No existing file either — fall through and write what we have.
+  }
+}
+
 const info = {
   version: pkg.version,
-  branch: git(["rev-parse", "--abbrev-ref", "HEAD"]) || undefined,
-  commit: git(["rev-parse", "--short", "HEAD"]) || undefined,
-  commit_time: git(["log", "-1", "--format=%cI"]) || undefined,
+  branch: branch || undefined,
+  commit: commit || undefined,
+  commit_time: commitTime || undefined,
 }
 
 await fs.mkdir(distDir, { recursive: true })
