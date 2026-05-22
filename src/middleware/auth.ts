@@ -40,12 +40,11 @@ const NO_AUTH_SENTINEL: KeyRow = {
   label: null,
   allowed_models: '["*"]',
   rate_limit_override: null,
-  // --no-auth is a debugging / loopback mode by design. Operators who
-  // pass --no-auth want full visibility, so the sentinel ships with
-  // debug ON — trace middleware will capture every proxied request.
-  // (In production, --no-auth is gated by the non-loopback acknowledgement
-  // flag, so this isn't a foot-gun for accidentally-exposed deploys.)
-  debug_enabled: 1,
+  // Sentinel is NOT a real key — it can't toggle per-key debug. Capture
+  // in --no-auth mode is decided by the global `features.debug` toggle
+  // in Settings → Advanced. shouldCapture() checks that gate first, so
+  // operators can opt in / out at the global level.
+  debug_enabled: 0,
   debug_expires_at: null,
   created_at: 0,
   revoked_at: null,

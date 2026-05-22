@@ -2269,7 +2269,10 @@ function dateStrForTs(ts) {
 	return `${y}-${m}-${day}`;
 }
 function describeKeyDebugState(row, eventTs, keyId) {
-	if (keyId === "__noauth__") return "This request came in via --no-auth mode (no real key). Capture is always on in that mode, so a missing trace points to a writer issue, not a debug-toggle issue.";
+	if (keyId === "__noauth__") {
+		if (getConfig().features.debug) return "This request came in via --no-auth mode. Global features.debug is ON, so capture should have fired — a missing trace points to a writer or middleware issue, not a debug-toggle issue.";
+		return "This request came in via --no-auth mode and the global features.debug toggle is OFF. Enable Settings → Advanced → features.debug to capture --no-auth requests (per-key debug doesn't apply since there is no real key).";
+	}
 	if (!row) return "The event's key no longer exists in this database — it may have been deleted, or the event was recorded by a different server instance writing to a different data directory.";
 	const labelDisplay = row.label ?? "(no label)";
 	if (row.revoked_at !== null) return `Key ${labelDisplay} is currently revoked.`;
@@ -2367,9 +2370,11 @@ logsRoute.get("/:id/trace", (c) => {
 			best_match_within_2s: false
 		}
 	};
+	const cfg = getConfig();
 	const diagnostics = {
 		traces_dir: tracesDir(),
-		traces_days: getConfig().retention.traces_days,
+		traces_days: cfg.retention.traces_days,
+		features_debug: cfg.features.debug,
 		date_str: dateStr,
 		file_path: filePath,
 		file_exists: fileExists,
@@ -5580,7 +5585,7 @@ const NO_AUTH_SENTINEL = {
 	label: null,
 	allowed_models: "[\"*\"]",
 	rate_limit_override: null,
-	debug_enabled: 1,
+	debug_enabled: 0,
 	debug_expires_at: null,
 	created_at: 0,
 	revoked_at: null

@@ -335,14 +335,23 @@ function describeKeyDebugState(
   eventTs: number,
   keyId: string,
 ): string {
-  // --no-auth sentinel: not a real row, never in the keys table. Capture
-  // is wired on by default (auth.ts NO_AUTH_SENTINEL.debug_enabled = 1)
-  // so requests in this mode SHOULD have traces — say so.
+  // --no-auth sentinel: not a real key, can't toggle per-key debug.
+  // Capture in --no-auth mode is gated entirely by the global
+  // features.debug switch.
   if (keyId === "__noauth__") {
+    const globalDebug = getConfig().features.debug
+    if (globalDebug) {
+      return (
+        `This request came in via --no-auth mode. Global features.debug`
+        + ` is ON, so capture should have fired — a missing trace points`
+        + ` to a writer or middleware issue, not a debug-toggle issue.`
+      )
+    }
     return (
-      `This request came in via --no-auth mode (no real key). Capture is`
-      + ` always on in that mode, so a missing trace points to a writer`
-      + ` issue, not a debug-toggle issue.`
+      `This request came in via --no-auth mode and the global`
+      + ` features.debug toggle is OFF. Enable Settings → Advanced →`
+      + ` features.debug to capture --no-auth requests (per-key debug`
+      + ` doesn't apply since there is no real key).`
     )
   }
   if (!row) {
@@ -374,6 +383,7 @@ function describeKeyDebugState(
 interface TraceLookupDiagnostics {
   traces_dir: string
   traces_days: number
+  features_debug: boolean
   date_str: string
   file_path: string
   file_exists: boolean
@@ -549,9 +559,11 @@ logsRoute.get("/:id/trace", (c) => {
         },
       }
 
+  const cfg = getConfig()
   const diagnostics: TraceLookupDiagnostics = {
     traces_dir: tracesDir(),
-    traces_days: getConfig().retention.traces_days,
+    traces_days: cfg.retention.traces_days,
+    features_debug: cfg.features.debug,
     date_str: dateStr,
     file_path: filePath,
     file_exists: fileExists,
