@@ -69,7 +69,22 @@ async function computeBuildIdentity(): Promise<BuildIdentity> {
     }
   }
 
-  // git — best effort; only run when we found a repo root.
+  // First preference: a build-info.json shipped next to the bundled
+  // dist/main.js. Written at build time so installs via `bunx github:...`
+  // (which clone to a tmp dir without `.git`) still know the commit.
+  const baked = await readBakedBuildInfo()
+  if (baked) {
+    return {
+      version: baked.version || version,
+      branch: baked.branch,
+      commit: baked.commit,
+      commit_time: baked.commit_time,
+      started_at: STARTED_AT,
+    }
+  }
+
+  // Second preference: live `git` against the repo we're running from
+  // (only works when invoked via `bun src/main.ts` from a checkout).
   let branch: string | null = null
   let commit: string | null = null
   let commitTime: string | null = null
@@ -86,6 +101,35 @@ async function computeBuildIdentity(): Promise<BuildIdentity> {
     commit_time: commitTime || undefined,
     started_at: STARTED_AT,
   }
+}
+
+interface BakedBuildInfo {
+  version?: string
+  branch?: string
+  commit?: string
+  commit_time?: string
+}
+
+async function readBakedBuildInfo(): Promise<BakedBuildInfo | null> {
+  // Look for build-info.json next to this module's bundled output. We try
+  // a couple of candidate locations because tsdown bundles all source
+  // files into a single dist/main.js — `import.meta.url` will be that
+  // file, so dist/build-info.json sits in the same directory.
+  const here = path.dirname(new URL(import.meta.url).pathname)
+  const candidates = [
+    path.join(here, "build-info.json"),
+    path.join(here, "..", "build-info.json"),
+    path.join(here, "..", "dist", "build-info.json"),
+  ]
+  for (const p of candidates) {
+    try {
+      const raw = await fs.readFile(p)
+      return JSON.parse(raw) as BakedBuildInfo
+    } catch {
+      continue
+    }
+  }
+  return null
 }
 
 function runGit(args: Array<string>, cwd: string): string | null {

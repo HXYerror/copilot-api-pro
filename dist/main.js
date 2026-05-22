@@ -2361,6 +2361,14 @@ async function computeBuildIdentity() {
 	if (repoRoot) try {
 		version = JSON.parse(await fs.readFile(path.join(repoRoot, "package.json"))).version;
 	} catch {}
+	const baked = await readBakedBuildInfo();
+	if (baked) return {
+		version: baked.version || version,
+		branch: baked.branch,
+		commit: baked.commit,
+		commit_time: baked.commit_time,
+		started_at: STARTED_AT
+	};
 	let branch = null;
 	let commit = null;
 	let commitTime = null;
@@ -2388,6 +2396,21 @@ async function computeBuildIdentity() {
 		commit_time: commitTime || void 0,
 		started_at: STARTED_AT
 	};
+}
+async function readBakedBuildInfo() {
+	const here = path.dirname(new URL(import.meta.url).pathname);
+	const candidates = [
+		path.join(here, "build-info.json"),
+		path.join(here, "..", "build-info.json"),
+		path.join(here, "..", "dist", "build-info.json")
+	];
+	for (const p of candidates) try {
+		const raw = await fs.readFile(p);
+		return JSON.parse(raw);
+	} catch {
+		continue;
+	}
+	return null;
 }
 function runGit(args, cwd) {
 	try {

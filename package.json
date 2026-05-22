@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "build": "bun run build:server && bun run build:ui",
-    "build:server": "bun ./node_modules/tsdown/dist/run.mjs",
+    "build:server": "bun ./node_modules/tsdown/dist/run.mjs && bun run scripts/bake-build-info.ts",
     "build:ui": "bun install --cwd ui && bun run --cwd ui build",
     "dev": "bun run --watch ./src/main.ts",
     "dev:ui": "bun run --cwd ui dev",
