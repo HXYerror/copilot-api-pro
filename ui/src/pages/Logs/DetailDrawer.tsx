@@ -6,6 +6,7 @@ import { Link } from "react-router-dom"
 import type { FullTraceResponse, LogEntry, TraceLeg } from "~/api/types"
 
 import { api } from "~/api/client"
+import { copyToClipboard } from "~/api/clipboard"
 import {
   extractKeyMetrics,
   KpiBar,
@@ -66,12 +67,10 @@ export function DetailDrawer({ entry, onClose }: DetailDrawerProps) {
   const noCaptureBody = extractNoCaptureBody(traceError, noCapture)
 
   async function copy(text: string, tag: string) {
-    try {
-      await navigator.clipboard.writeText(text)
+    const ok = await copyToClipboard(text)
+    if (ok) {
       setCopied(tag)
       globalThis.setTimeout(() => setCopied(null), 1500)
-    } catch {
-      // ignore
     }
   }
 

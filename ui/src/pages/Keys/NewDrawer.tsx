@@ -1,9 +1,11 @@
-import { Button, Card, TextInput } from "@tremor/react"
 import { useMutation } from "@tanstack/react-query"
+import { Button, Card, TextInput } from "@tremor/react"
 import { useEffect, useState } from "react"
 
-import { api } from "~/api/client"
 import type { KeyCreateResponse } from "~/api/types"
+
+import { api } from "~/api/client"
+import { copyToClipboard } from "~/api/clipboard"
 
 interface NewKeyDrawerProps {
   open: boolean
@@ -59,19 +61,17 @@ export function NewKeyDrawer({ open, onClose, onCreated }: NewKeyDrawerProps) {
   if (!open) return null
 
   const error =
-    createMutation.error instanceof Error ?
-      createMutation.error.message
-    : null
+    createMutation.error instanceof Error ? createMutation.error.message : null
 
   async function copyPlain() {
     if (!created) return
-    try {
-      await navigator.clipboard.writeText(created.plain)
+    const ok = await copyToClipboard(created.plain)
+    if (ok) {
       setCopyOk(true)
-      window.setTimeout(() => setCopyOk(false), 1500)
-    } catch {
-      // clipboard rejected — leave UI as-is, the value is still selectable
+      globalThis.setTimeout(() => setCopyOk(false), 1500)
     }
+    // If clipboard rejected, leave UI as-is — the value is still selectable
+    // in the monospace box above the button.
   }
 
   return (
@@ -106,10 +106,7 @@ export function NewKeyDrawer({ open, onClose, onCreated }: NewKeyDrawerProps) {
               <div className="mt-3 break-all rounded-tremor-small bg-tremor-background-muted p-3 mono text-xs text-tremor-content-strong">
                 {created.plain}
               </div>
-              <Button
-                className="mt-3"
-                onClick={() => void copyPlain()}
-              >
+              <Button className="mt-3" onClick={() => void copyPlain()}>
                 {copyOk ? "Copied!" : "Copy to clipboard"}
               </Button>
             </Card>
@@ -169,9 +166,7 @@ export function NewKeyDrawer({ open, onClose, onCreated }: NewKeyDrawerProps) {
               </label>
               <select
                 value={tier}
-                onChange={(e) =>
-                  setTier(e.target.value as "admin" | "client")
-                }
+                onChange={(e) => setTier(e.target.value as "admin" | "client")}
                 className="mt-1 w-full rounded-tremor-small border border-tremor-border bg-tremor-background px-3 py-2 text-sm"
               >
                 <option value="client">Client</option>
@@ -221,8 +216,7 @@ export function NewKeyDrawer({ open, onClose, onCreated }: NewKeyDrawerProps) {
                 <>
                   <p className="text-xs text-tremor-content-subtle">
                     Debug mode captures full upstream request/response bodies to
-                    disk. Use sparingly — never on production traffic with
-                    PII.
+                    disk. Use sparingly — never on production traffic with PII.
                   </p>
                   <label className="flex items-center gap-2 text-xs">
                     <input
