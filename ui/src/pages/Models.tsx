@@ -325,6 +325,14 @@ function VendorCell({ caps }: { caps: Record<string, unknown> | null }) {
   )
 }
 
+function shortLimitLabel(k: string): string {
+  if (k === "max_context_window_tokens") return "ctx"
+  if (k === "max_output_tokens") return "out"
+  if (k === "max_prompt_tokens") return "prompt"
+  if (k === "max_non_streaming_output_tokens") return "ns-out"
+  return k
+}
+
 function LimitsCell({
   caps,
   limits,
@@ -335,22 +343,28 @@ function LimitsCell({
   if (!caps) {
     return <td className="px-4 py-2 text-xs text-tremor-content">—</td>
   }
-  const ctx = limits.max_context_window_tokens as number | undefined
-  const out = limits.max_output_tokens as number | undefined
-  const promptCap = limits.max_prompt_tokens as number | undefined
+  // Surface every numeric token-limit field Copilot returns under `limits`
+  // (excluding vision/image-count knobs). Models the operator hasn't seen
+  // before will surface new fields without a code change.
+  const numericLimits = Object.entries(limits)
+    .filter(
+      ([k, v]) =>
+        typeof v === "number"
+        && k !== "max_prompt_image_size"
+        && k !== "max_prompt_images"
+        && k !== "max_inputs",
+    )
+    .map(([k, v]) => [k, v as number] as const)
   return (
     <td className="px-4 py-2 text-xs text-tremor-content">
-      <div>
-        <span className="text-tremor-content-subtle">ctx</span> {fmtTokens(ctx)}
-      </div>
-      <div>
-        <span className="text-tremor-content-subtle">out</span> {fmtTokens(out)}
-      </div>
-      {promptCap !== undefined && (
-        <div className="text-tremor-content-subtle">
-          prompt {fmtTokens(promptCap)}
+      {numericLimits.map(([k, v]) => (
+        <div key={k}>
+          <span className="text-tremor-content-subtle">
+            {shortLimitLabel(k)}
+          </span>{" "}
+          {fmtTokens(v)}
         </div>
-      )}
+      ))}
     </td>
   )
 }

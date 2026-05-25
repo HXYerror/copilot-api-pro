@@ -731,8 +731,8 @@ function CatalogPanel({ catalog, draft, onUseAlias }: CatalogPanelProps) {
           <Title>Copilot upstream catalog</Title>
           <Text>
             Live model list reported by GitHub Copilot at startup. Read-only.
-            Use the "Use as alias" button to start a new alias row in the
-            Models tab; the alias defaults to the upstream id but is editable.
+            Use the "Use as alias" button to start a new alias row in the Models
+            tab; the alias defaults to the upstream id but is editable.
           </Text>
         </div>
         <div className="flex items-center gap-2">
@@ -853,8 +853,21 @@ function CatalogRow({
   }
   const limits = (caps.limits ?? {}) as Record<string, unknown>
   const supports = (caps.supports ?? {}) as Record<string, unknown>
-  const ctx = limits.max_context_window_tokens as number | undefined
-  const out = limits.max_output_tokens as number | undefined
+  // Surface every numeric token-limit field Copilot returns — VS Code
+  // shows a different "max context" than max_context_window_tokens for
+  // some models (e.g. gpt-5.5 advertises 2M context but the API returns
+  // 1.1M under max_context_window_tokens, with the bigger value living
+  // in another key like max_prompt_tokens). Listing all numeric limits
+  // lets operators see exactly what Copilot reports.
+  const numericLimits = Object.entries(limits)
+    .filter(
+      ([k, v]) =>
+        typeof v === "number"
+        && k !== "max_prompt_image_size"
+        && k !== "max_prompt_images"
+        && k !== "max_inputs",
+    )
+    .map(([k, v]) => [k, v as number] as const)
   const minThink = supports.min_thinking_budget as number | undefined
   const maxThink = supports.max_thinking_budget as number | undefined
   const adaptiveThink = supports.adaptive_thinking === true
@@ -905,14 +918,22 @@ function CatalogRow({
             )}
         </td>
         <td className="px-3 py-2 text-xs text-tremor-content">
-          <div>
-            <span className="text-tremor-content-subtle">ctx</span>{" "}
-            {fmtTokens(ctx)}
-          </div>
-          <div>
-            <span className="text-tremor-content-subtle">out</span>{" "}
-            {fmtTokens(out)}
-          </div>
+          {numericLimits.map(([k, v]) => (
+            <div key={k}>
+              <span className="text-tremor-content-subtle">
+                {k === "max_context_window_tokens" ?
+                  "ctx"
+                : k === "max_output_tokens" ?
+                  "out"
+                : k === "max_prompt_tokens" ?
+                  "prompt"
+                : k === "max_non_streaming_output_tokens" ?
+                  "ns-out"
+                : k}
+              </span>{" "}
+              {fmtTokens(v)}
+            </div>
+          ))}
         </td>
         <td className="px-3 py-2 text-xs">
           {maxThink !== undefined ?
