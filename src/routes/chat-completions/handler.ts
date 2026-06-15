@@ -140,7 +140,16 @@ export async function handleCompletion(
       clientAlias !== payload.model ?
         clientAlias
       : resolveUpstream(response.model, models)
-    return c.json({ ...response, model: egressModel })
+    // Backfill OpenAI-spec required fields that Copilot upstream sometimes
+    // omits. The `object` field is REQUIRED by clients that strict-validate
+    // against the OpenAI schema (Vercel AI SDK, instructor, etc) — without
+    // it those SDKs error out with shape mismatch.
+    return c.json({
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      ...response,
+      model: egressModel,
+    })
   }
 
   consola.debug("Streaming response")
@@ -207,9 +216,10 @@ interface RewriteCtx {
 }
 
 /**
- * Rewrite the `model` field in a single SSE chunk's `data` payload.
- * Returns the chunk unchanged if `data` is not parseable JSON or has no
- * top-level `model` field.  Never touches nested JSON (tool-call arguments).
+ * Rewrite the `model` field in a single SSE chunk's `data` payload, and
+ * backfill OpenAI-spec `object: "chat.completion.chunk"` + `created` when
+ * Copilot upstream omits them. Returns the chunk unchanged if `data` is
+ * not parseable JSON. Never touches nested JSON (tool-call arguments).
  */
 function rewriteChunkModel(chunk: SSEMessage, ctx: RewriteCtx): SSEMessage {
   const data = chunk.data
@@ -222,23 +232,29 @@ function rewriteChunkModel(chunk: SSEMessage, ctx: RewriteCtx): SSEMessage {
     return chunk
   }
 
-  if (
-    typeof parsed !== "object"
-    || parsed === null
-    || !Object.hasOwn(parsed, "model")
-  ) {
-    return chunk
-  }
+  if (typeof parsed !== "object" || parsed === null) return chunk
+  const obj = parsed as Record<string, unknown>
 
-  const { clientAlias, upstreamModel, models } = ctx
-  const egressModel =
-    clientAlias !== upstreamModel ? clientAlias : (
-      resolveUpstream((parsed as { model: string }).model, models)
-    )
+  // Only rewrite `model` when upstream included one. Backfill the OpenAI
+  // schema fields regardless — clients that strict-validate need them on
+  // every chunk.
+  let model: unknown = obj["model"]
+  if (typeof model === "string") {
+    const { clientAlias, upstreamModel, models } = ctx
+    model =
+      clientAlias !== upstreamModel ? clientAlias : (
+        resolveUpstream(model, models)
+      )
+  }
 
   return {
     ...chunk,
-    data: JSON.stringify({ ...parsed, model: egressModel }),
+    data: JSON.stringify({
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      ...obj,
+      ...(typeof model === "string" ? { model } : {}),
+    }),
   }
 }
 

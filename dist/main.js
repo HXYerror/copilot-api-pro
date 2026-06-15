@@ -6884,6 +6884,8 @@ async function handleCompletion$1(c) {
 		c.set("usage", readCopilotUsage(response));
 		const egressModel = clientAlias !== payload.model ? clientAlias : resolveUpstream(response.model, models);
 		return c.json({
+			object: "chat.completion",
+			created: Math.floor(Date.now() / 1e3),
 			...response,
 			model: egressModel
 		});
@@ -6921,9 +6923,10 @@ function maybeStashUsageFromChunk(c, chunk) {
 	if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0 || u.cache_read_tokens !== void 0 || u.cache_creation_tokens !== void 0) c.set("usage", u);
 }
 /**
-* Rewrite the `model` field in a single SSE chunk's `data` payload.
-* Returns the chunk unchanged if `data` is not parseable JSON or has no
-* top-level `model` field.  Never touches nested JSON (tool-call arguments).
+* Rewrite the `model` field in a single SSE chunk's `data` payload, and
+* backfill OpenAI-spec `object: "chat.completion.chunk"` + `created` when
+* Copilot upstream omits them. Returns the chunk unchanged if `data` is
+* not parseable JSON. Never touches nested JSON (tool-call arguments).
 */
 function rewriteChunkModel(chunk, ctx) {
 	const data = chunk.data;
@@ -6934,14 +6937,20 @@ function rewriteChunkModel(chunk, ctx) {
 	} catch {
 		return chunk;
 	}
-	if (typeof parsed !== "object" || parsed === null || !Object.hasOwn(parsed, "model")) return chunk;
-	const { clientAlias, upstreamModel, models } = ctx;
-	const egressModel = clientAlias !== upstreamModel ? clientAlias : resolveUpstream(parsed.model, models);
+	if (typeof parsed !== "object" || parsed === null) return chunk;
+	const obj = parsed;
+	let model = obj["model"];
+	if (typeof model === "string") {
+		const { clientAlias, upstreamModel, models } = ctx;
+		model = clientAlias !== upstreamModel ? clientAlias : resolveUpstream(model, models);
+	}
 	return {
 		...chunk,
 		data: JSON.stringify({
-			...parsed,
-			model: egressModel
+			object: "chat.completion.chunk",
+			created: Math.floor(Date.now() / 1e3),
+			...obj,
+			...typeof model === "string" ? { model } : {}
 		})
 	};
 }
