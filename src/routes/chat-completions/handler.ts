@@ -12,6 +12,7 @@ import { readCopilotUsage } from "~/lib/copilot-usage"
 import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
+import { withKeepalive } from "~/lib/sse-keepalive"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
@@ -154,25 +155,28 @@ export async function handleCompletion(
 
   consola.debug("Streaming response")
   return streamSSE(c, async (stream) => {
-    for await (const chunk of response) {
-      consola.debug("Streaming chunk:", JSON.stringify(chunk))
+    await withKeepalive(stream, async (touch) => {
+      for await (const chunk of response) {
+        consola.debug("Streaming chunk:", JSON.stringify(chunk))
 
-      // Telemetry (issue #34): inspect every chunk for a top-level `usage`
-      // field. When `stream_options.include_usage = true` is honored, the
-      // terminal chunk carries it; older models may never emit it (in which
-      // case the middleware records usage_unknown=1).
-      maybeStashUsageFromChunk(c, chunk as SSEMessage)
+        // Telemetry (issue #34): inspect every chunk for a top-level `usage`
+        // field. When `stream_options.include_usage = true` is honored, the
+        // terminal chunk carries it; older models may never emit it (in which
+        // case the middleware records usage_unknown=1).
+        maybeStashUsageFromChunk(c, chunk as SSEMessage)
 
-      // Egress SSE rewrite: parse event data and rewrite the model field.
-      // Only rewrite on structured JSON chunks — skip [DONE] sentinel and
-      // any non-JSON data verbatim to avoid corrupting tool-call arguments.
-      const rewritten = rewriteChunkModel(chunk as SSEMessage, {
-        clientAlias,
-        upstreamModel: payload.model,
-        models,
-      })
-      await stream.writeSSE(rewritten)
-    }
+        // Egress SSE rewrite: parse event data and rewrite the model field.
+        // Only rewrite on structured JSON chunks — skip [DONE] sentinel and
+        // any non-JSON data verbatim to avoid corrupting tool-call arguments.
+        const rewritten = rewriteChunkModel(chunk as SSEMessage, {
+          clientAlias,
+          upstreamModel: payload.model,
+          models,
+        })
+        await stream.writeSSE(rewritten)
+        touch()
+      }
+    })
   })
 }
 

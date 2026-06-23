@@ -10,6 +10,7 @@ import { getConfig } from "~/lib/config-store"
 import { readCopilotUsage } from "~/lib/copilot-usage"
 import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
 import { checkRateLimit } from "~/lib/rate-limit"
+import { withKeepalive } from "~/lib/sse-keepalive"
 import { state } from "~/lib/state"
 import { isModelAllowed } from "~/middleware/auth"
 import {
@@ -130,17 +131,20 @@ function streamResponsesEvents(
     c,
     async (stream) => {
       try {
-        for await (const rawEvent of response as AsyncIterable<{
-          data?: string
-          event?: string
-        }>) {
-          if (!rawEvent.data) continue
-          const forwardData = sanitiseSseDataIfPossible(rawEvent.data)
-          await stream.writeSSE({
-            event: rawEvent.event,
-            data: forwardData,
-          })
-        }
+        await withKeepalive(stream, async (touch) => {
+          for await (const rawEvent of response as AsyncIterable<{
+            data?: string
+            event?: string
+          }>) {
+            if (!rawEvent.data) continue
+            const forwardData = sanitiseSseDataIfPossible(rawEvent.data)
+            await stream.writeSSE({
+              event: rawEvent.event,
+              data: forwardData,
+            })
+            touch()
+          }
+        })
       } catch (err) {
         // Upstream iterator threw mid-stream (TCP reset, 5xx after some events,
         // events() helper internal error). Forward a generic error event so

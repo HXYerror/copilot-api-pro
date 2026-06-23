@@ -6583,6 +6583,28 @@ function isResponsesOnlyModel(modelId) {
 }
 
 //#endregion
+//#region src/lib/sse-keepalive.ts
+const SILENCE_BEFORE_KEEPALIVE_MS = 1e4;
+const KEEPALIVE_POLL_MS = 5e3;
+async function withKeepalive(stream, body) {
+	let lastWrite = Date.now();
+	const touch = () => {
+		lastWrite = Date.now();
+	};
+	const heartbeat = setInterval(() => {
+		if (Date.now() - lastWrite > SILENCE_BEFORE_KEEPALIVE_MS) {
+			stream.write(": keepalive\n\n").catch(() => {});
+			lastWrite = Date.now();
+		}
+	}, KEEPALIVE_POLL_MS);
+	try {
+		await body(touch);
+	} finally {
+		clearInterval(heartbeat);
+	}
+}
+
+//#endregion
 //#region src/lib/tokenizer.ts
 const ENCODING_MAP = {
 	o200k_base: () => import("gpt-tokenizer/encoding/o200k_base"),
@@ -6892,16 +6914,19 @@ async function handleCompletion$1(c) {
 	}
 	consola.debug("Streaming response");
 	return streamSSE(c, async (stream) => {
-		for await (const chunk of response) {
-			consola.debug("Streaming chunk:", JSON.stringify(chunk));
-			maybeStashUsageFromChunk(c, chunk);
-			const rewritten = rewriteChunkModel(chunk, {
-				clientAlias,
-				upstreamModel: payload.model,
-				models
-			});
-			await stream.writeSSE(rewritten);
-		}
+		await withKeepalive(stream, async (touch) => {
+			for await (const chunk of response) {
+				consola.debug("Streaming chunk:", JSON.stringify(chunk));
+				maybeStashUsageFromChunk(c, chunk);
+				const rewritten = rewriteChunkModel(chunk, {
+					clientAlias,
+					upstreamModel: payload.model,
+					models
+				});
+				await stream.writeSSE(rewritten);
+				touch();
+			}
+		});
 	});
 }
 /**
@@ -8744,21 +8769,24 @@ async function handleNative(c, payload, clientAlias) {
 		let inputTokens;
 		let outputTokens;
 		try {
-			for await (const rawEvent of response) {
-				if (!rawEvent.data) continue;
-				await stream.writeSSE({
-					event: rawEvent.event,
-					data: rawEvent.data
-				});
-				if (rawEvent.data === "[DONE]") continue;
-				try {
-					const parsed = JSON.parse(rawEvent.data);
-					consola.debug("Native SSE event:", parsed.type);
-					[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [inputTokens, outputTokens]);
-				} catch {
-					consola.warn("Could not parse native SSE chunk for logging:", rawEvent.data.slice(0, 200));
+			await withKeepalive(stream, async (touch) => {
+				for await (const rawEvent of response) {
+					if (!rawEvent.data) continue;
+					await stream.writeSSE({
+						event: rawEvent.event,
+						data: rawEvent.data
+					});
+					touch();
+					if (rawEvent.data === "[DONE]") continue;
+					try {
+						const parsed = JSON.parse(rawEvent.data);
+						consola.debug("Native SSE event:", parsed.type);
+						[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [inputTokens, outputTokens]);
+					} catch {
+						consola.warn("Could not parse native SSE chunk for logging:", rawEvent.data.slice(0, 200));
+					}
 				}
-			}
+			});
 		} catch (err) {
 			consola.error("Native Anthropic SSE iteration failed:", err);
 			try {
@@ -8862,28 +8890,31 @@ async function handleTranslated(c, anthropicPayload, clientAlias) {
 			toolCalls: {}
 		};
 		try {
-			for await (const rawEvent of response) {
-				consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent));
-				if (rawEvent.data === "[DONE]") break;
-				if (!rawEvent.data) continue;
-				let chunk;
-				try {
-					chunk = JSON.parse(rawEvent.data);
-				} catch (parseErr) {
-					consola.warn(`[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`, rawEvent.data.slice(0, 200));
-					continue;
+			await withKeepalive(stream, async (touch) => {
+				for await (const rawEvent of response) {
+					consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent));
+					if (rawEvent.data === "[DONE]") break;
+					if (!rawEvent.data) continue;
+					let chunk;
+					try {
+						chunk = JSON.parse(rawEvent.data);
+					} catch (parseErr) {
+						consola.warn(`[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`, rawEvent.data.slice(0, 200));
+						continue;
+					}
+					const u = readCopilotUsage(chunk);
+					if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0) c.set("usage", u);
+					const events$1 = translateChunkToAnthropicEvents(chunk, streamState);
+					for (const event of events$1) {
+						consola.debug("Translated Anthropic event:", JSON.stringify(event));
+						await stream.writeSSE({
+							event: event.type,
+							data: JSON.stringify(event)
+						});
+						touch();
+					}
 				}
-				const u = readCopilotUsage(chunk);
-				if (u.prompt_tokens !== void 0 || u.completion_tokens !== void 0) c.set("usage", u);
-				const events$1 = translateChunkToAnthropicEvents(chunk, streamState);
-				for (const event of events$1) {
-					consola.debug("Translated Anthropic event:", JSON.stringify(event));
-					await stream.writeSSE({
-						event: event.type,
-						data: JSON.stringify(event)
-					});
-				}
-			}
+			});
 		} catch (err) {
 			consola.error("Translated /v1/messages SSE iteration failed:", err);
 			try {
@@ -8946,25 +8977,28 @@ function streamResponsesAsAnthropic(c, payload, defaultEffort) {
 			let inputTokens;
 			let outputTokens;
 			try {
-				for await (const rawEvent of rawResponse) {
-					const eventType = rawEvent.event ?? "";
-					let parsedData = void 0;
-					if (rawEvent.data) try {
-						parsedData = JSON.parse(rawEvent.data);
-					} catch {
-						consola.warn("Could not parse Responses SSE chunk:", rawEvent.data.slice(0, 200));
+				await withKeepalive(stream, async (touch) => {
+					for await (const rawEvent of rawResponse) {
+						const eventType = rawEvent.event ?? "";
+						let parsedData = void 0;
+						if (rawEvent.data) try {
+							parsedData = JSON.parse(rawEvent.data);
+						} catch {
+							consola.warn("Could not parse Responses SSE chunk:", rawEvent.data.slice(0, 200));
+						}
+						consola.debug("Responses SSE event:", eventType);
+						const anthropicEvents = translateResponsesEventToAnthropic(eventType, parsedData, streamState);
+						for (const event of anthropicEvents) {
+							consola.debug("Translated Responses→Anthropic event:", event.type);
+							[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [inputTokens, outputTokens]);
+							await stream.writeSSE({
+								event: event.type,
+								data: JSON.stringify(event)
+							});
+							touch();
+						}
 					}
-					consola.debug("Responses SSE event:", eventType);
-					const anthropicEvents = translateResponsesEventToAnthropic(eventType, parsedData, streamState);
-					for (const event of anthropicEvents) {
-						consola.debug("Translated Responses→Anthropic event:", event.type);
-						[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [inputTokens, outputTokens]);
-						await stream.writeSSE({
-							event: event.type,
-							data: JSON.stringify(event)
-						});
-					}
-				}
+				});
 			} catch (err) {
 				consola.error("Error during Responses API streaming:", err);
 				try {
@@ -9127,14 +9161,17 @@ function streamResponsesEvents(c, response) {
 	consola.debug("Responses streaming response — proxying SSE events");
 	return streamSSE(c, async (stream) => {
 		try {
-			for await (const rawEvent of response) {
-				if (!rawEvent.data) continue;
-				const forwardData = sanitiseSseDataIfPossible(rawEvent.data);
-				await stream.writeSSE({
-					event: rawEvent.event,
-					data: forwardData
-				});
-			}
+			await withKeepalive(stream, async (touch) => {
+				for await (const rawEvent of response) {
+					if (!rawEvent.data) continue;
+					const forwardData = sanitiseSseDataIfPossible(rawEvent.data);
+					await stream.writeSSE({
+						event: rawEvent.event,
+						data: forwardData
+					});
+					touch();
+				}
+			});
 		} catch (err) {
 			consola.error("Responses SSE iteration failed:", err);
 			await stream.writeSSE({

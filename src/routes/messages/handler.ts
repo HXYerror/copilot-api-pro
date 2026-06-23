@@ -12,6 +12,7 @@ import { applyDefaultModelRewrite, isAppliedError } from "~/lib/default-model"
 import { forwardError } from "~/lib/error"
 import { getModelMode } from "~/lib/model-routing"
 import { checkRateLimit } from "~/lib/rate-limit"
+import { withKeepalive } from "~/lib/sse-keepalive"
 import { state } from "~/lib/state"
 import { isModelAllowed } from "~/middleware/auth"
 import { sanitiseResponsesOutput } from "~/routes/responses/translation"
@@ -180,38 +181,43 @@ async function handleNative(
       let outputTokens: number | undefined
 
       try {
-        for await (const rawEvent of response as AsyncIterable<{
-          data?: string
-          event?: string
-        }>) {
-          if (!rawEvent.data) continue
+        await withKeepalive(stream, async (touch) => {
+          for await (const rawEvent of response as AsyncIterable<{
+            data?: string
+            event?: string
+          }>) {
+            if (!rawEvent.data) continue
 
-          // Forward verbatim — never block on parse failure
-          await stream.writeSSE({
-            event: rawEvent.event,
-            data: rawEvent.data,
-          })
+            // Forward verbatim — never block on parse failure
+            await stream.writeSSE({
+              event: rawEvent.event,
+              data: rawEvent.data,
+            })
+            touch()
 
-          // Skip the OpenAI-style `[DONE]` sentinel that Copilot's
-          // Anthropic endpoint mirrors for compatibility — it's not JSON,
-          // attempting to parse it just emits noise. The real terminator
-          // is `message_stop`, which we already handled above.
-          if (rawEvent.data === "[DONE]") continue
+            // Skip the OpenAI-style `[DONE]` sentinel that Copilot's
+            // Anthropic endpoint mirrors for compatibility — it's not JSON,
+            // attempting to parse it just emits noise. The real terminator
+            // is `message_stop`, which we already handled above.
+            if (rawEvent.data === "[DONE]") continue
 
-          try {
-            const parsed = JSON.parse(rawEvent.data) as AnthropicStreamEventData
-            consola.debug("Native SSE event:", parsed.type)
-            ;[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [
-              inputTokens,
-              outputTokens,
-            ])
-          } catch {
-            consola.warn(
-              "Could not parse native SSE chunk for logging:",
-              rawEvent.data.slice(0, 200),
-            )
+            try {
+              const parsed = JSON.parse(
+                rawEvent.data,
+              ) as AnthropicStreamEventData
+              consola.debug("Native SSE event:", parsed.type)
+              ;[inputTokens, outputTokens] = stashAnthropicUsage(c, parsed, [
+                inputTokens,
+                outputTokens,
+              ])
+            } catch {
+              consola.warn(
+                "Could not parse native SSE chunk for logging:",
+                rawEvent.data.slice(0, 200),
+              )
+            }
           }
-        }
+        })
       } catch (err) {
         // Upstream stream died (TCP reset, 5xx after some events, parse
         // failure inside events() helper). Anthropic clients expect an
@@ -424,51 +430,57 @@ async function handleTranslated(
       }
 
       try {
-        for await (const rawEvent of response) {
-          consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
-          if (rawEvent.data === "[DONE]") {
-            break
-          }
+        await withKeepalive(stream, async (touch) => {
+          for await (const rawEvent of response) {
+            consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
+            if (rawEvent.data === "[DONE]") {
+              break
+            }
 
-          if (!rawEvent.data) {
-            continue
-          }
+            if (!rawEvent.data) {
+              continue
+            }
 
-          // Defensive JSON.parse: Copilot occasionally emits half-buffered or
-          // non-JSON chunks (HTML 5xx body during incidents). Throwing would
-          // break the whole stream + leave the client hanging, so we log and
-          // skip this chunk only.
-          let chunk: ChatCompletionChunk
-          try {
-            chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
-          } catch (parseErr) {
-            consola.warn(
-              `[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`,
-              rawEvent.data.slice(0, 200),
-            )
-            continue
-          }
+            // Defensive JSON.parse: Copilot occasionally emits half-buffered or
+            // non-JSON chunks (HTML 5xx body during incidents). Throwing would
+            // break the whole stream + leave the client hanging, so we log and
+            // skip this chunk only.
+            let chunk: ChatCompletionChunk
+            try {
+              chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+            } catch (parseErr) {
+              consola.warn(
+                `[/v1/messages stream] dropped unparseable chunk (${String(parseErr)}):`,
+                rawEvent.data.slice(0, 200),
+              )
+              continue
+            }
 
-          // Telemetry: read copilot_usage off the OpenAI chunk before we
-          // translate it into Anthropic events (which drops the field). The
-          // helper handles both copilot_usage and native usage shapes.
-          const u = readCopilotUsage(chunk)
-          if (
-            u.prompt_tokens !== undefined
-            || u.completion_tokens !== undefined
-          ) {
-            c.set("usage", u)
-          }
-          const events = translateChunkToAnthropicEvents(chunk, streamState)
+            // Telemetry: read copilot_usage off the OpenAI chunk before we
+            // translate it into Anthropic events (which drops the field). The
+            // helper handles both copilot_usage and native usage shapes.
+            const u = readCopilotUsage(chunk)
+            if (
+              u.prompt_tokens !== undefined
+              || u.completion_tokens !== undefined
+            ) {
+              c.set("usage", u)
+            }
+            const events = translateChunkToAnthropicEvents(chunk, streamState)
 
-          for (const event of events) {
-            consola.debug("Translated Anthropic event:", JSON.stringify(event))
-            await stream.writeSSE({
-              event: event.type,
-              data: JSON.stringify(event),
-            })
+            for (const event of events) {
+              consola.debug(
+                "Translated Anthropic event:",
+                JSON.stringify(event),
+              )
+              await stream.writeSSE({
+                event: event.type,
+                data: JSON.stringify(event),
+              })
+              touch()
+            }
           }
-        }
+        })
       } catch (err) {
         // Upstream iterator threw (TCP reset, events() helper error, etc.).
         // Anthropic clients hang on silent closes — emit error + message_stop
@@ -571,44 +583,50 @@ function streamResponsesAsAnthropic(
         let outputTokens: number | undefined
 
         try {
-          for await (const rawEvent of rawResponse as AsyncIterable<{
-            data?: string
-            event?: string
-          }>) {
-            const eventType = rawEvent.event ?? ""
+          await withKeepalive(stream, async (touch) => {
+            for await (const rawEvent of rawResponse as AsyncIterable<{
+              data?: string
+              event?: string
+            }>) {
+              const eventType = rawEvent.event ?? ""
 
-            let parsedData: unknown = undefined
-            if (rawEvent.data) {
-              try {
-                parsedData = JSON.parse(rawEvent.data)
-              } catch {
-                consola.warn(
-                  "Could not parse Responses SSE chunk:",
-                  rawEvent.data.slice(0, 200),
+              let parsedData: unknown = undefined
+              if (rawEvent.data) {
+                try {
+                  parsedData = JSON.parse(rawEvent.data)
+                } catch {
+                  consola.warn(
+                    "Could not parse Responses SSE chunk:",
+                    rawEvent.data.slice(0, 200),
+                  )
+                }
+              }
+
+              consola.debug("Responses SSE event:", eventType)
+
+              const anthropicEvents = translateResponsesEventToAnthropic(
+                eventType,
+                parsedData,
+                streamState,
+              )
+
+              for (const event of anthropicEvents) {
+                consola.debug(
+                  "Translated Responses→Anthropic event:",
+                  event.type,
                 )
+                ;[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [
+                  inputTokens,
+                  outputTokens,
+                ])
+                await stream.writeSSE({
+                  event: event.type,
+                  data: JSON.stringify(event),
+                })
+                touch()
               }
             }
-
-            consola.debug("Responses SSE event:", eventType)
-
-            const anthropicEvents = translateResponsesEventToAnthropic(
-              eventType,
-              parsedData,
-              streamState,
-            )
-
-            for (const event of anthropicEvents) {
-              consola.debug("Translated Responses→Anthropic event:", event.type)
-              ;[inputTokens, outputTokens] = stashAnthropicUsage(c, event, [
-                inputTokens,
-                outputTokens,
-              ])
-              await stream.writeSSE({
-                event: event.type,
-                data: JSON.stringify(event),
-              })
-            }
-          }
+          })
         } catch (err) {
           consola.error("Error during Responses API streaming:", err)
           try {
