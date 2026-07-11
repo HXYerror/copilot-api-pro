@@ -325,10 +325,10 @@ describe("events service", () => {
       latency_ms: 42,
       error: null,
       usage_unknown: 0,
-    thinking_level: null,
-    cache_read_tokens: null,
-    cache_creation_tokens: null,
-    reasoning_tokens: null,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
     })
     expect(countEvents()).toBe(1)
   })
@@ -348,10 +348,10 @@ describe("events service", () => {
         latency_ms: 0,
         error: "upstream_error",
         usage_unknown: 1,
-      thinking_level: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
-      reasoning_tokens: null,
+        thinking_level: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        reasoning_tokens: null,
       }),
     ).not.toThrow()
   })
@@ -370,10 +370,10 @@ describe("events service", () => {
         latency_ms: 1,
         error: null,
         usage_unknown: 1,
-      thinking_level: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
-      reasoning_tokens: null,
+        thinking_level: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        reasoning_tokens: null,
       })
     }
     // Keep last 2 (cutoff at now - 3000), delete first 3
@@ -434,10 +434,10 @@ describe("retention sweep", () => {
         latency_ms: 0,
         error: null,
         usage_unknown: 1,
-      thinking_level: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
-      reasoning_tokens: null,
+        thinking_level: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        reasoning_tokens: null,
       })
     }
     for (let i = 0; i < 2; i++) {
@@ -452,10 +452,10 @@ describe("retention sweep", () => {
         latency_ms: 0,
         error: null,
         usage_unknown: 1,
-      thinking_level: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
-      reasoning_tokens: null,
+        thinking_level: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+        reasoning_tokens: null,
       })
     }
     expect(countEvents()).toBe(5)
@@ -478,10 +478,10 @@ describe("retention sweep", () => {
       latency_ms: 0,
       error: null,
       usage_unknown: 1,
-    thinking_level: null,
-    cache_read_tokens: null,
-    cache_creation_tokens: null,
-    reasoning_tokens: null,
+      thinking_level: null,
+      cache_read_tokens: null,
+      cache_creation_tokens: null,
+      reasoning_tokens: null,
     })
     const deleted = await sweepEventsOnce()
     expect(deleted).toBe(0)
@@ -770,5 +770,47 @@ describe("telemetry middleware: Anthropic native stream", () => {
     expect(ev?.prompt_tokens).toBe(10)
     expect(ev?.completion_tokens).toBe(20)
     expect(ev?.usage_unknown).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// count_tokens pre-flight rows must not land in the Messages tab
+// ---------------------------------------------------------------------------
+
+describe("telemetry middleware: /v1/messages/count_tokens", () => {
+  test("count_tokens row is tagged with METHOD-path (routes to Other tab)", async () => {
+    // count_tokens is a POST that carries a `model` in its body, but it's a
+    // pre-flight token-estimate call — Claude Code fires one before every
+    // real /v1/messages. Lumping it into the Messages tab would drown the
+    // real completions in noise, so telemetry deliberately skips the body
+    // snapshot for this route and stores the "<METHOD> <path>" marker
+    // instead. The kindClause "/"-heuristic in src/admin/api/logs.ts then
+    // buckets it into the Other tab.
+    const { plain } = createKey({
+      tier: "client",
+      label: "tc",
+      allowedModels: ["*"],
+    })
+
+    const res = await server.request("/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${plain}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4.5",
+        messages: [{ role: "user", content: "hello world" }],
+      }),
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+
+    await waitForEvents(1)
+    const ev = lastEvent()
+    expect(ev?.model).toBe("POST /v1/messages/count_tokens")
+    // The "/"-heuristic — same predicate kindClause uses — must classify
+    // this row as "other", not "messages".
+    expect(ev?.model.includes("/")).toBe(true)
   })
 })

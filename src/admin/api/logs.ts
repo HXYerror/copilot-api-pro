@@ -110,10 +110,12 @@ function buildWhere(
   }
 
   // Kind filter: real message requests vs non-message endpoints (model
-  // listings, etc). Telemetry middleware writes `model = "<METHOD> <path>"`
-  // for non-POST routes — those always contain a "/", whereas real model
-  // names never do, so the "/" heuristic is reliable. Skipped when caller
-  // wants per-kind counts under the same other-filters set.
+  // listings, count_tokens pre-flights, etc). Telemetry middleware writes
+  // `model = "<METHOD> <path>"` for non-POST routes AND for the
+  // /v1/messages/count_tokens pre-flight — those always contain a "/",
+  // whereas real model names never do, so the "/" heuristic is reliable.
+  // Skipped when caller wants per-kind counts under the same other-filters
+  // set.
   if (!options.excludeKind) {
     const kindSql = kindClause(c.req.query("kind"))
     if (kindSql) parts.push(kindSql)

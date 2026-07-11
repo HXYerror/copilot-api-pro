@@ -314,9 +314,17 @@ export const telemetryMiddleware: MiddlewareHandler<{
   // inside the handler. GET routes (e.g. /v1/models) have no body fields —
   // for those we record "<METHOD route>" so the Logs page row shows the
   // actual endpoint instead of an uninformative "n/a".
+  //
+  // Special-case: /v1/messages/count_tokens is a POST that carries a model
+  // in its body, so a naive snapshot would tag the row exactly like a real
+  // completion. But it's a pre-flight token-estimate call — Claude Code
+  // fires one before every real /v1/messages — and lumping it with the
+  // Messages tab makes latency / volume totals meaningless. Skip the
+  // snapshot and let the "<METHOD> <path>" default land in the Other tab
+  // via the "/"-heuristic in kindClause.
   let clientModel = `${c.req.method} ${c.req.path}`
   let thinkingLevel: string | null = null
-  if (c.req.method === "POST") {
+  if (c.req.method === "POST" && c.req.path !== "/v1/messages/count_tokens") {
     try {
       const meta = await snapshotPostMeta(c.req.raw.clone() as Request)
       if (meta.model !== "n/a") clientModel = meta.model

@@ -5882,7 +5882,7 @@ const telemetryMiddleware = async (c, next) => {
 	const start$1 = Date.now();
 	let clientModel = `${c.req.method} ${c.req.path}`;
 	let thinkingLevel = null;
-	if (c.req.method === "POST") try {
+	if (c.req.method === "POST" && c.req.path !== "/v1/messages/count_tokens") try {
 		const meta = await snapshotPostMeta(c.req.raw.clone());
 		if (meta.model !== "n/a") clientModel = meta.model;
 		thinkingLevel = meta.thinking_level;
