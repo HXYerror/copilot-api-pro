@@ -55,6 +55,113 @@ function rowsToConfig(rows: Array<ModelRow>, base: AppConfig): AppConfig {
   return { ...base, models }
 }
 
+/**
+ * Derive the effort-level options for a given upstream model. Instead of a
+ * fixed low/medium/high/xhigh list we look at what the catalog actually
+ * reports for THIS model and offer only those:
+ *
+ *   - `supports.reasoning_effort` is present → use exactly that list.
+ *     Some Copilot variants pin it to a single value (e.g.
+ *     `claude-opus-4.7-high` → ["high"]) and the runtime would clamp any
+ *     other choice anyway, so hide the wrong options up-front.
+ *   - Anthropic models with `adaptive_thinking` / `max_thinking_budget`
+ *     but no explicit reasoning_effort → offer the Claude Code effort
+ *     enum (low/medium/high/xhigh) because that's what we translate to
+ *     `output_config.effort` at request time.
+ *   - Model with no thinking capability at all → dropdown only has
+ *     "— off —"; injection is a no-op.
+ *
+ * Off ("") is always available.
+ */
+function effortOptionsForUpstream(
+  upstream: UpstreamModel | undefined,
+): Array<"" | "low" | "medium" | "high" | "xhigh"> {
+  if (!upstream) return ["", "low", "medium", "high", "xhigh"]
+  const supports = upstream.capabilities.supports as {
+    reasoning_effort?: Array<string>
+    adaptive_thinking?: boolean
+    max_thinking_budget?: number
+  }
+  const explicit = supports.reasoning_effort
+  if (Array.isArray(explicit) && explicit.length > 0) {
+    const valid = new Set(["low", "medium", "high", "xhigh"])
+    const opts = explicit.filter(
+      (e): e is "low" | "medium" | "high" | "xhigh" => valid.has(e),
+    )
+    return ["", ...opts]
+  }
+  const anthropicThinking =
+    supports.adaptive_thinking === true
+    || (typeof supports.max_thinking_budget === "number"
+      && supports.max_thinking_budget > 0)
+  if (anthropicThinking) {
+    return ["", "low", "medium", "high", "xhigh"]
+  }
+  // No thinking capability advertised.
+  return [""]
+}
+
+/**
+ * A default-effort <select> that only offers levels the selected upstream
+ * model actually accepts. If the row already has a stored value that
+ * isn't in the allowed set (e.g. operator picked "xhigh" then swapped
+ * the row's upstream to a model that only supports "high"), the current
+ * value is still rendered but marked as `(unsupported)` so the operator
+ * can see the conflict and pick a valid replacement.
+ */
+type EffortValue = "" | "low" | "medium" | "high" | "xhigh"
+
+function effortLabel(v: EffortValue): string {
+  return v === "" ? "— off —" : v
+}
+
+function effortTooltip(
+  value: EffortValue,
+  currentAllowed: boolean,
+  noThinking: boolean,
+): string | undefined {
+  if (noThinking) return "This upstream model has no thinking capability"
+  if (!currentAllowed && value !== "") {
+    return `Current value "${value}" isn't in the model's supported list — save will forward as clamped to the highest supported level`
+  }
+  return undefined
+}
+
+function EffortSelect({
+  value,
+  onChange,
+  options,
+}: {
+  value: EffortValue
+  onChange: (v: EffortValue) => void
+  options: Array<EffortValue>
+}) {
+  const currentAllowed = options.includes(value)
+  const noThinking = options.length === 1 && options[0] === ""
+  const conflict = !currentAllowed && value !== ""
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value as EffortValue)}
+      disabled={noThinking && value === ""}
+      className={
+        "w-full rounded-tremor-small border bg-tremor-background px-2 py-1 text-xs "
+        + (conflict ?
+          "border-rose-400 text-rose-700"
+        : "border-tremor-border text-tremor-content")
+      }
+      title={effortTooltip(value, currentAllowed, noThinking)}
+    >
+      {options.map((o) => (
+        <option key={o} value={o}>
+          {effortLabel(o)}
+        </option>
+      ))}
+      {conflict && <option value={value}>{value} (unsupported)</option>}
+    </select>
+  )
+}
+
 export function Settings() {
   const qc = useQueryClient()
   const { data, isLoading, error } = useQuery({
@@ -459,27 +566,18 @@ export function Settings() {
                               <CapsCell model={upstream} />
                             </td>
                             <td className="px-2 py-2 text-xs">
-                              {/* Per-alias default effort. Injected when the
-                                  client sends no thinking signal. Models
-                                  whose catalog doesn't list reasoning_effort
-                                  ignore the setting silently (the runtime
-                                  clamps to supported levels). */}
-                              <select
+                              {/* Per-alias default effort. Options are
+                                  narrowed to what the selected upstream
+                                  model actually supports — dropping
+                                  choices that Copilot would just clamp
+                                  or ignore at request time. */}
+                              <EffortSelect
                                 value={r.default_effort}
-                                onChange={(e) =>
-                                  updateRow(i, {
-                                    default_effort: e.target
-                                      .value as ModelRow["default_effort"],
-                                  })
+                                onChange={(v) =>
+                                  updateRow(i, { default_effort: v })
                                 }
-                                className="w-full rounded-tremor-small border border-tremor-border bg-tremor-background px-2 py-1 text-xs"
-                              >
-                                <option value="">— off —</option>
-                                <option value="low">low</option>
-                                <option value="medium">medium</option>
-                                <option value="high">high</option>
-                                <option value="xhigh">xhigh</option>
-                              </select>
+                                options={effortOptionsForUpstream(upstream)}
+                              />
                             </td>
                             <td className="px-2 py-2 text-center">
                               <input
