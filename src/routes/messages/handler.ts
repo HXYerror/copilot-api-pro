@@ -379,14 +379,15 @@ async function handleTranslated(
   // Per-alias default effort: inject reasoning_effort onto the translated
   // chat-completions payload when the client sent no thinking signal and
   // the alias config provides a default. Chat-completions only accepts
-  // low/medium/high — collapse "xhigh" down to "high".
+  // low/medium/high — collapse "xhigh" and "max" down to "high".
   // (Mirrors the same logic in routes/chat-completions/handler.ts so a
   // request that comes in via /v1/messages on a non-Claude alias still
   // honours the configured default.)
   const aliasDefault = getConfig().models[clientAlias]?.default_effort
   let finalPayload = openAIPayload
   if (!openAIPayload.reasoning_effort && aliasDefault && aliasDefault !== "") {
-    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    const e =
+      aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault
     consola.debug(
       `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias}, translated path)`,
     )

@@ -39,7 +39,7 @@ export const createMessagesNative = async (
   payload: AnthropicMessagesPayload,
   onUpstream?: UpstreamCaptureFn,
   clientAnthropicBeta?: string,
-  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "",
+  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "max" | "",
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -454,12 +454,13 @@ const EFFORT_RANK: Record<string, number> = {
   medium: 2,
   high: 3,
   xhigh: 4,
+  max: 5,
 }
 
 export function clampEffortForModel(
   effort: string | undefined,
   modelId: string,
-): "low" | "medium" | "high" | "xhigh" | undefined {
+): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
   const entry = state.models?.data.find((m) => m.id === modelId)
   const supported = (
     entry?.capabilities?.supports as
@@ -469,14 +470,16 @@ export function clampEffortForModel(
   if (!Array.isArray(supported) || supported.length === 0) {
     // Model didn't advertise reasoning_effort — pass through whatever the
     // caller had. Caller will decide whether to include the field.
-    return effort as "low" | "medium" | "high" | "xhigh" | undefined
+    return effort as "low" | "medium" | "high" | "xhigh" | "max" | undefined
   }
   if (effort && supported.includes(effort)) {
-    return effort as "low" | "medium" | "high" | "xhigh"
+    return effort as "low" | "medium" | "high" | "xhigh" | "max"
   }
   // Pick the highest-ranked supported level.
   const best = supported
-    .filter((s): s is "low" | "medium" | "high" | "xhigh" => s in EFFORT_RANK)
+    .filter(
+      (s): s is "low" | "medium" | "high" | "xhigh" | "max" => s in EFFORT_RANK,
+    )
     .sort((a, b) => (EFFORT_RANK[b] ?? 0) - (EFFORT_RANK[a] ?? 0))[0]
   if (best && effort && best !== effort) {
     consola.debug(
@@ -510,7 +513,7 @@ export function clampEffortForModel(
  */
 export function buildUpstreamPayload(
   payload: AnthropicMessagesPayload,
-  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "",
+  defaultEffort?: "low" | "medium" | "high" | "xhigh" | "max" | "",
 ): AnthropicMessagesPayload {
   const { thinking, output_config, messages, ...rest } = payload
   const sanitisedMessages = sanitiseMessages(messages)
@@ -527,9 +530,9 @@ export function buildUpstreamPayload(
     payload.model,
   )
   const restWithMaxTokens =
-    adjustedMaxTokens !== undefined && adjustedMaxTokens !== rest.max_tokens
-      ? { ...rest, max_tokens: adjustedMaxTokens }
-      : rest
+    adjustedMaxTokens !== undefined && adjustedMaxTokens !== rest.max_tokens ?
+      { ...rest, max_tokens: adjustedMaxTokens }
+    : rest
 
   // Per-alias default effort: when the client didn't ask for thinking at
   // all AND the alias config provides a default, synthesise an adaptive
@@ -694,9 +697,7 @@ function sanitiseMessages(
           if (Array.isArray(block.content)) {
             const nestedCleaned = block.content.filter((nested) => {
               if (nested.type === "text") {
-                return (
-                  typeof nested.text === "string" && nested.text.length > 0
-                )
+                return typeof nested.text === "string" && nested.text.length > 0
               }
               return true
             })

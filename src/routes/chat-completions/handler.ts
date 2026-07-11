@@ -112,10 +112,11 @@ export async function handleCompletion(
 
   // Per-alias default effort: inject when client didn't supply reasoning_effort.
   // OpenAI chat-completions only accepts low/medium/high — collapse "xhigh"
-  // down to "high" for this endpoint.
+  // and "max" down to "high" for this endpoint.
   const aliasDefault = models[clientAlias]?.default_effort
   if (!payload.reasoning_effort && aliasDefault && aliasDefault !== "") {
-    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    const e =
+      aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault
     consola.debug(
       `[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias})`,
     )

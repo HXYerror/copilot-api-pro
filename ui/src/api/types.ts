@@ -489,7 +489,7 @@ export interface AppConfig {
        * doesn't carry any thinking/reasoning signal, the proxy injects this
        * value before forwarding upstream. Empty string = no default.
        */
-      default_effort?: "" | "low" | "medium" | "high" | "xhigh"
+      default_effort?: "" | "low" | "medium" | "high" | "xhigh" | "max"
     }
   >
   retention: {

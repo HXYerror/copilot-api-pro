@@ -81,10 +81,11 @@ export async function handleResponses(
   await checkRateLimit(state)
 
   // Per-alias default effort: inject when client didn't supply reasoning.effort.
-  // Responses API has effort: low|medium|high (no xhigh); xhigh → high.
+  // Responses API has effort: low|medium|high — collapse xhigh/max → high.
   const aliasDefault = getConfig().models[clientAlias]?.default_effort
   if (!payload.reasoning?.effort && aliasDefault && aliasDefault !== "") {
-    const e = aliasDefault === "xhigh" ? "high" : aliasDefault
+    const e =
+      aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault
     consola.debug(
       `[alias-effort] injecting reasoning.effort=${e} (alias=${clientAlias})`,
     )

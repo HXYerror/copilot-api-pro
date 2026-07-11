@@ -303,8 +303,10 @@ function translateReasoning(
   // down to "high" (the highest valid value for this endpoint).
   if (!thinking) {
     if (defaultEffort && defaultEffort !== "") {
+      // Responses API only accepts low/medium/high — collapse both
+      // "xhigh" and "max" down to "high" (highest valid value).
       const e =
-        defaultEffort === "xhigh" ? "high"
+        defaultEffort === "xhigh" || defaultEffort === "max" ? "high"
         : VALID_EFFORT_VALUES.has(defaultEffort) ? defaultEffort
         : null
       if (e) return { effort: e as "low" | "medium" | "high" }

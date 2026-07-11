@@ -44,16 +44,33 @@ const ModelEntrySchema = z.object({
    * Never overrides what the client explicitly sent — purely a fill-in.
    * See HANDOFF.md §5.7 for the thinking protocol details.
    */
-  default_effort: z.enum(["low", "medium", "high", "xhigh", ""]).default(""),
+  /**
+   * Default effort injected when the client sends no thinking signal:
+   *   - Claude Code effort enum ("low" | "medium" | "high" | "xhigh" | "max")
+   *     — set on `output_config.effort` (Anthropic via effort-2025-11-24
+   *     beta), `reasoning_effort` (OpenAI chat-completions with xhigh→high
+   *     collapse; `max` treated as `high`), or `reasoning.effort`
+   *     (Responses API).
+   *   - `""` (default) — don't inject; respect client's absence.
+   *
+   * The Settings UI narrows the dropdown to each model's catalog-declared
+   * `reasoning_effort` array so operators can only pick a value the model
+   * actually supports.
+   *
+   * See HANDOFF.md §5.7 for the thinking protocol details.
+   */
+  default_effort: z
+    .enum(["low", "medium", "high", "xhigh", "max", ""])
+    .default(""),
 })
 
 const RetentionSchema = z.object({
-  events_days: z.number().int().min(0).default(90),
-  // traces_days = 0 keeps captures in-memory only: the live SSE tail still
-  // works, but nothing is written to disk. This is the privacy-preserving
-  // default per issue #36 — operators must opt in to on-disk persistence by
-  // setting a positive value in ~/.local/share/copilot-api/config.json.
-  traces_days: z.number().int().min(0).default(0),
+  events_days: z.number().int().min(0).default(60),
+  // On-disk trace persistence. Traces are always written to disk when the
+  // trace middleware fires (see src/services/trace-writer.ts) — this knob
+  // only controls how long the sweeper keeps them. 60d default matches
+  // events_days so operators see a consistent retention window.
+  traces_days: z.number().int().min(0).default(60),
   traces_max_bytes: z.number().int().min(0).default(104857600), // 100MB
   audit_days: z.number().int().min(0).default(365),
 })

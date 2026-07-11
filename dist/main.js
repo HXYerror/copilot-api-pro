@@ -488,12 +488,13 @@ const ModelEntrySchema = z.object({
 		"medium",
 		"high",
 		"xhigh",
+		"max",
 		""
 	]).default("")
 });
 const RetentionSchema = z.object({
-	events_days: z.number().int().min(0).default(90),
-	traces_days: z.number().int().min(0).default(0),
+	events_days: z.number().int().min(0).default(60),
+	traces_days: z.number().int().min(0).default(60),
 	traces_max_bytes: z.number().int().min(0).default(104857600),
 	audit_days: z.number().int().min(0).default(365)
 });
@@ -6892,7 +6893,7 @@ async function handleCompletion$1(c) {
 	const onUpstream = c.var.trace_capture_upstream;
 	const aliasDefault = models[clientAlias]?.default_effort;
 	if (!payload.reasoning_effort && aliasDefault && aliasDefault !== "") {
-		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		const e = aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault;
 		consola.debug(`[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias})`);
 		payload = {
 			...payload,
@@ -7624,7 +7625,8 @@ const EFFORT_RANK = {
 	low: 1,
 	medium: 2,
 	high: 3,
-	xhigh: 4
+	xhigh: 4,
+	max: 5
 };
 function clampEffortForModel(effort, modelId) {
 	const supported = ((state.models?.data.find((m) => m.id === modelId))?.capabilities?.supports)?.reasoning_effort;
@@ -8119,7 +8121,7 @@ function translateToolChoice(toolChoice) {
 function translateReasoning(thinking, outputConfig, defaultEffort) {
 	if (!thinking) {
 		if (defaultEffort && defaultEffort !== "") {
-			const e = defaultEffort === "xhigh" ? "high" : VALID_EFFORT_VALUES.has(defaultEffort) ? defaultEffort : null;
+			const e = defaultEffort === "xhigh" || defaultEffort === "max" ? "high" : VALID_EFFORT_VALUES.has(defaultEffort) ? defaultEffort : null;
 			if (e) return { effort: e };
 		}
 		return;
@@ -8864,7 +8866,7 @@ async function handleTranslated(c, anthropicPayload, clientAlias) {
 	const aliasDefault = getConfig().models[clientAlias]?.default_effort;
 	let finalPayload = openAIPayload;
 	if (!openAIPayload.reasoning_effort && aliasDefault && aliasDefault !== "") {
-		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		const e = aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault;
 		consola.debug(`[alias-effort] injecting reasoning_effort=${e} (alias=${clientAlias}, translated path)`);
 		finalPayload = {
 			...openAIPayload,
@@ -9136,7 +9138,7 @@ async function handleResponses(c) {
 	await checkRateLimit(state);
 	const aliasDefault = getConfig().models[clientAlias]?.default_effort;
 	if (!payload.reasoning?.effort && aliasDefault && aliasDefault !== "") {
-		const e = aliasDefault === "xhigh" ? "high" : aliasDefault;
+		const e = aliasDefault === "xhigh" || aliasDefault === "max" ? "high" : aliasDefault;
 		consola.debug(`[alias-effort] injecting reasoning.effort=${e} (alias=${clientAlias})`);
 		payload = {
 			...payload,

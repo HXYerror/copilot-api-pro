@@ -28,7 +28,7 @@ interface ModelRow {
   upstream: string
   enabled: boolean
   allowed_keys: Array<string>
-  default_effort: "" | "low" | "medium" | "high" | "xhigh"
+  default_effort: "" | "low" | "medium" | "high" | "xhigh" | "max"
 }
 
 function configToRows(cfg: AppConfig): Array<ModelRow> {
@@ -56,60 +56,46 @@ function rowsToConfig(rows: Array<ModelRow>, base: AppConfig): AppConfig {
 }
 
 /**
- * Derive the effort-level options for a given upstream model. Instead of a
- * fixed low/medium/high/xhigh list we look at what the catalog actually
- * reports for THIS model and offer only those:
+ * Derive the effort-level options for a given upstream model. Strictly
+ * follow what Copilot's catalog reports under
+ * `capabilities.supports.reasoning_effort`:
  *
- *   - `supports.reasoning_effort` is present → use exactly that list.
- *     Some Copilot variants pin it to a single value (e.g.
- *     `claude-opus-4.7-high` → ["high"]) and the runtime would clamp any
- *     other choice anyway, so hide the wrong options up-front.
- *   - Anthropic models with `adaptive_thinking` / `max_thinking_budget`
- *     but no explicit reasoning_effort → offer the Claude Code effort
- *     enum (low/medium/high/xhigh) because that's what we translate to
- *     `output_config.effort` at request time.
- *   - Model with no thinking capability at all → dropdown only has
- *     "— off —"; injection is a no-op.
+ *   - claude-opus-4.6           → ["low","medium","high","max"]
+ *   - claude-opus-4.7 / 4.8     → ["low","medium","high","xhigh","max"]
+ *   - gpt-5.5                   → ["low","medium","high"]
+ *   - claude-haiku-4.5 / sonnet → not declared → dropdown only has "off"
  *
- * Off ("") is always available.
+ * "Off" ("") is always available.
  */
 function effortOptionsForUpstream(
   upstream: UpstreamModel | undefined,
-): Array<"" | "low" | "medium" | "high" | "xhigh"> {
-  if (!upstream) return ["", "low", "medium", "high", "xhigh"]
+): Array<EffortValue> {
+  if (!upstream) return ["", "low", "medium", "high", "xhigh", "max"]
   const supports = upstream.capabilities.supports as {
     reasoning_effort?: Array<string>
-    adaptive_thinking?: boolean
-    max_thinking_budget?: number
   }
   const explicit = supports.reasoning_effort
   if (Array.isArray(explicit) && explicit.length > 0) {
-    const valid = new Set(["low", "medium", "high", "xhigh"])
-    const opts = explicit.filter(
-      (e): e is "low" | "medium" | "high" | "xhigh" => valid.has(e),
+    const valid = new Set<EffortValue>([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ])
+    const opts = explicit.filter((e): e is EffortValue =>
+      valid.has(e as EffortValue),
     )
     return ["", ...opts]
   }
-  const anthropicThinking =
-    supports.adaptive_thinking === true
-    || (typeof supports.max_thinking_budget === "number"
-      && supports.max_thinking_budget > 0)
-  if (anthropicThinking) {
-    return ["", "low", "medium", "high", "xhigh"]
-  }
-  // No thinking capability advertised.
+  // No reasoning_effort declared — offer "off" only. Operators who need
+  // thinking on adaptive-only models (haiku / sonnet) can set it in the
+  // client request; default_effort injection isn't meaningful when the
+  // model doesn't advertise a discrete effort enum.
   return [""]
 }
 
-/**
- * A default-effort <select> that only offers levels the selected upstream
- * model actually accepts. If the row already has a stored value that
- * isn't in the allowed set (e.g. operator picked "xhigh" then swapped
- * the row's upstream to a model that only supports "high"), the current
- * value is still rendered but marked as `(unsupported)` so the operator
- * can see the conflict and pick a valid replacement.
- */
-type EffortValue = "" | "low" | "medium" | "high" | "xhigh"
+type EffortValue = "" | "low" | "medium" | "high" | "xhigh" | "max"
 
 function effortLabel(v: EffortValue): string {
   return v === "" ? "— off —" : v
@@ -120,7 +106,9 @@ function effortTooltip(
   currentAllowed: boolean,
   noThinking: boolean,
 ): string | undefined {
-  if (noThinking) return "This upstream model has no thinking capability"
+  if (noThinking) {
+    return `This model doesn't declare a reasoning_effort list. Default-effort injection is disabled — clients can still request thinking themselves.`
+  }
   if (!currentAllowed && value !== "") {
     return `Current value "${value}" isn't in the model's supported list — save will forward as clamped to the highest supported level`
   }
