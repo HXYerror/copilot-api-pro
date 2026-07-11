@@ -65,7 +65,7 @@ export interface TraceEvent {
    *     signals without turning on debug up-front.
    *   - "full": additionally captures req / res / upstream_req /
    *     upstream_res bodies (subject to size cap + redaction). Gated
-   *     on shouldCapture — global features.debug, per-key debug, or
+   *     on captureLevel — global features.debug, per-key debug, or
    *     admin X-Capi-Debug header.
    * Missing on old records = "full" (backward compat).
    */
@@ -137,7 +137,7 @@ function eventToJSON(event: TraceEvent): Record<string, unknown> {
 /**
  * Persist and broadcast a single trace event.
  *
- * Always writes to disk when invoked. The trace middleware's `shouldCapture`
+ * Always writes to disk when invoked. The trace middleware's `captureLevel`
  * check is the canonical gate — by the time we get here the operator has
  * explicitly opted in (per-key debug, global features.debug, or admin
  * X-Capi-Debug header), and silently dropping their capture because

@@ -203,13 +203,18 @@ describe("writeTrace — on-disk persistence", () => {
     expect(raw).toContain("[REDACTED]")
   })
 
-  test("traces_days=0 → no file is written (in-memory only)", async () => {
+  test("traces_days=0 → still writes to disk (retention only, not gate)", async () => {
+    // traces_days is now a retention-only knob: the sweeper deletes files
+    // older than N days, but writeTrace always persists when the middleware
+    // decided the request was worth capturing. Silently dropping traces at
+    // write-time based on retention was a huge UX trap — operators stared
+    // at "no captured request" with no clue why.
     await loadConfig(makeTmpConfig(testDir, {}, { traces_days: 0 }))
-    writeTrace(makeEvent({ trace_id: "should-not-persist" }))
+    writeTrace(makeEvent({ trace_id: "persist-even-when-retention-zero" }))
     const filePath = traceFilePath(todayDateStr())
-    expect(fs.existsSync(filePath)).toBe(false)
-    // Broadcaster still receives it (in-memory only mode keeps live tail)
-    // — we just can't easily assert that here without a subscriber.
+    expect(fs.existsSync(filePath)).toBe(true)
+    const raw = fs.readFileSync(filePath, "utf8")
+    expect(raw).toContain("persist-even-when-retention-zero")
   })
 
   test("ensures tracesDir() exists with 0o700 on first write", () => {
@@ -712,15 +717,14 @@ describe("trace middleware — end-to-end", () => {
     expect(parsed.key_id).toBeDefined()
   })
 
-  test("client tier with X-Capi-Debug → NO trace (header stripped by auth)", async () => {
+  test("client tier with X-Capi-Debug → headers-only trace (no body capture)", async () => {
+    // authMiddleware strips X-Capi-Debug for non-admin callers, so
+    // `debug_via_header` never gets set. Combined with debug_enabled=0 and
+    // features.debug=false, the trace middleware falls through to its
+    // default: capture headers, not bodies. Verify that shape lands on disk.
     await loadConfig(makeTmpConfig(testDir, { auth: true }, { traces_days: 7 }))
     const { plain } = createKey({ tier: "client", label: "trace-client" })
     globalThis.fetch = chatCompletionFetchMock()
-
-    const beforeSize =
-      fs.existsSync(traceFilePath(todayDateStr())) ?
-        fs.statSync(traceFilePath(todayDateStr())).size
-      : 0
 
     const res = await server.request("/v1/chat/completions", {
       method: "POST",
@@ -739,11 +743,28 @@ describe("trace middleware — end-to-end", () => {
     await res.text()
     await new Promise((r) => setTimeout(r, 50))
 
-    const afterSize =
-      fs.existsSync(traceFilePath(todayDateStr())) ?
-        fs.statSync(traceFilePath(todayDateStr())).size
-      : 0
-    expect(afterSize).toBe(beforeSize)
+    const filePath = traceFilePath(todayDateStr())
+    expect(fs.existsSync(filePath)).toBe(true)
+    const lines = fs
+      .readFileSync(filePath, "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+    const parsed = JSON.parse(lines.at(-1) ?? "{}") as Record<string, unknown>
+    expect(parsed.capture_level).toBe("headers")
+    const req = parsed.req as Record<string, unknown>
+    const resLeg = parsed.res as Record<string, unknown>
+    expect(req.body).toBeUndefined()
+    expect(resLeg.body).toBeUndefined()
+    if (parsed.upstream_req) {
+      expect(
+        (parsed.upstream_req as Record<string, unknown>).body,
+      ).toBeUndefined()
+    }
+    if (parsed.upstream_res) {
+      expect(
+        (parsed.upstream_res as Record<string, unknown>).body,
+      ).toBeUndefined()
+    }
   })
 
   test("key with debug_enabled=1 → trace line written", async () => {

@@ -42,7 +42,7 @@ const NO_AUTH_SENTINEL: KeyRow = {
   rate_limit_override: null,
   // Sentinel is NOT a real key — it can't toggle per-key debug. Capture
   // in --no-auth mode is decided by the global `features.debug` toggle
-  // in Settings → Advanced. shouldCapture() checks that gate first, so
+  // in Settings → Advanced. captureLevel() checks that gate first, so
   // operators can opt in / out at the global level.
   debug_enabled: 0,
   debug_expires_at: null,

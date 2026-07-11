@@ -5988,6 +5988,12 @@ const REDACTION_PLACEHOLDER = "[REDACTED]";
 * - Proxy → upstream: authorization (Copilot bearer), x-github-token,
 *   x-vscs-token (Copilot Chat extension headers — see api-config.ts)
 * - Upstream → proxy: set-cookie
+*
+* BYOK-style secrets (`x-anthropic-key`, `x-openai-key`, `x-goog-api-key`,
+* `openai-organization`) aren't emitted by this proxy today, but headers-only
+* capture now persists every header on every authed request. A BYOK client
+* that stamps one of these on a request would otherwise land it on disk in
+* cleartext. Cheap to defend, so we do.
 */
 const REDACTED_HEADERS = new Set([
 	"authorization",
@@ -5997,6 +6003,10 @@ const REDACTED_HEADERS = new Set([
 	"proxy-authorization",
 	"x-github-token",
 	"x-vscs-token",
+	"x-anthropic-key",
+	"x-openai-key",
+	"x-goog-api-key",
+	"openai-organization",
 	"x-capi-debug"
 ]);
 /**
@@ -6110,7 +6120,7 @@ function legToJSON(leg) {
 		...leg.url !== void 0 && { url: leg.url },
 		...leg.status !== void 0 && { status: leg.status },
 		headers: redactHeaders(leg.headers),
-		body: redactBody(leg.body)
+		...leg.body !== void 0 && { body: redactBody(leg.body) }
 	};
 }
 function eventToJSON(event) {
@@ -6119,6 +6129,7 @@ function eventToJSON(event) {
 		ts: event.ts,
 		key_id: event.key_id,
 		route: event.route,
+		...event.capture_level && { capture_level: event.capture_level },
 		req: legToJSON(event.req),
 		...event.upstream_req && { upstream_req: legToJSON(event.upstream_req) },
 		...event.upstream_res && { upstream_res: legToJSON(event.upstream_res) },
@@ -6130,7 +6141,7 @@ function eventToJSON(event) {
 /**
 * Persist and broadcast a single trace event.
 *
-* Always writes to disk when invoked. The trace middleware's `shouldCapture`
+* Always writes to disk when invoked. The trace middleware's `captureLevel`
 * check is the canonical gate — by the time we get here the operator has
 * explicitly opted in (per-key debug, global features.debug, or admin
 * X-Capi-Debug header), and silently dropping their capture because
@@ -6188,13 +6199,20 @@ function appendToDisk(line) {
 //#endregion
 //#region src/middleware/trace.ts
 const MAX_BODY_BYTES = 256 * 1024;
-function shouldCapture(c) {
+/**
+* Every request that clears auth is captured — at minimum in headers-only
+* mode. That gives operators routing / rate-limit / auth-decision
+* visibility for free, without any opt-in. Full-body capture is gated on
+* explicit debug signals so bodies (which are the privacy-heavy and
+* disk-heavy part) only land on disk when someone asked for them.
+*/
+function captureLevel(c) {
 	const key = c.get("key");
-	if (!key) return false;
-	if (getConfig().features.debug) return true;
-	if (isDebugActive(key)) return true;
-	if (c.get("debug_via_header") === true && key.tier === "admin") return true;
-	return false;
+	if (!key) return null;
+	if (getConfig().features.debug) return "full";
+	if (isDebugActive(key)) return "full";
+	if (c.get("debug_via_header") === true && key.tier === "admin") return "full";
+	return "headers";
 }
 async function readBodyCapped(body) {
 	if (!body) return "";
@@ -6233,10 +6251,10 @@ function headersToObj(h) {
 	for (const [k, v] of h.entries()) out[k.toLowerCase()] = v;
 	return out;
 }
-async function captureRequest(c) {
+async function captureRequest(c, level) {
 	const raw = c.req.raw;
-	let body = "";
-	if (raw.body && raw.method !== "GET" && raw.method !== "HEAD") try {
+	let body;
+	if (level === "full" && raw.body && raw.method !== "GET" && raw.method !== "HEAD") try {
 		const cloned = raw.clone();
 		body = await readBodyCapped(cloned.body);
 	} catch (err) {
@@ -6264,7 +6282,7 @@ function appendCapped(state$1, decoder, chunk) {
 	state$1.buf += decoder.decode(chunk, { stream: true });
 	state$1.totalBytes += chunk.byteLength;
 }
-function wrapResponseForCapture(c, onFinish) {
+function wrapResponseForCapture(c, level, onFinish) {
 	const body = c.res.body;
 	const state$1 = {
 		buf: "",
@@ -6294,7 +6312,7 @@ function wrapResponseForCapture(c, onFinish) {
 						return;
 					}
 					if (result.value) {
-						appendCapped(state$1, decoder, result.value);
+						if (level === "full") appendCapped(state$1, decoder, result.value);
 						controller.enqueue(result.value);
 					}
 				} catch (err) {
@@ -6320,21 +6338,30 @@ function bodyOrTruncated(state$1) {
 	return state$1.truncated ? `${state$1.buf}[TRUNCATED]` : state$1.buf;
 }
 const traceMiddleware = async (c, next) => {
-	if (!shouldCapture(c)) {
+	const level = captureLevel(c);
+	if (!level) {
 		await next();
 		return;
 	}
 	const start$1 = Date.now();
 	const traceId = randomUUID();
-	const reqLeg = await captureRequest(c);
+	const reqLeg = await captureRequest(c, level);
 	const key = c.get("key");
+	const stripBody = (leg) => {
+		if (!leg) return void 0;
+		if (level === "full") return leg;
+		return {
+			...leg,
+			body: void 0
+		};
+	};
 	let upstreamReq;
 	let upstreamRes;
 	let upstreamResPending;
 	const capture = (cap) => {
-		upstreamReq = cap.req;
-		if (cap.res) upstreamRes = cap.res;
-		if (cap.res_pending) upstreamResPending = cap.res_pending;
+		upstreamReq = stripBody(cap.req);
+		if (cap.res) upstreamRes = stripBody(cap.res);
+		if (cap.res_pending) upstreamResPending = level === "full" ? cap.res_pending : cap.res_pending.then((leg) => stripBody(leg));
 	};
 	c.set("trace_capture_upstream", capture);
 	let threw = false;
@@ -6364,13 +6391,14 @@ const traceMiddleware = async (c, next) => {
 				ts: start$1,
 				key_id: key?.id ?? "__noauth__",
 				route: c.req.path,
+				capture_level: level,
 				req: reqLeg,
 				upstream_req: upstreamReq,
 				upstream_res: upstreamRes,
 				res: {
 					status: c.res.status,
 					headers: headersToObj(c.res.headers),
-					body: bodyOrTruncated(resState)
+					body: level === "full" ? bodyOrTruncated(resState) : void 0
 				},
 				latency_ms: Date.now() - start$1,
 				meta: traceMeta
@@ -6387,7 +6415,7 @@ const traceMiddleware = async (c, next) => {
 		});
 		throw thrown;
 	}
-	wrapResponseForCapture(c, (state$1) => {
+	wrapResponseForCapture(c, level, (state$1) => {
 		finishTrace(state$1);
 	});
 };
@@ -7361,7 +7389,7 @@ function sanitiseOutputItem(item) {
 */
 const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, defaultEffort) => {
 	if (!state.copilotToken) throw new Error("Copilot token not found");
-	const willInjectEffort = !payload.thinking && !!defaultEffort && defaultEffort !== "";
+	const willInjectEffort = !payload.thinking && Boolean(defaultEffort);
 	const hasVision = messageHasImages(payload);
 	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta, willInjectEffort);
 	headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user";

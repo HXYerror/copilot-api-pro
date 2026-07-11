@@ -37,6 +37,12 @@ const REDACTION_PLACEHOLDER = "[REDACTED]"
  * - Proxy → upstream: authorization (Copilot bearer), x-github-token,
  *   x-vscs-token (Copilot Chat extension headers — see api-config.ts)
  * - Upstream → proxy: set-cookie
+ *
+ * BYOK-style secrets (`x-anthropic-key`, `x-openai-key`, `x-goog-api-key`,
+ * `openai-organization`) aren't emitted by this proxy today, but headers-only
+ * capture now persists every header on every authed request. A BYOK client
+ * that stamps one of these on a request would otherwise land it on disk in
+ * cleartext. Cheap to defend, so we do.
  */
 export const REDACTED_HEADERS: ReadonlySet<string> = new Set([
   "authorization",
@@ -46,6 +52,10 @@ export const REDACTED_HEADERS: ReadonlySet<string> = new Set([
   "proxy-authorization",
   "x-github-token",
   "x-vscs-token",
+  "x-anthropic-key",
+  "x-openai-key",
+  "x-goog-api-key",
+  "openai-organization",
   // x-capi-debug is not a secret, but it's an admin-tier signal we don't
   // want to surface in captured traces (operators can see it in the audit
   // log instead).
