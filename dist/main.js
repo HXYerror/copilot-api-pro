@@ -7389,7 +7389,7 @@ function sanitiseOutputItem(item) {
 */
 const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, defaultEffort) => {
 	if (!state.copilotToken) throw new Error("Copilot token not found");
-	const willInjectEffort = !payload.thinking && Boolean(defaultEffort);
+	const willInjectEffort = !payload.thinking && !!defaultEffort && defaultEffort !== "";
 	const hasVision = messageHasImages(payload);
 	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta, willInjectEffort);
 	headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user";
