@@ -53,8 +53,16 @@ interface NativeUsage {
   cache_read_tokens?: number
   cache_creation_input_tokens?: number
   cache_creation_tokens?: number
-  /** OpenAI /responses field — only place reasoning_tokens shows up. */
-  output_tokens_details?: { reasoning_tokens?: number }
+  /**
+   * Field naming varies by upstream shape:
+   *   - OpenAI /responses:      usage.output_tokens_details.reasoning_tokens
+   *   - Anthropic /v1/messages: usage.output_tokens_details.thinking_tokens
+   * We accept both.
+   */
+  output_tokens_details?: {
+    reasoning_tokens?: number
+    thinking_tokens?: number
+  }
 }
 
 /**
@@ -115,11 +123,14 @@ export function readCopilotUsage(response: unknown): NormalisedUsage {
       out.cache_creation_tokens
       ?? native.cache_creation_input_tokens
       ?? native.cache_creation_tokens
-    // /responses-style breakdown: reasoning_tokens hides under
-    // output_tokens_details. Only place it appears — Claude responses
-    // don't have it.
+    // Reasoning / thinking tokens hide under output_tokens_details.
+    // OpenAI /responses  → reasoning_tokens
+    // Anthropic /messages → thinking_tokens
+    // Same concept, different field name; accept either.
     out.reasoning_tokens =
-      out.reasoning_tokens ?? native.output_tokens_details?.reasoning_tokens
+      out.reasoning_tokens
+      ?? native.output_tokens_details?.reasoning_tokens
+      ?? native.output_tokens_details?.thinking_tokens
   }
 
   // Best-effort total_tokens when neither field provided it.

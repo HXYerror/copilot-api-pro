@@ -6464,7 +6464,7 @@ function readCopilotUsage(response) {
 		out.total_tokens = out.total_tokens ?? native.total_tokens;
 		out.cache_read_tokens = out.cache_read_tokens ?? native.cache_read_input_tokens ?? native.cache_read_tokens;
 		out.cache_creation_tokens = out.cache_creation_tokens ?? native.cache_creation_input_tokens ?? native.cache_creation_tokens;
-		out.reasoning_tokens = out.reasoning_tokens ?? native.output_tokens_details?.reasoning_tokens;
+		out.reasoning_tokens = out.reasoning_tokens ?? native.output_tokens_details?.reasoning_tokens ?? native.output_tokens_details?.thinking_tokens;
 	}
 	if (out.total_tokens === void 0 && out.prompt_tokens !== void 0 && out.completion_tokens !== void 0) out.total_tokens = out.prompt_tokens + out.completion_tokens;
 	return out;
@@ -7361,8 +7361,9 @@ function sanitiseOutputItem(item) {
 */
 const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, defaultEffort) => {
 	if (!state.copilotToken) throw new Error("Copilot token not found");
+	const willInjectEffort = !payload.thinking && !!defaultEffort && defaultEffort !== "";
 	const hasVision = messageHasImages(payload);
-	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta);
+	const headers = buildNativeHeaders(hasVision, Boolean(payload.stream), clientAnthropicBeta, willInjectEffort);
 	headers["X-Initiator"] = isAgentMessagesCall(payload) ? "agent" : "user";
 	const upstream = `${copilotBaseUrl(state)}/v1/messages`;
 	consola.debug("Native Anthropic upstream:", upstream);
@@ -7389,7 +7390,7 @@ const createMessagesNative = async (payload, onUpstream, clientAnthropicBeta, de
 			}
 			consola.warn(`[anthropic-beta] upstream rejected ${JSON.stringify(newlyUnsupported)} — added to deny-list${newToProcess.length > 0 ? " (new, persisted)" : ""}, retrying`);
 			sentHeaders = { ...headers };
-			const rebuiltBeta = mergeAnthropicBeta(clientAnthropicBeta);
+			const rebuiltBeta = mergeAnthropicBeta(clientAnthropicBeta, willInjectEffort);
 			if (rebuiltBeta === "") delete sentHeaders["anthropic-beta"];
 			else sentHeaders["anthropic-beta"] = rebuiltBeta;
 			response = await fetch(upstream, {
@@ -7546,8 +7547,9 @@ function persistLearnedBetaFlag(flag) {
 		consola.warn(`[anthropic-beta] failed to persist learned flag "${flag}": ${String(err)}`);
 	}
 }
-function mergeAnthropicBeta(clientBeta) {
+function mergeAnthropicBeta(clientBeta, requireEffortBeta = false) {
 	const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"];
+	if (requireEffortBeta) ours.push("effort-2025-11-24");
 	const fromClient = (clientBeta ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 	const merged = [...new Set([...fromClient, ...ours])];
 	const denyList = ensureLearnedSet();
@@ -7570,9 +7572,9 @@ function parseUnsupportedBetaFromError(body) {
 * header.  We reuse `copilotHeaders()` for auth/agent headers and then layer the
 * Anthropic-specific ones on top.
 */
-function buildNativeHeaders(vision, stream, clientBeta) {
+function buildNativeHeaders(vision, stream, clientBeta, requireEffortBeta = false) {
 	const { "openai-intent": _dropped,...anthropicBase } = copilotHeaders(state, vision);
-	const beta = mergeAnthropicBeta(clientBeta);
+	const beta = mergeAnthropicBeta(clientBeta, requireEffortBeta);
 	return {
 		...anthropicBase,
 		"anthropic-version": "2023-06-01",

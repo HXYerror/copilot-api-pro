@@ -43,11 +43,22 @@ export const createMessagesNative = async (
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
+  // When we're about to inject default_effort AND the client didn't send
+  // their own thinking, we MUST also request the `effort-2025-11-24`
+  // anthropic-beta flag from upstream — that beta is what gates
+  // `output_config.effort`. Without it, Copilot silently drops the
+  // field and our injection becomes a no-op (verified empirically:
+  // thinking_tokens=0 across all effort levels when the beta is absent,
+  // but rises monotonically once it's included).
+  const willInjectEffort =
+    !payload.thinking && !!defaultEffort && defaultEffort !== ""
+
   const hasVision = messageHasImages(payload)
   const headers = buildNativeHeaders(
     hasVision,
     Boolean(payload.stream),
     clientAnthropicBeta,
+    willInjectEffort,
   )
   // X-Initiator parity with /chat/completions and /responses: tells upstream
   // whether this turn is operator-initiated ("user") or part of an
@@ -129,7 +140,10 @@ export const createMessagesNative = async (
       // forwarding `anthropic-beta: ""` would either be a no-op or get
       // rejected as a malformed value depending on upstream's parser.
       sentHeaders = { ...headers }
-      const rebuiltBeta = mergeAnthropicBeta(clientAnthropicBeta)
+      const rebuiltBeta = mergeAnthropicBeta(
+        clientAnthropicBeta,
+        willInjectEffort,
+      )
       if (rebuiltBeta === "") {
         delete sentHeaders["anthropic-beta"]
       } else {
@@ -341,8 +355,19 @@ function persistLearnedBetaFlag(flag: string): void {
   }
 }
 
-function mergeAnthropicBeta(clientBeta: string | undefined): string {
+function mergeAnthropicBeta(
+  clientBeta: string | undefined,
+  requireEffortBeta = false,
+): string {
   const ours = ["interleaved-thinking-2025-05-14", "prompt-caching-2024-07-31"]
+  if (requireEffortBeta) {
+    // `effort-2025-11-24` unlocks `output_config.effort` on Anthropic
+    // upstream. Only add it when the request is going to carry effort —
+    // adding it unconditionally would surface as an unsupported-flag
+    // warning on models / endpoints that don't accept it, and would
+    // eventually land the flag in the auto-learned deny-list.
+    ours.push("effort-2025-11-24")
+  }
   const fromClient = (clientBeta ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -381,6 +406,7 @@ function buildNativeHeaders(
   vision: boolean,
   stream: boolean,
   clientBeta?: string,
+  requireEffortBeta = false,
 ): Record<string, string> {
   const base = copilotHeaders(state, vision)
 
@@ -393,7 +419,7 @@ function buildNativeHeaders(
   // version of upstream could reject both), DROP the header entirely
   // rather than forwarding `anthropic-beta: ""` which is a malformed value
   // some HTTP parsers reject.
-  const beta = mergeAnthropicBeta(clientBeta)
+  const beta = mergeAnthropicBeta(clientBeta, requireEffortBeta)
   return {
     ...anthropicBase,
     "anthropic-version": "2023-06-01",
