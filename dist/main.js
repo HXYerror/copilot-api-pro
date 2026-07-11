@@ -5823,7 +5823,15 @@ function statusToErrorTag(status) {
 	if (status >= 400 && status < 500) return "client_error";
 	return "error";
 }
+const REAL_MESSAGE_ROUTES = new Set([
+	"/chat/completions",
+	"/v1/chat/completions",
+	"/v1/messages",
+	"/responses",
+	"/v1/responses"
+]);
 function resolveFinalModel(c, snapshotModel) {
+	if (!REAL_MESSAGE_ROUTES.has(c.req.path)) return snapshotModel;
 	if (!/^[A-Z]+ \//.test(snapshotModel)) return snapshotModel;
 	const handlerModel = c.get("client_requested_model");
 	if (typeof handlerModel === "string" && handlerModel.length > 0) return handlerModel;
@@ -5882,7 +5890,7 @@ const telemetryMiddleware = async (c, next) => {
 	const start$1 = Date.now();
 	let clientModel = `${c.req.method} ${c.req.path}`;
 	let thinkingLevel = null;
-	if (c.req.method === "POST" && c.req.path !== "/v1/messages/count_tokens") try {
+	if (c.req.method === "POST" && REAL_MESSAGE_ROUTES.has(c.req.path)) try {
 		const meta = await snapshotPostMeta(c.req.raw.clone());
 		if (meta.model !== "n/a") clientModel = meta.model;
 		thinkingLevel = meta.thinking_level;

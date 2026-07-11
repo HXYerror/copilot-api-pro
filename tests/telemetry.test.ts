@@ -777,7 +777,11 @@ describe("telemetry middleware: Anthropic native stream", () => {
 // count_tokens pre-flight rows must not land in the Messages tab
 // ---------------------------------------------------------------------------
 
-describe("telemetry middleware: /v1/messages/count_tokens", () => {
+// ---------------------------------------------------------------------------
+// Non-completion routes must not land in the Messages tab
+// ---------------------------------------------------------------------------
+
+describe("telemetry middleware: non-completion routes → Other tab", () => {
   test("count_tokens row is tagged with METHOD-path (routes to Other tab)", async () => {
     // count_tokens is a POST that carries a `model` in its body, but it's a
     // pre-flight token-estimate call — Claude Code fires one before every
@@ -811,6 +815,58 @@ describe("telemetry middleware: /v1/messages/count_tokens", () => {
     expect(ev?.model).toBe("POST /v1/messages/count_tokens")
     // The "/"-heuristic — same predicate kindClause uses — must classify
     // this row as "other", not "messages".
+    expect(ev?.model.includes("/")).toBe(true)
+  })
+
+  test("embeddings row is tagged with METHOD-path (not the body model)", async () => {
+    // /v1/embeddings is a POST that carries a `model` field ("text-embedding-*")
+    // but is not a completion — it's a vector-search pre-computation call.
+    // The Messages tab is reserved for real completion routes, so telemetry
+    // must skip the body snapshot here too. Only /chat/completions,
+    // /v1/messages, and /responses (with their /v1 twins) surface a body-model.
+    const { plain } = createKey({
+      tier: "client",
+      label: "tc",
+      allowedModels: ["*"],
+    })
+
+    // Upstream mock — embeddings handler forwards; we just need a plausible
+    // 200 so the middleware records a normal row.
+    // @ts-expect-error - mock doesn't implement full fetch signature
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
+            model: "text-embedding-3-small",
+            usage: { prompt_tokens: 4, total_tokens: 4 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+
+    const res = await server.request("/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${plain}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: "hello world",
+      }),
+    })
+    // Handler might 400 in the mocked config (no model alias configured for
+    // text-embedding-*), but telemetry still records the row — and the row's
+    // classification is what we care about here.
+    await res.text()
+
+    await waitForEvents(1)
+    const ev = lastEvent()
+    // Regardless of status, model must be the METHOD-path marker, NOT the
+    // body's "text-embedding-3-small" value.
+    expect(ev?.model).toBe("POST /v1/embeddings")
     expect(ev?.model.includes("/")).toBe(true)
   })
 })

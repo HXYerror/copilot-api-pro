@@ -201,6 +201,29 @@ function statusToErrorTag(status: number): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Real-message allowlist.
+//
+// Only requests to these paths belong in the Logs page's "Messages" tab.
+// Everything else (embeddings, count_tokens pre-flights, /v1/models, /token,
+// /usage, and any future non-completion route) gets tagged with the
+// "<METHOD> <path>" marker so the "/"-heuristic in kindClause routes it to
+// the "Other" tab.
+//
+// We check the exact request path — not startsWith — so /v1/messages does
+// NOT match /v1/messages/count_tokens. Both /chat/completions and its /v1
+// alias are proxied by the same handler (see src/server.ts), so we list
+// both. Same for /responses.
+// ---------------------------------------------------------------------------
+
+const REAL_MESSAGE_ROUTES: ReadonlySet<string> = new Set([
+  "/chat/completions",
+  "/v1/chat/completions",
+  "/v1/messages",
+  "/responses",
+  "/v1/responses",
+])
+
+// ---------------------------------------------------------------------------
 // Insert helper — fully wrapped in try/catch so a failure never propagates
 // ---------------------------------------------------------------------------
 
@@ -208,6 +231,13 @@ function resolveFinalModel(
   c: Context<{ Variables: TelemetryVar }>,
   snapshotModel: string,
 ): string {
+  // Only the real message routes get to surface a body-model in the row —
+  // everything else stays as "<METHOD> <path>" so the Logs "Messages" tab
+  // isn't polluted by embeddings, count_tokens, /v1/models, etc. Even if a
+  // future non-completion handler starts setting client_requested_model,
+  // we ignore it here.
+  if (!REAL_MESSAGE_ROUTES.has(c.req.path)) return snapshotModel
+
   // ctx.clientModel comes from the body snapshot — it can fall back to
   // "<METHOD> <path>" when the model field wasn't found in the first 16KB.
   // Handlers' applyDefaultModelRewrite always sets client_requested_model,
@@ -310,21 +340,13 @@ export const telemetryMiddleware: MiddlewareHandler<{
   const start = Date.now()
 
   // Snapshot the client-facing model name + thinking level BEFORE next()
-  // consumes the body. We clone defensively so c.req.json() still works
-  // inside the handler. GET routes (e.g. /v1/models) have no body fields —
-  // for those we record "<METHOD route>" so the Logs page row shows the
-  // actual endpoint instead of an uninformative "n/a".
-  //
-  // Special-case: /v1/messages/count_tokens is a POST that carries a model
-  // in its body, so a naive snapshot would tag the row exactly like a real
-  // completion. But it's a pre-flight token-estimate call — Claude Code
-  // fires one before every real /v1/messages — and lumping it with the
-  // Messages tab makes latency / volume totals meaningless. Skip the
-  // snapshot and let the "<METHOD> <path>" default land in the Other tab
-  // via the "/"-heuristic in kindClause.
+  // consumes the body. Only real message routes get the snapshot — every
+  // other route (GET, embeddings, count_tokens, admin, health) falls
+  // through to the "<METHOD> <path>" marker so the Logs "Messages" tab
+  // stays clean of non-completion traffic.
   let clientModel = `${c.req.method} ${c.req.path}`
   let thinkingLevel: string | null = null
-  if (c.req.method === "POST" && c.req.path !== "/v1/messages/count_tokens") {
+  if (c.req.method === "POST" && REAL_MESSAGE_ROUTES.has(c.req.path)) {
     try {
       const meta = await snapshotPostMeta(c.req.raw.clone() as Request)
       if (meta.model !== "n/a") clientModel = meta.model
