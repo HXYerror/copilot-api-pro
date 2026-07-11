@@ -181,6 +181,7 @@ interface FullTrace {
   ts?: number
   key_id?: string
   route?: string
+  capture_level?: "headers" | "full"
   req?: TraceLeg
   upstream_req?: TraceLeg
   upstream_res?: TraceLeg
@@ -404,6 +405,7 @@ function LegsTab({
   copied: string | null
   onCopy: (s: string, tag: string) => void
 }) {
+  const headersOnly = trace?.capture_level === "headers"
   return (
     <div className="mt-4">
       {traceLoading && (
@@ -415,6 +417,17 @@ function LegsTab({
             {noCaptureReason
               ?? `No captured trace for this event. Enable debug on the key`
                 + ` and re-run the request to capture future calls.`}
+          </Text>
+        </Card>
+      )}
+      {headersOnly && (tab === "request" || tab === "response") && (
+        <Card decoration="top" decorationColor="blue" className="mb-3">
+          <Text className="text-xs">
+            <strong>Headers-only capture.</strong> This request wasn't tagged
+            for full-body debug, so the wire headers are recorded but the body
+            content is not. Enable debug on the key (or set global{" "}
+            <span className="mono">features.debug</span>) and re-run to see
+            request / response bodies here.
           </Text>
         </Card>
       )}

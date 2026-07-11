@@ -325,6 +325,14 @@ export interface FullTraceResponse {
     ts?: number
     key_id?: string
     route?: string
+    /**
+     * "headers" = only method / url / status / headers captured for
+     * every leg (bodies omitted). Default mode when neither global nor
+     * per-key debug is on. "full" = bodies included too. Missing on
+     * legacy trace lines written before this field existed → treat as
+     * "full" for back-compat.
+     */
+    capture_level?: "headers" | "full"
     req?: TraceLeg
     upstream_req?: TraceLeg
     upstream_res?: TraceLeg

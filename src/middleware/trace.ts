@@ -81,17 +81,26 @@ export type TraceVar = KeyVar & {
 // Activation check
 // ---------------------------------------------------------------------------
 
-function shouldCapture(c: Context<{ Variables: KeyVar }>): boolean {
-  const key = c.get("key") as KeyVar["key"] | undefined
-  if (!key) return false
+type CaptureLevel = "headers" | "full"
 
-  // Global override from config.features.debug — captures every request
-  // regardless of key state. Operator-flipped via Settings UI; intended for
-  // short-lived debug sessions because trace files can grow fast.
-  if (getConfig().features.debug) return true
+/**
+ * Every request that clears auth is captured — at minimum in headers-only
+ * mode. That gives operators routing / rate-limit / auth-decision
+ * visibility for free, without any opt-in. Full-body capture is gated on
+ * explicit debug signals so bodies (which are the privacy-heavy and
+ * disk-heavy part) only land on disk when someone asked for them.
+ */
+function captureLevel(c: Context<{ Variables: KeyVar }>): CaptureLevel | null {
+  const key = c.get("key") as KeyVar["key"] | undefined
+  if (!key) return null
+
+  // Global override — captures every request in full mode regardless of
+  // key state. Operator-flipped via Settings UI; intended for short-lived
+  // debug sessions because trace files can grow fast.
+  if (getConfig().features.debug) return "full"
 
   // Key-level debug opt-in (the canonical "trace this key" signal).
-  if (isDebugActive(key)) return true
+  if (isDebugActive(key)) return "full"
 
   // Admin-tier override via X-Capi-Debug. authMiddleware has already
   // stripped the header (so it never leaks upstream) and surfaced the bit
@@ -99,9 +108,10 @@ function shouldCapture(c: Context<{ Variables: KeyVar }>): boolean {
   // auth.ts only sets the flag for admin-tier callers, but keeping it
   // makes the contract explicit and survives future refactors.
   const viaHeader = c.get("debug_via_header")
-  if (viaHeader === true && key.tier === "admin") return true
+  if (viaHeader === true && key.tier === "admin") return "full"
 
-  return false
+  // Default: headers-only. Small, low-privacy, always available.
+  return "headers"
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +182,16 @@ function headersToObj(h: Headers): Record<string, string> {
 
 async function captureRequest(
   c: Context<{ Variables: KeyVar }>,
+  level: CaptureLevel,
 ): Promise<TraceLeg> {
   const raw = c.req.raw
-  let body = ""
-  if (raw.body && raw.method !== "GET" && raw.method !== "HEAD") {
+  let body: string | undefined
+  if (
+    level === "full"
+    && raw.body
+    && raw.method !== "GET"
+    && raw.method !== "HEAD"
+  ) {
     try {
       const cloned = raw.clone() as Request
       body = await readBodyCapped(cloned.body)
@@ -227,6 +243,7 @@ function appendCapped(
 
 function wrapResponseForCapture(
   c: Context<{ Variables: KeyVar }>,
+  level: CaptureLevel,
   onFinish: (state: ResponseCaptureState) => void,
 ): void {
   const body = c.res.body
@@ -263,7 +280,12 @@ function wrapResponseForCapture(
             return
           }
           if (result.value) {
-            appendCapped(state, decoder, result.value)
+            // Headers-only mode: pass bytes through but don't accumulate.
+            // Wrapping is still needed to detect stream completion for
+            // accurate latency_ms and to fire the trace write.
+            if (level === "full") {
+              appendCapped(state, decoder, result.value)
+            }
             controller.enqueue(result.value)
           }
         } catch (err) {
@@ -300,14 +322,15 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   c,
   next,
 ) => {
-  if (!shouldCapture(c)) {
+  const level = captureLevel(c)
+  if (!level) {
     await next()
     return
   }
 
   const start = Date.now()
   const traceId = randomUUID()
-  const reqLeg = await captureRequest(c)
+  const reqLeg = await captureRequest(c, level)
   const key = c.get("key") as KeyVar["key"] | undefined
 
   // Install the upstream-capture sink. Helpers under
@@ -322,13 +345,27 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   // setting `cap.res_pending` to a Promise that resolves when the body is
   // ready. finishTrace awaits this promise (with a 30s safety timeout)
   // before writing the JSONL line so the upstream_res field is populated.
+  //
+  // In headers-only mode we still install the sink (helpers always call
+  // it) but strip the body out of whatever they hand us — the request /
+  // response wire format stays visible without the payload content.
+  const stripBody = (leg: TraceLeg | undefined): TraceLeg | undefined => {
+    if (!leg) return undefined
+    if (level === "full") return leg
+    return { ...leg, body: undefined }
+  }
   let upstreamReq: TraceLeg | undefined
   let upstreamRes: TraceLeg | undefined
   let upstreamResPending: Promise<TraceLeg | undefined> | undefined
   const capture: TraceCaptureUpstream = (cap) => {
-    upstreamReq = cap.req
-    if (cap.res) upstreamRes = cap.res
-    if (cap.res_pending) upstreamResPending = cap.res_pending
+    upstreamReq = stripBody(cap.req)
+    if (cap.res) upstreamRes = stripBody(cap.res)
+    if (cap.res_pending) {
+      upstreamResPending =
+        level === "full" ?
+          cap.res_pending
+        : cap.res_pending.then((leg) => stripBody(leg))
+    }
   }
   // Type-safe set; helpers retrieve via c.var.trace_capture_upstream.
   ;(c as Context<{ Variables: TraceVar }>).set(
@@ -376,13 +413,14 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
         ts: start,
         key_id: key?.id ?? "__noauth__",
         route: c.req.path,
+        capture_level: level,
         req: reqLeg,
         upstream_req: upstreamReq,
         upstream_res: upstreamRes,
         res: {
           status: c.res.status,
           headers: headersToObj(c.res.headers),
-          body: bodyOrTruncated(resState),
+          body: level === "full" ? bodyOrTruncated(resState) : undefined,
         },
         latency_ms: Date.now() - start,
         meta: traceMeta,
@@ -397,7 +435,7 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
     throw thrown
   }
 
-  wrapResponseForCapture(c, (state) => {
+  wrapResponseForCapture(c, level, (state) => {
     void finishTrace(state)
   })
 }

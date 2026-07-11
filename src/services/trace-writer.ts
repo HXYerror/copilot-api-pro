@@ -38,7 +38,12 @@ export interface TraceLeg {
   url?: string
   status?: number
   headers: Record<string, string> | Headers
-  body: string | object | null | undefined
+  /**
+   * Body bytes captured for this leg. `undefined` = leg was captured in
+   * headers-only mode (no body was read from the wire). Distinct from
+   * `""` which means "captured, and the body was empty".
+   */
+  body?: string | object | null
 }
 
 export interface TraceEvent {
@@ -51,6 +56,20 @@ export interface TraceEvent {
   upstream_res?: TraceLeg
   res: TraceLeg
   latency_ms: number
+  /**
+   * Capture depth for this trace:
+   *   - "headers": legs carry method / url / status / headers only.
+   *     `body` on every leg is undefined and is omitted from the JSONL
+   *     serialization. Every request is captured at this level so
+   *     operators can always inspect routing / rate-limit / auth
+   *     signals without turning on debug up-front.
+   *   - "full": additionally captures req / res / upstream_req /
+   *     upstream_res bodies (subject to size cap + redaction). Gated
+   *     on shouldCapture — global features.debug, per-key debug, or
+   *     admin X-Capi-Debug header.
+   * Missing on old records = "full" (backward compat).
+   */
+  capture_level?: "headers" | "full"
   /**
    * Optional per-request metadata.  Free-form record so future fields don't
    * need a schema bump.  Today we use it to surface the default-model
@@ -87,7 +106,9 @@ function legToJSON(leg: TraceLeg): Record<string, unknown> {
     ...(leg.url !== undefined && { url: leg.url }),
     ...(leg.status !== undefined && { status: leg.status }),
     headers: redactHeaders(leg.headers),
-    body: redactBody(leg.body),
+    // Omit body entirely for headers-only captures. Distinguishes
+    // "not captured" from "captured empty" for downstream tooling.
+    ...(leg.body !== undefined && { body: redactBody(leg.body) }),
   }
 }
 
@@ -97,6 +118,7 @@ function eventToJSON(event: TraceEvent): Record<string, unknown> {
     ts: event.ts,
     key_id: event.key_id,
     route: event.route,
+    ...(event.capture_level && { capture_level: event.capture_level }),
     req: legToJSON(event.req),
     ...(event.upstream_req && { upstream_req: legToJSON(event.upstream_req) }),
     ...(event.upstream_res && { upstream_res: legToJSON(event.upstream_res) }),
