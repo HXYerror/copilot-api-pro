@@ -6259,10 +6259,10 @@ function headersToObj(h) {
 	for (const [k, v] of h.entries()) out[k.toLowerCase()] = v;
 	return out;
 }
-async function captureRequest(c, level) {
+async function captureRequest(c) {
 	const raw = c.req.raw;
 	let body;
-	if (level === "full" && raw.body && raw.method !== "GET" && raw.method !== "HEAD") try {
+	if (raw.body && raw.method !== "GET" && raw.method !== "HEAD") try {
 		const cloned = raw.clone();
 		body = await readBodyCapped(cloned.body);
 	} catch (err) {
@@ -6290,7 +6290,7 @@ function appendCapped(state$1, decoder, chunk) {
 	state$1.buf += decoder.decode(chunk, { stream: true });
 	state$1.totalBytes += chunk.byteLength;
 }
-function wrapResponseForCapture(c, level, onFinish) {
+function wrapResponseForCapture(c, onFinish) {
 	const body = c.res.body;
 	const state$1 = {
 		buf: "",
@@ -6320,7 +6320,7 @@ function wrapResponseForCapture(c, level, onFinish) {
 						return;
 					}
 					if (result.value) {
-						if (level === "full") appendCapped(state$1, decoder, result.value);
+						appendCapped(state$1, decoder, result.value);
 						controller.enqueue(result.value);
 					}
 				} catch (err) {
@@ -6353,23 +6353,15 @@ const traceMiddleware = async (c, next) => {
 	}
 	const start$1 = Date.now();
 	const traceId = randomUUID();
-	const reqLeg = await captureRequest(c, level);
+	const reqLeg = await captureRequest(c);
 	const key = c.get("key");
-	const stripBody = (leg) => {
-		if (!leg) return void 0;
-		if (level === "full") return leg;
-		return {
-			...leg,
-			body: void 0
-		};
-	};
 	let upstreamReq;
 	let upstreamRes;
 	let upstreamResPending;
 	const capture = (cap) => {
-		upstreamReq = stripBody(cap.req);
-		if (cap.res) upstreamRes = stripBody(cap.res);
-		if (cap.res_pending) upstreamResPending = level === "full" ? cap.res_pending : cap.res_pending.then((leg) => stripBody(leg));
+		upstreamReq = cap.req;
+		if (cap.res) upstreamRes = cap.res;
+		if (cap.res_pending) upstreamResPending = cap.res_pending;
 	};
 	c.set("trace_capture_upstream", capture);
 	let threw = false;
@@ -6392,6 +6384,16 @@ const traceMiddleware = async (c, next) => {
 				if (timer) clearTimeout(timer);
 			}
 		}
+		const isError = threw || c.res.status >= 400;
+		const effectiveLevel = level === "full" || isError ? "full" : "headers";
+		const stripBody = (leg) => {
+			if (!leg) return void 0;
+			if (effectiveLevel === "full") return leg;
+			return {
+				...leg,
+				body: void 0
+			};
+		};
 		try {
 			const traceMeta = c.var.trace_meta;
 			writeTrace({
@@ -6399,14 +6401,17 @@ const traceMiddleware = async (c, next) => {
 				ts: start$1,
 				key_id: key?.id ?? "__noauth__",
 				route: c.req.path,
-				capture_level: level,
-				req: reqLeg,
-				upstream_req: upstreamReq,
-				upstream_res: upstreamRes,
+				capture_level: effectiveLevel,
+				req: effectiveLevel === "full" ? reqLeg : {
+					...reqLeg,
+					body: void 0
+				},
+				upstream_req: stripBody(upstreamReq),
+				upstream_res: stripBody(upstreamRes),
 				res: {
 					status: c.res.status,
 					headers: headersToObj(c.res.headers),
-					body: level === "full" ? bodyOrTruncated(resState) : void 0
+					body: effectiveLevel === "full" ? bodyOrTruncated(resState) : void 0
 				},
 				latency_ms: Date.now() - start$1,
 				meta: traceMeta
@@ -6423,7 +6428,7 @@ const traceMiddleware = async (c, next) => {
 		});
 		throw thrown;
 	}
-	wrapResponseForCapture(c, level, (state$1) => {
+	wrapResponseForCapture(c, (state$1) => {
 		finishTrace(state$1);
 	});
 };

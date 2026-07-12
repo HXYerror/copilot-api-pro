@@ -800,4 +800,74 @@ describe("trace middleware — end-to-end", () => {
       : 0
     expect(afterSize).toBeGreaterThan(beforeSize)
   })
+
+  test("error response (500) auto-promotes headers-only → full", async () => {
+    // A client-tier key with debug OFF would normally get a headers-only
+    // trace. But when the response is an error, empty-body traces are
+    // exactly the debugging dead-end the trace file is meant to prevent —
+    // so the middleware auto-promotes to full and preserves the buffered
+    // req/res bodies. This test drives an upstream 500 through the chat-
+    // completions handler and asserts the resulting JSONL line has
+    // capture_level="full" plus non-empty bodies on the client-facing legs.
+    await loadConfig(makeTmpConfig(testDir, { auth: true }, { traces_days: 7 }))
+    const { plain } = createKey({ tier: "client", label: "trace-err" })
+    // Mock upstream returning a 500 with a JSON error body — mirrors the
+    // shape Copilot actually emits on internal errors.
+    const upstreamErrorBody = JSON.stringify({
+      error: {
+        message: "upstream unavailable",
+        type: "internal_error",
+      },
+    })
+    // @ts-expect-error - mock doesn't implement full fetch signature
+    globalThis.fetch = () =>
+      Promise.resolve(
+        new Response(upstreamErrorBody, {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+
+    const clientBody = JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hi" }],
+      stream: false,
+    })
+    const res = await server.request("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${plain}`,
+        "Content-Type": "application/json",
+      },
+      body: clientBody,
+    })
+    // Upstream 500 → proxy 5xx surface. We don't care about the exact code,
+    // only that it's an error status so the auto-promote fires.
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    await res.text()
+    await new Promise((r) => setTimeout(r, 50))
+
+    const filePath = traceFilePath(todayDateStr())
+    expect(fs.existsSync(filePath)).toBe(true)
+    const lines = fs
+      .readFileSync(filePath, "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+    const parsed = JSON.parse(lines.at(-1) ?? "{}") as Record<string, unknown>
+    expect(parsed.capture_level).toBe("full")
+
+    // req body must round-trip — the model field was captured verbatim
+    // (headers-only mode would have dropped it).
+    const req = parsed.req as { body?: string }
+    expect(typeof req.body).toBe("string")
+    expect(req.body).toContain("gpt-4o")
+
+    // res body must be present — this is the diagnostic payload the whole
+    // feature exists for. Either the proxy's own error envelope or the
+    // upstream body passed through, depending on how forwardError shaped
+    // it — either way, non-empty and non-undefined.
+    const resLeg = parsed.res as { body?: string }
+    expect(typeof resLeg.body).toBe("string")
+    expect((resLeg.body ?? "").length).toBeGreaterThan(0)
+  })
 })

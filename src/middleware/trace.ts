@@ -20,6 +20,20 @@
  * Body capture is capped at MAX_BODY_BYTES per leg; anything beyond is
  * replaced with "[TRUNCATED]".
  *
+ * Capture-level ladder (what actually lands in the JSONL line):
+ *   - "full"    — bodies on every leg. Selected when the operator opted in
+ *                 up-front (per-key debug, admin X-Capi-Debug, or global
+ *                 features.debug).
+ *   - "full" (auto-promoted) — same shape as above, but selected because
+ *                 the request ended in an error (status >= 400 or the
+ *                 middleware threw). Every request buffers its bodies in
+ *                 memory regardless of level, so operators can diagnose
+ *                 5xx incidents without having had debug enabled beforehand.
+ *   - "headers" — bodies dropped. Selected for successful (status < 400)
+ *                 requests when debug wasn't opted-in. Every request still
+ *                 lands in the trace file at this minimum so operators
+ *                 have routing / auth / rate-limit visibility for free.
+ *
  * Coverage: client→proxy and proxy→client are captured by the middleware
  * directly. The upstream legs (proxy→GitHub Copilot) are captured by helpers
  * in src/services/copilot/* via the `c.var.trace_capture_upstream` callback
@@ -182,16 +196,15 @@ function headersToObj(h: Headers): Record<string, string> {
 
 async function captureRequest(
   c: Context<{ Variables: KeyVar }>,
-  level: CaptureLevel,
 ): Promise<TraceLeg> {
   const raw = c.req.raw
+  // Always buffer the request body when there is one. In headers-only mode
+  // we may still emit it — if the response ends up being an error (status
+  // >= 400 or the middleware threw), the trace middleware auto-promotes to
+  // "full" and needs the buffered body to write. Bodies that don't end up
+  // getting emitted are dropped on the floor when finishTrace runs.
   let body: string | undefined
-  if (
-    level === "full"
-    && raw.body
-    && raw.method !== "GET"
-    && raw.method !== "HEAD"
-  ) {
+  if (raw.body && raw.method !== "GET" && raw.method !== "HEAD") {
     try {
       const cloned = raw.clone() as Request
       body = await readBodyCapped(cloned.body)
@@ -243,7 +256,6 @@ function appendCapped(
 
 function wrapResponseForCapture(
   c: Context<{ Variables: KeyVar }>,
-  level: CaptureLevel,
   onFinish: (state: ResponseCaptureState) => void,
 ): void {
   const body = c.res.body
@@ -280,12 +292,10 @@ function wrapResponseForCapture(
             return
           }
           if (result.value) {
-            // Headers-only mode: pass bytes through but don't accumulate.
-            // Wrapping is still needed to detect stream completion for
-            // accurate latency_ms and to fire the trace write.
-            if (level === "full") {
-              appendCapped(state, decoder, result.value)
-            }
+            // Always accumulate — the middleware decides at emit time
+            // whether to include the body in the JSONL line based on
+            // effectiveLevel (headers vs error auto-promote vs full).
+            appendCapped(state, decoder, result.value)
             controller.enqueue(result.value)
           }
         } catch (err) {
@@ -330,7 +340,7 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
 
   const start = Date.now()
   const traceId = randomUUID()
-  const reqLeg = await captureRequest(c, level)
+  const reqLeg = await captureRequest(c)
   const key = c.get("key") as KeyVar["key"] | undefined
 
   // Install the upstream-capture sink. Helpers under
@@ -346,26 +356,16 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
   // ready. finishTrace awaits this promise (with a 30s safety timeout)
   // before writing the JSONL line so the upstream_res field is populated.
   //
-  // In headers-only mode we still install the sink (helpers always call
-  // it) but strip the body out of whatever they hand us — the request /
-  // response wire format stays visible without the payload content.
-  const stripBody = (leg: TraceLeg | undefined): TraceLeg | undefined => {
-    if (!leg) return undefined
-    if (level === "full") return leg
-    return { ...leg, body: undefined }
-  }
+  // Bodies are always buffered here; the decision to emit them is deferred
+  // to finishTrace so error auto-promote (headers → full on status >= 400)
+  // can retroactively include upstream_req/upstream_res bodies too.
   let upstreamReq: TraceLeg | undefined
   let upstreamRes: TraceLeg | undefined
   let upstreamResPending: Promise<TraceLeg | undefined> | undefined
   const capture: TraceCaptureUpstream = (cap) => {
-    upstreamReq = stripBody(cap.req)
-    if (cap.res) upstreamRes = stripBody(cap.res)
-    if (cap.res_pending) {
-      upstreamResPending =
-        level === "full" ?
-          cap.res_pending
-        : cap.res_pending.then((leg) => stripBody(leg))
-    }
+    upstreamReq = cap.req
+    if (cap.res) upstreamRes = cap.res
+    if (cap.res_pending) upstreamResPending = cap.res_pending
   }
   // Type-safe set; helpers retrieve via c.var.trace_capture_upstream.
   ;(c as Context<{ Variables: TraceVar }>).set(
@@ -405,6 +405,29 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
         if (timer) clearTimeout(timer)
       }
     }
+
+    // Effective capture level:
+    //   - "full" if operator opted in (via captureLevel above), OR
+    //   - "full" if the response was an error (status >= 400) or the
+    //     middleware threw — auto-promote so operators can diagnose 5xx /
+    //     4xx incidents without having had debug enabled up-front. Serving
+    //     "(empty body)" for a 500 is exactly the debugging dead-end this
+    //     feature is meant to prevent.
+    //   - "headers" otherwise: bodies are dropped from the JSONL line.
+    //
+    // Every path buffers bodies up to MAX_BODY_BYTES regardless — the
+    // decision is what we WRITE, not what we CAPTURE. Success paths pay
+    // the buffering cost but bodies get discarded here.
+    const isError = threw || c.res.status >= 400
+    const effectiveLevel: CaptureLevel =
+      level === "full" || isError ? "full" : "headers"
+
+    const stripBody = (leg: TraceLeg | undefined): TraceLeg | undefined => {
+      if (!leg) return undefined
+      if (effectiveLevel === "full") return leg
+      return { ...leg, body: undefined }
+    }
+
     try {
       const traceMeta = (c.var as { trace_meta?: Record<string, unknown> })
         .trace_meta
@@ -413,14 +436,16 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
         ts: start,
         key_id: key?.id ?? "__noauth__",
         route: c.req.path,
-        capture_level: level,
-        req: reqLeg,
-        upstream_req: upstreamReq,
-        upstream_res: upstreamRes,
+        capture_level: effectiveLevel,
+        req:
+          effectiveLevel === "full" ? reqLeg : { ...reqLeg, body: undefined },
+        upstream_req: stripBody(upstreamReq),
+        upstream_res: stripBody(upstreamRes),
         res: {
           status: c.res.status,
           headers: headersToObj(c.res.headers),
-          body: level === "full" ? bodyOrTruncated(resState) : undefined,
+          body:
+            effectiveLevel === "full" ? bodyOrTruncated(resState) : undefined,
         },
         latency_ms: Date.now() - start,
         meta: traceMeta,
@@ -435,7 +460,7 @@ export const traceMiddleware: MiddlewareHandler<{ Variables: KeyVar }> = async (
     throw thrown
   }
 
-  wrapResponseForCapture(c, level, (state) => {
+  wrapResponseForCapture(c, (state) => {
     void finishTrace(state)
   })
 }
