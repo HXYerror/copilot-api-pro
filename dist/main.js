@@ -342,9 +342,19 @@ function stopCopilotTokenRefresh() {
 		copilotTokenRefreshTimer = void 0;
 	}
 }
-const REFRESH_MAX_ATTEMPTS = 10;
-const REFRESH_BACKOFF_BASE_MS = 1e3;
-const REFRESH_BACKOFF_CAP_MS = 6e4;
+const BACKOFF_DELAYS_MS = [
+	1e3,
+	1e4,
+	3e4,
+	6e4,
+	6e4,
+	12e4,
+	12e4,
+	18e4,
+	24e4,
+	3e5
+];
+const REFRESH_MAX_ATTEMPTS = BACKOFF_DELAYS_MS.length + 1;
 let inflightRefresh = null;
 function refreshCopilotTokenWithRetry() {
 	if (inflightRefresh) {
@@ -369,9 +379,9 @@ async function runRefreshLoop() {
 	} catch (err) {
 		lastErr = err;
 		if (attempt >= REFRESH_MAX_ATTEMPTS) break;
-		const jittered = Math.min(REFRESH_BACKOFF_BASE_MS * 2 ** (attempt - 1), REFRESH_BACKOFF_CAP_MS) * (.5 + Math.random() * .5);
-		consola.warn(`[copilot-token] refresh attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed, retrying in ${Math.round(jittered)}ms: ${String(err)}`);
-		await new Promise((resolve) => setTimeout(resolve, jittered));
+		const delayMs = BACKOFF_DELAYS_MS[attempt - 1] ?? 6e4;
+		consola.warn(`[copilot-token] refresh attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed, retrying in ${delayMs}ms: ${String(err)}`);
+		await new Promise((resolve) => setTimeout(resolve, delayMs));
 	}
 	consola.error(`[copilot-token] refresh failed after ${REFRESH_MAX_ATTEMPTS} attempts — continuing with stale token, next scheduled tick will try again. Last error: ${String(lastErr)}`);
 }

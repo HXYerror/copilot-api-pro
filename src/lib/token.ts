@@ -31,7 +31,7 @@ export function stopCopilotTokenRefresh(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh with retry + exponential backoff.
+// Refresh with retry + explicit backoff schedule.
 //
 // GitHub's Copilot token endpoint occasionally 5xx's or times out under load.
 // The previous implementation tried once, logged, and gave up — leaving
@@ -39,19 +39,35 @@ export function stopCopilotTokenRefresh(): void {
 // tick. Every request served in the meantime would 401 from upstream, which
 // the proxy surfaces as a 500 storm to clients.
 //
-// New behaviour: up to REFRESH_MAX_ATTEMPTS attempts per tick, exponential
-// backoff (1s → 60s cap) with 50–100% jitter. Total worst-case wall time
-// across all attempts is ~7-8 minutes, well within the 29-min refresh
-// interval so overlapping ticks can't happen. If all attempts fail we log
-// a loud error and preserve the stale token — same recover-on-next-tick
-// behaviour as before, but only after we've genuinely tried to save the
-// day. An overlap guard prevents the (rare) case where a previous refresh
-// is still retrying when the next interval fires.
+// New behaviour: up to 11 attempts per tick following the explicit delay
+// schedule in BACKOFF_DELAYS_MS below (1s, 10s, 30s, 60s, 60s, 120s, 120s,
+// 180s, 240s, 300s between attempts). Total worst-case wall time is
+// ~18.7 minutes, deliberately kept under the 29-min refresh interval so
+// overlapping ticks can't happen in the normal case. If all attempts fail
+// we log a loud error and preserve the stale token — same recover-on-next-
+// tick behaviour as before, but only after we've genuinely tried to save
+// the day. An overlap guard coalesces the (rare) case where a previous
+// refresh is still retrying when the next interval fires.
 // ---------------------------------------------------------------------------
 
-const REFRESH_MAX_ATTEMPTS = 10
-const REFRESH_BACKOFF_BASE_MS = 1000
-const REFRESH_BACKOFF_CAP_MS = 60_000
+// Explicit schedule of delays (in ms) between successive attempts. Entry i
+// is the wait AFTER attempt (i+1) fails, before attempt (i+2) starts. Total
+// attempts = BACKOFF_DELAYS_MS.length + 1 (first attempt has no wait before it).
+// Sum ≈ 18.7 minutes, deliberately kept under the ~29-min refresh interval so
+// a still-running retry can't collide with the next scheduled tick.
+const BACKOFF_DELAYS_MS: ReadonlyArray<number> = [
+  1_000, // after attempt 1 → attempt 2
+  10_000, // after 2 → 3
+  30_000, // after 3 → 4
+  60_000, // after 4 → 5
+  60_000, // after 5 → 6
+  120_000, // after 6 → 7
+  120_000, // after 7 → 8
+  180_000, // after 8 → 9
+  240_000, // after 9 → 10
+  300_000, // after 10 → 11
+]
+const REFRESH_MAX_ATTEMPTS = BACKOFF_DELAYS_MS.length + 1
 
 // In-flight refresh, if any. Using a Promise as the mutex (instead of a
 // boolean flag + `await`) keeps the check-and-set synchronous — no race
@@ -92,18 +108,14 @@ async function runRefreshLoop(): Promise<void> {
     } catch (err) {
       lastErr = err
       if (attempt >= REFRESH_MAX_ATTEMPTS) break
-      // delay = base * 2^(attempt-1), capped, with 50-100% jitter to
-      // avoid thundering herd if multiple procs restart together.
-      const exp = Math.min(
-        REFRESH_BACKOFF_BASE_MS * 2 ** (attempt - 1),
-        REFRESH_BACKOFF_CAP_MS,
-      )
-      const jittered = exp * (0.5 + Math.random() * 0.5)
+      // Explicit schedule lookup (not exponential formula) so the sequence
+      // is easy to reason about and tune without doing 2^n arithmetic.
+      const delayMs = BACKOFF_DELAYS_MS[attempt - 1] ?? 60_000
       consola.warn(
         `[copilot-token] refresh attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed, `
-          + `retrying in ${Math.round(jittered)}ms: ${String(err)}`,
+          + `retrying in ${delayMs}ms: ${String(err)}`,
       )
-      await new Promise((resolve) => setTimeout(resolve, jittered))
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
     }
   }
   consola.error(

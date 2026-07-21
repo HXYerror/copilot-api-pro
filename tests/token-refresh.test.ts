@@ -8,16 +8,24 @@ import { _refreshCopilotTokenWithRetry_TEST_ONLY } from "../src/lib/token"
 // monkey-patching globalThis.fetch to a controlled mock and asserting on
 // the resulting state.copilotToken + call count.
 //
-// Backoff timing:
-//   attempt 1 → fail → wait 500-1000ms (base=1000ms with 50-100% jitter)
-//   attempt 2 → fail → wait 1000-2000ms
-//   attempt 3 → fail → wait 2000-4000ms
-//   attempt N → wait min(1000 * 2^(N-1), 60000) * (0.5..1)
+// Backoff schedule (BACKOFF_DELAYS_MS in src/lib/token.ts):
+//   after attempt 1 → wait  1s → attempt 2
+//   after attempt 2 → wait 10s → attempt 3
+//   after attempt 3 → wait 30s → attempt 4
+//   after attempt 4 → wait 60s → attempt 5
+//   after attempt 5 → wait 60s → attempt 6
+//   after attempt 6 → wait 120s → attempt 7
+//   after attempt 7 → wait 120s → attempt 8
+//   after attempt 8 → wait 180s → attempt 9
+//   after attempt 9 → wait 240s → attempt 10
+//   after attempt 10 → wait 300s → attempt 11
+//   after attempt 11 → give up
 //
-// To keep tests fast we override globalThis.setTimeout with a passthrough
-// that fires immediately. The retry logic uses `new Promise(r => setTimeout(r, delay))`,
-// so the mocked setTimeout resolves each backoff wait instantly and the
-// full 10-attempt loop finishes in <100ms.
+// Total worst case ≈ 18.7 min real time. To keep tests fast we override
+// globalThis.setTimeout with a passthrough that fires immediately. The
+// retry logic uses `new Promise(r => setTimeout(r, delay))`, so the mocked
+// setTimeout resolves each backoff wait instantly and the full 11-attempt
+// loop finishes in <100ms.
 // ---------------------------------------------------------------------------
 
 let originalFetch: typeof fetch
@@ -133,15 +141,15 @@ describe("refreshCopilotTokenWithRetry — transient failures", () => {
     expect(state.copilotToken).toBe("fresh-token-5")
   })
 
-  test("succeeds on the last (10th) attempt → state gets the fresh token", async () => {
-    globalThis.fetch = mockCopilotTokenFailingNTimesThen(9, "fresh-token-10")
+  test("succeeds on the last (11th) attempt → state gets the fresh token", async () => {
+    globalThis.fetch = mockCopilotTokenFailingNTimesThen(10, "fresh-token-11")
     await _refreshCopilotTokenWithRetry_TEST_ONLY()
-    expect(state.copilotToken).toBe("fresh-token-10")
+    expect(state.copilotToken).toBe("fresh-token-11")
   })
 })
 
 describe("refreshCopilotTokenWithRetry — exhaustion", () => {
-  test("all 10 attempts fail → stale token preserved, exactly 10 fetches", async () => {
+  test("all 11 attempts fail → stale token preserved, exactly 11 fetches", async () => {
     const { fetch: mockFn, getCalls } = mockCopilotTokenAlwaysFailing()
     globalThis.fetch = mockFn
     await _refreshCopilotTokenWithRetry_TEST_ONLY()
@@ -149,7 +157,7 @@ describe("refreshCopilotTokenWithRetry — exhaustion", () => {
     // so in-flight requests can still limp along while operators notice
     // the loud error log and intervene.
     expect(state.copilotToken).toBe("stale-token-from-previous-refresh")
-    expect(getCalls()).toBe(10)
+    expect(getCalls()).toBe(11)
   })
 })
 
