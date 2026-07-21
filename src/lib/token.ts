@@ -30,6 +30,96 @@ export function stopCopilotTokenRefresh(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Refresh with retry + exponential backoff.
+//
+// GitHub's Copilot token endpoint occasionally 5xx's or times out under load.
+// The previous implementation tried once, logged, and gave up — leaving
+// state.copilotToken stale for another full ~29 min until the next interval
+// tick. Every request served in the meantime would 401 from upstream, which
+// the proxy surfaces as a 500 storm to clients.
+//
+// New behaviour: up to REFRESH_MAX_ATTEMPTS attempts per tick, exponential
+// backoff (1s → 60s cap) with 50–100% jitter. Total worst-case wall time
+// across all attempts is ~7-8 minutes, well within the 29-min refresh
+// interval so overlapping ticks can't happen. If all attempts fail we log
+// a loud error and preserve the stale token — same recover-on-next-tick
+// behaviour as before, but only after we've genuinely tried to save the
+// day. An overlap guard prevents the (rare) case where a previous refresh
+// is still retrying when the next interval fires.
+// ---------------------------------------------------------------------------
+
+const REFRESH_MAX_ATTEMPTS = 10
+const REFRESH_BACKOFF_BASE_MS = 1000
+const REFRESH_BACKOFF_CAP_MS = 60_000
+
+// In-flight refresh, if any. Using a Promise as the mutex (instead of a
+// boolean flag + `await`) keeps the check-and-set synchronous — no race
+// between reading the flag and setting it while a microtask hops in.
+let inflightRefresh: Promise<void> | null = null
+
+function refreshCopilotTokenWithRetry(): Promise<void> {
+  if (inflightRefresh) {
+    consola.warn(
+      "[copilot-token] previous refresh still running — coalescing with existing",
+    )
+    return inflightRefresh
+  }
+  const p = runRefreshLoop().finally(() => {
+    inflightRefresh = null
+  })
+  inflightRefresh = p
+  return p
+}
+
+async function runRefreshLoop(): Promise<void> {
+  let lastErr: unknown = null
+  for (let attempt = 1; attempt <= REFRESH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const { token: refreshed } = await getCopilotToken()
+      state.copilotToken = refreshed
+      if (attempt === 1) {
+        consola.debug("Copilot token refreshed")
+      } else {
+        consola.info(
+          `[copilot-token] refreshed on attempt ${attempt}/${REFRESH_MAX_ATTEMPTS}`,
+        )
+      }
+      if (state.showToken) {
+        consola.info("Refreshed Copilot token:", refreshed)
+      }
+      return
+    } catch (err) {
+      lastErr = err
+      if (attempt >= REFRESH_MAX_ATTEMPTS) break
+      // delay = base * 2^(attempt-1), capped, with 50-100% jitter to
+      // avoid thundering herd if multiple procs restart together.
+      const exp = Math.min(
+        REFRESH_BACKOFF_BASE_MS * 2 ** (attempt - 1),
+        REFRESH_BACKOFF_CAP_MS,
+      )
+      const jittered = exp * (0.5 + Math.random() * 0.5)
+      consola.warn(
+        `[copilot-token] refresh attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed, `
+          + `retrying in ${Math.round(jittered)}ms: ${String(err)}`,
+      )
+      await new Promise((resolve) => setTimeout(resolve, jittered))
+    }
+  }
+  consola.error(
+    `[copilot-token] refresh failed after ${REFRESH_MAX_ATTEMPTS} attempts — `
+      + `continuing with stale token, next scheduled tick will try again. `
+      + `Last error: ${String(lastErr)}`,
+  )
+}
+
+/**
+ * Test-only handle for the retry-with-backoff path. Production code always
+ * enters via the setInterval-scheduled tick inside setupCopilotToken.
+ */
+export const _refreshCopilotTokenWithRetry_TEST_ONLY =
+  refreshCopilotTokenWithRetry
+
 export const setupCopilotToken = async () => {
   const { token, refresh_in } = await getCopilotToken()
   state.copilotToken = token
@@ -52,26 +142,9 @@ export const setupCopilotToken = async () => {
     // CRITICAL: do NOT `throw` from inside a setInterval async callback —
     // there is no one to await the resulting rejected Promise, so it lands
     // as an unhandledRejection. Bun will, in strict-mode / user-configured
-    // unhandledRejection handlers, crash the entire server. A refresh
-    // failure here is recoverable: state.copilotToken keeps its current
-    // value until it actually expires, at which point the next request
-    // surfaces a 401 → operator re-runs auth. Losing the *next* refresh
-    // attempt is strictly less bad than killing the process.
-    void (async () => {
-      try {
-        const { token: refreshed } = await getCopilotToken()
-        state.copilotToken = refreshed
-        consola.debug("Copilot token refreshed")
-        if (state.showToken) {
-          consola.info("Refreshed Copilot token:", refreshed)
-        }
-      } catch (error) {
-        consola.error(
-          "Failed to refresh Copilot token (continuing with existing token until next attempt):",
-          error,
-        )
-      }
-    })()
+    // unhandledRejection handlers, crash the entire server. The retry
+    // helper catches everything internally and never throws.
+    void refreshCopilotTokenWithRetry()
   }, refreshInterval)
 }
 

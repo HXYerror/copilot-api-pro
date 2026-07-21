@@ -342,6 +342,39 @@ function stopCopilotTokenRefresh() {
 		copilotTokenRefreshTimer = void 0;
 	}
 }
+const REFRESH_MAX_ATTEMPTS = 10;
+const REFRESH_BACKOFF_BASE_MS = 1e3;
+const REFRESH_BACKOFF_CAP_MS = 6e4;
+let inflightRefresh = null;
+function refreshCopilotTokenWithRetry() {
+	if (inflightRefresh) {
+		consola.warn("[copilot-token] previous refresh still running — coalescing with existing");
+		return inflightRefresh;
+	}
+	const p = runRefreshLoop().finally(() => {
+		inflightRefresh = null;
+	});
+	inflightRefresh = p;
+	return p;
+}
+async function runRefreshLoop() {
+	let lastErr = null;
+	for (let attempt = 1; attempt <= REFRESH_MAX_ATTEMPTS; attempt++) try {
+		const { token: refreshed } = await getCopilotToken();
+		state.copilotToken = refreshed;
+		if (attempt === 1) consola.debug("Copilot token refreshed");
+		else consola.info(`[copilot-token] refreshed on attempt ${attempt}/${REFRESH_MAX_ATTEMPTS}`);
+		if (state.showToken) consola.info("Refreshed Copilot token:", refreshed);
+		return;
+	} catch (err) {
+		lastErr = err;
+		if (attempt >= REFRESH_MAX_ATTEMPTS) break;
+		const jittered = Math.min(REFRESH_BACKOFF_BASE_MS * 2 ** (attempt - 1), REFRESH_BACKOFF_CAP_MS) * (.5 + Math.random() * .5);
+		consola.warn(`[copilot-token] refresh attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed, retrying in ${Math.round(jittered)}ms: ${String(err)}`);
+		await new Promise((resolve) => setTimeout(resolve, jittered));
+	}
+	consola.error(`[copilot-token] refresh failed after ${REFRESH_MAX_ATTEMPTS} attempts — continuing with stale token, next scheduled tick will try again. Last error: ${String(lastErr)}`);
+}
 const setupCopilotToken = async () => {
 	const { token, refresh_in } = await getCopilotToken();
 	state.copilotToken = token;
@@ -351,16 +384,7 @@ const setupCopilotToken = async () => {
 	const refreshInterval = (refresh_in - 60) * 1e3;
 	copilotTokenRefreshTimer = setInterval(() => {
 		consola.debug("Refreshing Copilot token");
-		(async () => {
-			try {
-				const { token: refreshed } = await getCopilotToken();
-				state.copilotToken = refreshed;
-				consola.debug("Copilot token refreshed");
-				if (state.showToken) consola.info("Refreshed Copilot token:", refreshed);
-			} catch (error) {
-				consola.error("Failed to refresh Copilot token (continuing with existing token until next attempt):", error);
-			}
-		})();
+		refreshCopilotTokenWithRetry();
 	}, refreshInterval);
 };
 async function setupGitHubToken(options) {
